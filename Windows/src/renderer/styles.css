@@ -303,7 +303,7 @@ h2 {
 
 .segmented-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
 }
 
@@ -650,6 +650,10 @@ button:disabled {
   min-width: 0;
 }
 
+.file-title {
+  min-width: 0;
+}
+
 .file-row,
 .file-footer {
   justify-content: space-between;
@@ -671,6 +675,52 @@ button:disabled {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-meta-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.file-meta-row p {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.start-time-button {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 400;
+  padding: 1px 4px;
+}
+
+.start-time-button:hover:not(:disabled) {
+  background: var(--surface-soft);
+  color: var(--text);
+}
+
+.start-time-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.start-time-value {
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
 .status-badge {
@@ -723,7 +773,7 @@ button:disabled {
   font-size: 12px;
 }
 
-.time-row span {
+.time-row > span {
   display: inline-flex;
   min-width: 0;
   align-items: center;
@@ -738,6 +788,18 @@ button:disabled {
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-weight: 750;
+}
+
+.duration-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.time-separator {
+  color: var(--muted);
 }
 
 .queue-item.error .progress-fill {
@@ -763,6 +825,88 @@ button:disabled {
   font-size: 12px;
   font-weight: 650;
   padding: 0 9px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(17, 20, 19, 0.32);
+  padding: 18px;
+}
+
+.time-dialog {
+  display: grid;
+  width: min(360px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
+.dialog-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.dialog-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.dialog-section {
+  display: grid;
+  gap: 7px;
+}
+
+.dialog-section-label {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.date-time-grid {
+  display: grid;
+  gap: 7px;
+}
+
+.date-grid {
+  grid-template-columns: minmax(0, 1.35fr) repeat(2, minmax(0, 1fr));
+}
+
+.time-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.date-time-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.date-time-grid .text-input {
+  min-width: 0;
+  padding: 0 8px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.dialog-actions .primary-button,
+.dialog-actions .ghost-button {
+  flex: 0 0 auto;
+  min-width: 76px;
 }
 
 @media (max-width: 1040px) {

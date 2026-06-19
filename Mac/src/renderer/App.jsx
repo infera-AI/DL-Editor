@@ -1,5 +1,6 @@
 import {
   Activity,
+  CalendarClock,
   CheckCircle2,
   CircleStop,
   Clock3,
@@ -26,7 +27,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-const FPS_PRESETS = [1, 2, 5, 10];
+const FPS_PRESETS = [1, 2, 4, 5, 10];
 const RESOLUTION_PRESETS = [
   { label: "1080p", width: 1920, height: 1080 },
   { label: "720p", width: 1280, height: 720 },
@@ -79,7 +80,7 @@ const dlEditor = window.dlEditor || {
 
 function App() {
   const [jobs, setJobs] = useState([]);
-  const [fpsPreset, setFpsPreset] = useState(5);
+  const [fpsPreset, setFpsPreset] = useState(2);
   const [customFps, setCustomFps] = useState("");
   const [resolutionPreset, setResolutionPreset] = useState("720p");
   const [customWidth, setCustomWidth] = useState("");
@@ -99,6 +100,7 @@ function App() {
     return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
   });
   const [isMaximized, setIsMaximized] = useState(false);
+  const [startTimeEditor, setStartTimeEditor] = useState(null);
 
   const isRunning = batchState.status === "started";
   const isPaused = isRunning && Boolean(batchState.paused);
@@ -324,6 +326,27 @@ function App() {
     setJobs((current) => current.filter((job) => job.id !== id));
   }
 
+  function openStartTimeEditor(job) {
+    const startTimeMs = normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs);
+    const parts = getDateParts(startTimeMs);
+    setStartTimeEditor({
+      jobId: job.id,
+      ...parts
+    });
+  }
+
+  function saveStartTime() {
+    if (!startTimeEditor) return;
+
+    const startTimeMs = parseLocalDateTimeParts(startTimeEditor);
+    if (!Number.isFinite(startTimeMs)) return;
+
+    setJobs((current) =>
+      current.map((job) => (job.id === startTimeEditor.jobId ? { ...job, startTimeMs } : job))
+    );
+    setStartTimeEditor(null);
+  }
+
   return (
     <main className="app-shell">
       <AppChrome
@@ -537,6 +560,7 @@ function App() {
                   job={job}
                   key={job.id}
                   now={clockNow}
+                  onEditStartTime={() => openStartTimeEditor(job)}
                   onOpen={() => job.outputPath && dlEditor.openPath(job.outputPath)}
                   onRemove={() => removeJob(job.id)}
                   onReveal={() => job.outputPath && dlEditor.revealPath(job.outputPath)}
@@ -546,6 +570,14 @@ function App() {
           )}
         </section>
       </section>
+      {startTimeEditor && (
+        <StartTimeDialog
+          editor={startTimeEditor}
+          onCancel={() => setStartTimeEditor(null)}
+          onChange={(changes) => setStartTimeEditor((current) => (current ? { ...current, ...changes } : current))}
+          onSave={saveStartTime}
+        />
+      )}
     </main>
   );
 }
@@ -670,13 +702,142 @@ function Metric({ icon, label, value }) {
   );
 }
 
-function QueueItem({ disabled, job, now, onOpen, onRemove, onReveal }) {
+function StartTimeDialog({ editor, onCancel, onChange, onSave }) {
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onCancel();
+        }
+      }}
+      role="presentation"
+    >
+      <form
+        className="time-dialog"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave();
+        }}
+      >
+        <div className="dialog-heading">
+          <CalendarClock size={18} />
+          <strong>开始时间</strong>
+        </div>
+        <div className="dialog-fields">
+          <div className="dialog-section">
+            <span className="dialog-section-label">日期</span>
+            <div className="date-time-grid date-grid">
+              <label>
+                <span>年</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  min="1970"
+                  onChange={(event) => onChange({ year: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.year}
+                />
+              </label>
+              <label>
+                <span>月</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  max="12"
+                  min="1"
+                  onChange={(event) => onChange({ month: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.month}
+                />
+              </label>
+              <label>
+                <span>日</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  max="31"
+                  min="1"
+                  onChange={(event) => onChange({ day: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.day}
+                />
+              </label>
+            </div>
+          </div>
+          <div className="dialog-section">
+            <span className="dialog-section-label">时间</span>
+            <div className="date-time-grid time-grid">
+              <label>
+                <span>时</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  max="23"
+                  min="0"
+                  onChange={(event) => onChange({ hour: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.hour}
+                />
+              </label>
+              <label>
+                <span>分</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  max="59"
+                  min="0"
+                  onChange={(event) => onChange({ minute: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.minute}
+                />
+              </label>
+              <label>
+                <span>秒</span>
+                <input
+                  className="text-input"
+                  inputMode="numeric"
+                  max="59"
+                  min="0"
+                  onChange={(event) => onChange({ second: event.target.value })}
+                  required
+                  step="1"
+                  type="number"
+                  value={editor.second}
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+        <div className="dialog-actions">
+          <button className="ghost-button" onClick={onCancel} type="button">
+            取消
+          </button>
+          <button className="primary-button" type="submit">
+            确定
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal }) {
   const elapsedMs = getElapsedMs(job, now);
   const remainingMs = getEstimatedRemainingMs(job, elapsedMs);
   const durationMs = Math.max(0, Math.round((Number(job.duration) || 0) * 1000));
-  const videoTime = `${formatDurationSmart((Number(job.currentTime) || 0) * 1000, durationMs)} / ${formatDurationSmart(durationMs, durationMs)}`;
-  const remainingTime = formatDurationSmart(remainingMs);
-  const elapsedTime = formatDurationSmart(elapsedMs);
+  const currentVideoMs = Math.max(0, Math.round((Number(job.currentTime) || 0) * 1000));
+  const startTimeMs = normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs);
 
   return (
     <article className={`queue-item ${job.status}`}>
@@ -685,9 +846,16 @@ function QueueItem({ disabled, job, now, onOpen, onRemove, onReveal }) {
       </div>
       <div className="file-body">
         <div className="file-row">
-          <div>
+          <div className="file-title">
             <h3 title={job.path}>{job.name}</h3>
-            <p>{job.sizeLabel || job.path}</p>
+            <div className="file-meta-row">
+              <p>{job.sizeLabel || job.path}</p>
+              <button className="start-time-button" disabled={disabled} onClick={onEditStartTime} type="button">
+                <CalendarClock size={12} />
+                <span className="start-time-label">开始时间</span>
+                <span className="start-time-value">{formatDateTime(startTimeMs)}</span>
+              </button>
+            </div>
           </div>
           <span className="status-badge">{STATUS_LABELS[job.status] || job.status}</span>
         </div>
@@ -697,9 +865,15 @@ function QueueItem({ disabled, job, now, onOpen, onRemove, onReveal }) {
         <div className="time-row">
           <span>
             <Timer size={13} />
-            视频时间 {videoTime} · 预计剩余 {remainingTime}
+            视频时间 <DurationValue referenceValue={durationMs} value={currentVideoMs} />
+            <span className="time-separator">/</span>
+            <DurationValue referenceValue={durationMs} value={durationMs} />
+            <span className="time-separator">·</span>
+            预计剩余 <DurationValue value={remainingMs} />
           </span>
-          <span className="elapsed-chip">耗时 {elapsedTime}</span>
+          <span className="elapsed-chip">
+            耗时 <DurationValue value={elapsedMs} />
+          </span>
         </div>
         <div className="file-footer">
           <span>{job.message || (job.outputPath ? job.outputPath : job.path)}</span>
@@ -722,6 +896,16 @@ function QueueItem({ disabled, job, now, onOpen, onRemove, onReveal }) {
       </div>
     </article>
   );
+}
+
+function DurationValue({ value, referenceValue = value }) {
+  const label = formatDurationCompact(value, referenceValue);
+
+  if (!label) {
+    return <span className="duration-value">--</span>;
+  }
+
+  return <span className="duration-value">{label}</span>;
 }
 
 function clampPercent(value) {
@@ -780,30 +964,80 @@ function getEstimatedRemainingMs(job, elapsedMs) {
   return null;
 }
 
-function formatDurationSmart(value, referenceValue = value) {
+function formatDurationCompact(value, referenceValue = value) {
   if (!Number.isFinite(Number(value)) || Number(value) < 0) {
-    return "--:--";
+    return null;
   }
 
   const totalMs = Math.max(0, Math.round(Number(value)));
-  const referenceMs = Math.max(0, Math.round(Number(referenceValue) || totalMs));
-  const centiseconds = Math.floor((totalMs % 1000) / 10);
-  const totalSeconds = Math.floor(totalMs / 1000);
+  const totalSeconds = Math.round(totalMs / 1000);
   const seconds = totalSeconds % 60;
   const totalMinutes = Math.floor(totalSeconds / 60);
   const minutes = totalMinutes % 60;
   const hours = Math.floor(totalMinutes / 60);
+  const referenceMs = Math.max(0, Math.round(Number(referenceValue) || totalMs));
   const referenceSeconds = Math.floor(referenceMs / 1000);
+  const showHours = referenceSeconds >= 3600 || hours > 0;
 
-  if (referenceSeconds >= 3600) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}:${String(centiseconds).padStart(2, "0")}`;
+  if (showHours) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
 
-  if (referenceSeconds >= 60) {
-    return `${totalMinutes}:${String(seconds).padStart(2, "0")}:${String(centiseconds).padStart(2, "0")}`;
+  return `${totalMinutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function padDatePart(value) {
+  return String(value).padStart(2, "0");
+}
+
+function normalizeTimestamp(value) {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now();
+}
+
+function getDateParts(timestamp) {
+  const date = new Date(normalizeTimestamp(timestamp));
+  return {
+    year: String(date.getFullYear()),
+    month: padDatePart(date.getMonth() + 1),
+    day: padDatePart(date.getDate()),
+    hour: padDatePart(date.getHours()),
+    minute: padDatePart(date.getMinutes()),
+    second: padDatePart(date.getSeconds())
+  };
+}
+
+function formatDateTime(timestamp) {
+  const parts = getDateParts(timestamp);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function parseIntegerPart(value) {
+  const text = String(value ?? "").trim();
+  return /^\d+$/.test(text) ? Number(text) : NaN;
+}
+
+function parseLocalDateTimeParts(parts) {
+  const year = parseIntegerPart(parts?.year);
+  const month = parseIntegerPart(parts?.month);
+  const day = parseIntegerPart(parts?.day);
+  const hour = parseIntegerPart(parts?.hour);
+  const minute = parseIntegerPart(parts?.minute);
+  const second = parseIntegerPart(parts?.second);
+  const date = new Date(year, month - 1, day, hour, minute, second, 0);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute ||
+    date.getSeconds() !== second
+  ) {
+    return NaN;
   }
 
-  return `${totalSeconds}:${String(centiseconds).padStart(2, "0")}`;
+  return Number.isFinite(date.getTime()) ? date.getTime() : NaN;
 }
 
 export default App;

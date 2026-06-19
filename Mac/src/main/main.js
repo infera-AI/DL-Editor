@@ -456,12 +456,17 @@ function formatBytes(bytes) {
 
 function getFileMetadata(filePath) {
   const stats = fs.statSync(filePath);
+  const modifiedAtMs = Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : Date.now();
+
   return {
     id: crypto.randomUUID(),
     path: filePath,
     name: path.basename(filePath),
     size: stats.size,
     sizeLabel: formatBytes(stats.size),
+    modifiedAt: new Date(modifiedAtMs).toISOString(),
+    modifiedAtMs,
+    startTimeMs: modifiedAtMs,
     status: "queued",
     progress: 0
   };
@@ -495,15 +500,34 @@ function sanitizeName(name) {
   return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-").replace(/\s+/g, " ").trim();
 }
 
-function createOutputPath(inputPath, outputDirectory, options, reservedPaths = new Set()) {
-  const parsed = path.parse(inputPath);
-  const targetLabel = options.resolutionMode === "source" ? "source" : `${options.width}x${options.height}`;
-  const baseName = sanitizeName(`${parsed.name}-${targetLabel}-${options.fps}fps`);
+function padDatePart(value) {
+  return String(value).padStart(2, "0");
+}
+
+function normalizeTimestamp(value) {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now();
+}
+
+function formatTimestampFileName(timestamp) {
+  const date = new Date(normalizeTimestamp(timestamp));
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds())
+  ].join("_");
+}
+
+function createOutputPath(job, outputDirectory, reservedPaths = new Set()) {
+  const baseName = sanitizeName(formatTimestampFileName(job.startTimeMs ?? job.modifiedAtMs));
   let candidate = path.join(outputDirectory, `${baseName}.mp4`);
   let index = 2;
 
   while (fs.existsSync(candidate) || reservedPaths.has(candidate)) {
-    candidate = path.join(outputDirectory, `${baseName}-${index}.mp4`);
+    candidate = path.join(outputDirectory, `${baseName}_${index}.mp4`);
     index += 1;
   }
 
@@ -770,7 +794,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 }
 
 async function transcodeJob(job, options, outputDirectory, capabilities, reservedOutputPaths) {
-  const outputPath = createOutputPath(job.path, outputDirectory, options, reservedOutputPaths);
+  const outputPath = createOutputPath(job, outputDirectory, reservedOutputPaths);
   const duration = await probeDuration(job.path);
   const encoder = options.processingDevice === "cpu" ? "libx264" : capabilities.selectedGpuEncoder;
   const startedAt = Date.now();
