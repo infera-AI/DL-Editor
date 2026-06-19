@@ -1,0 +1,8 @@
+node_modules/
+dist/
+release/*
+!release/
+!release/DL-Editor-Windows-Setup-*.exe
+!release/DL-Editor-Windows-Setup-*.exe.blockmap
+tmp-smoke/
+*.log

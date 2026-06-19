@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="DL Editor app icon">
+  <defs>
+    <linearGradient id="bg" x1="156" y1="126" x2="868" y2="898" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#151817"/>
+      <stop offset="0.55" stop-color="#202726"/>
+      <stop offset="1" stop-color="#101211"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="286" y1="220" x2="744" y2="790" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6F3E7"/>
+      <stop offset="0.52" stop-color="#BDF8DC"/>
+      <stop offset="1" stop-color="#66E7B4"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="26" stdDeviation="34" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect x="78" y="78" width="868" height="868" rx="198" fill="url(#bg)" filter="url(#shadow)"/>
+  <rect x="100" y="100" width="824" height="824" rx="176" fill="none" stroke="#FFFFFF" stroke-opacity="0.09" stroke-width="4"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M326 766V258H500C668 258 772 358 772 512C772 666 668 766 500 766H326" stroke="url(#mark)" stroke-width="96"/>
+    <path d="M500 512L585 427M500 512L585 597" stroke="#F6F3E7" stroke-width="50"/>
+  </g>
+</svg>
