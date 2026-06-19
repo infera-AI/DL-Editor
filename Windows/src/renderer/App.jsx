@@ -7,14 +7,21 @@ import {
   FolderOpen,
   Gauge,
   ListVideo,
+  Maximize2,
+  Minimize2,
+  Minus,
+  Moon,
+  Pause,
   Play,
   Plus,
   RotateCcw,
   Settings2,
   Sparkles,
+  Sun,
   Timer,
   TriangleAlert,
   Video,
+  X,
   Zap
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -32,7 +39,8 @@ const STATUS_LABELS = {
   processing: "处理中",
   done: "完成",
   error: "失败",
-  canceled: "取消"
+  canceled: "取消",
+  paused: "暂停"
 };
 
 const dlEditor = window.dlEditor || {
@@ -54,12 +62,19 @@ const dlEditor = window.dlEditor || {
     gpu: { status: "unavailable", total: null, videoEncode: null, threeD: null, compute: null }
   }),
   startBatch: async () => ({ started: true }),
+  pauseBatch: async () => ({ paused: true }),
+  resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
   openPath: async () => undefined,
   revealPath: async () => undefined,
+  minimizeWindow: async () => undefined,
+  toggleMaximizeWindow: async () => false,
+  closeWindow: async () => undefined,
+  isWindowMaximized: async () => false,
   onJobUpdate: () => () => undefined,
   onBatchUpdate: () => () => undefined,
-  onSystemUsageUpdate: () => () => undefined
+  onSystemUsageUpdate: () => () => undefined,
+  onWindowMaximizedChange: () => () => undefined
 };
 
 function App() {
@@ -77,10 +92,18 @@ function App() {
   const [batchState, setBatchState] = useState({ status: "idle" });
   const [notice, setNotice] = useState("");
   const [clockNow, setClockNow] = useState(Date.now());
+  const [pauseTransitioning, setPauseTransitioning] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    const saved = window.localStorage?.getItem("dl-editor-theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
+  });
+  const [isMaximized, setIsMaximized] = useState(false);
 
   const isRunning = batchState.status === "started";
+  const isPaused = isRunning && Boolean(batchState.paused);
   const pendingJobs = jobs.filter((job) => job.status !== "done");
-  const hasProcessingJobs = jobs.some((job) => job.status === "processing");
+  const hasProcessingJobs = jobs.some((job) => job.status === "processing" || job.status === "paused");
 
   useEffect(() => {
     dlEditor.getCapabilities().then((data) => {
@@ -95,13 +118,23 @@ function App() {
     });
 
     const offBatch = dlEditor.onBatchUpdate((update) => {
-      setBatchState(update);
+      setBatchState((current) => ({ ...current, ...update }));
       if (update.status === "finished") {
         setNotice(`已完成 ${update.completed} 个视频，输出到 ${update.outputDirectory}`);
       } else if (update.status === "canceled") {
         setNotice("批量处理已取消");
       } else if (update.status === "error") {
         setNotice(update.message || "批量处理失败");
+      } else if (update.status === "started" && update.paused) {
+        setJobs((current) =>
+          current.map((job) => (job.status === "processing" ? { ...job, status: "paused", message: job.message || "Paused" } : job))
+        );
+        setNotice("处理已暂停");
+      } else if (update.status === "started" && update.resumed) {
+        setJobs((current) =>
+          current.map((job) => (job.status === "paused" ? { ...job, status: "processing", message: job.message || "Resumed" } : job))
+        );
+        setNotice("处理已继续");
       } else if (update.status === "started") {
         setNotice(
           `开始处理 ${update.total} 个视频，模式：${update.processingDevice === "cpu" ? "CPU" : "GPU"}，编码器：${update.encoder}，视频串行，分段并发：${update.concurrency || 1}`
@@ -110,13 +143,21 @@ function App() {
     });
 
     const offUsage = dlEditor.onSystemUsageUpdate(setSystemUsage);
+    const offMaximized = dlEditor.onWindowMaximizedChange(setIsMaximized);
+    dlEditor.isWindowMaximized().then(setIsMaximized).catch(() => undefined);
 
     return () => {
       offJob();
       offBatch();
       offUsage();
+      offMaximized();
     };
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage?.setItem("dl-editor-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     if (!hasProcessingJobs) {
@@ -167,7 +208,7 @@ function App() {
 
   const totals = useMemo(() => {
     const done = jobs.filter((job) => job.status === "done").length;
-    const active = jobs.filter((job) => job.status === "processing").length;
+    const active = jobs.filter((job) => job.status === "processing" || job.status === "paused").length;
     const errors = jobs.filter((job) => job.status === "error").length;
     return { done, active, errors, total: jobs.length };
   }, [jobs]);
@@ -228,6 +269,53 @@ function App() {
     await dlEditor.cancelBatch();
   }
 
+  async function togglePause() {
+    if (!isRunning || pauseTransitioning) return;
+
+    const shouldResume = isPaused;
+    setPauseTransitioning(true);
+    setBatchState((current) => ({ ...current, paused: !shouldResume, resumed: shouldResume || undefined }));
+    setJobs((current) =>
+      current.map((job) => {
+        if (shouldResume && job.status === "paused") {
+          return { ...job, status: "processing", message: "Resumed" };
+        }
+
+        if (!shouldResume && job.status === "processing") {
+          return { ...job, status: "paused", message: "Paused" };
+        }
+
+        return job;
+      })
+    );
+    setNotice(shouldResume ? "处理已继续" : "处理已暂停");
+
+    try {
+      const result = shouldResume ? await dlEditor.resumeBatch() : await dlEditor.pauseBatch();
+      if (typeof result?.paused === "boolean") {
+        setBatchState((current) => ({ ...current, paused: result.paused, resumed: shouldResume && !result.paused }));
+      }
+    } catch (error) {
+      setBatchState((current) => ({ ...current, paused: shouldResume, resumed: undefined }));
+      setJobs((current) =>
+        current.map((job) => {
+          if (shouldResume && job.status === "processing") {
+            return { ...job, status: "paused" };
+          }
+
+          if (!shouldResume && job.status === "paused") {
+            return { ...job, status: "processing" };
+          }
+
+          return job;
+        })
+      );
+      setNotice(error.message || (shouldResume ? "无法继续处理" : "无法暂停处理"));
+    } finally {
+      setPauseTransitioning(false);
+    }
+  }
+
   function clearFinished() {
     setJobs((current) => current.filter((job) => job.status !== "done"));
   }
@@ -238,20 +326,14 @@ function App() {
 
   return (
     <main className="app-shell">
-      <section className="top-bar">
-        <div>
-          <p className="eyebrow">DL Editor</p>
-          <h1>批量视频降帧降分辨率</h1>
-        </div>
-        <div className="system-pill" title="当前处理设备与编码器">
-          <Cpu size={16} />
-          <span>
-            {capabilities
-              ? `${capabilities.logicalCores} 线程 · ${processingDevice === "cpu" ? "CPU" : activeEncoder}`
-              : "检测中"}
-          </span>
-        </div>
-      </section>
+      <AppChrome
+        isMaximized={isMaximized}
+        onClose={() => dlEditor.closeWindow()}
+        onMinimize={() => dlEditor.minimizeWindow()}
+        onThemeToggle={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+        onToggleMaximize={() => dlEditor.toggleMaximizeWindow().then(setIsMaximized).catch(() => undefined)}
+        theme={theme}
+      />
 
       <section className="workspace">
         <aside className="control-panel">
@@ -400,6 +482,10 @@ function App() {
               <Play size={17} />
               <span>开始处理</span>
             </button>
+            <button className="ghost-button action-button" disabled={!isRunning || pauseTransitioning} onClick={togglePause} type="button">
+              {isPaused ? <Play size={16} /> : <Pause size={16} />}
+              <span>{isPaused ? "继续" : "暂停"}</span>
+            </button>
             <button className="ghost-button" disabled={!isRunning} onClick={cancelBatch} type="button">
               <CircleStop size={17} />
               <span>取消</span>
@@ -461,6 +547,28 @@ function App() {
         </section>
       </section>
     </main>
+  );
+}
+
+function AppChrome({ isMaximized, onClose, onMinimize, onThemeToggle, onToggleMaximize, theme }) {
+  return (
+    <section className="app-chrome">
+      <div className="drag-region" />
+      <div className="window-actions">
+        <button className="chrome-button" onClick={onThemeToggle} title={theme === "dark" ? "切换浅色主题" : "切换深色主题"} type="button">
+          {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+        </button>
+        <button className="chrome-button" onClick={onMinimize} title="最小化" type="button">
+          <Minus size={15} />
+        </button>
+        <button className="chrome-button" onClick={onToggleMaximize} title={isMaximized ? "还原" : "最大化"} type="button">
+          {isMaximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+        </button>
+        <button className="chrome-button close" onClick={onClose} title="关闭" type="button">
+          <X size={15} />
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -622,7 +730,7 @@ function percentLabel(value) {
 
 function getElapsedMs(job, now) {
   if (job.status === "processing" && Number.isFinite(Number(job.startedAt))) {
-    return Math.max(Number(job.elapsedMs) || 0, now - Number(job.startedAt));
+    return Math.max(Number(job.elapsedMs) || 0, now - Number(job.startedAt) - (Number(job.pausedMs) || 0));
   }
 
   if (Number.isFinite(Number(job.elapsedMs))) {

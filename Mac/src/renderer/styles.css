@@ -2,23 +2,68 @@
   color-scheme: light;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
-  background: #f7f7f5;
-  color: #171717;
+  background: var(--bg);
+  color: var(--text);
   --bg: #f7f7f5;
   --surface: #ffffff;
-  --surface-soft: #f0f0ed;
-  --line: #deded8;
-  --line-strong: #c9c9c1;
+  --surface-subtle: #fbfbfa;
+  --surface-soft: #f1f1ee;
+  --line: rgba(23, 23, 23, 0.11);
+  --line-strong: rgba(23, 23, 23, 0.2);
   --text: #171717;
   --muted: #6a6a62;
   --muted-strong: #4d4d47;
   --accent: #0f766e;
   --accent-strong: #115e59;
   --accent-soft: #d7f2ed;
+  --button: #171717;
+  --button-text: #ffffff;
   --danger: #b42318;
   --warning: #9a6700;
   --success: #177245;
-  --shadow: 0 18px 45px rgba(18, 18, 16, 0.08);
+  --shadow: 0 10px 28px rgba(18, 18, 16, 0.055);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111413;
+  --surface: #171c1a;
+  --surface-subtle: #1c2220;
+  --surface-soft: #242b28;
+  --line: rgba(246, 243, 231, 0.1);
+  --line-strong: rgba(246, 243, 231, 0.2);
+  --text: #f4f1e8;
+  --muted: #9ba39d;
+  --muted-strong: #c6ccc7;
+  --accent: #65d8ad;
+  --accent-strong: #9af1cf;
+  --accent-soft: rgba(101, 216, 173, 0.16);
+  --danger: #ff8a7f;
+  --warning: #f1c56a;
+  --success: #8ee5b4;
+  --button: #f4f1e8;
+  --button-text: #111413;
+  --shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+}
+
+:root[data-theme="dark"] .status-badge {
+  background: rgba(244, 241, 232, 0.12);
+  color: #f4f1e8;
+}
+
+:root[data-theme="dark"] .queue-item.processing .status-badge {
+  background: rgba(101, 216, 173, 0.24);
+  color: #b9ffe2;
+}
+
+:root[data-theme="dark"] .queue-item.done .status-badge {
+  background: rgba(142, 229, 180, 0.22);
+  color: #b9ffd5;
+}
+
+:root[data-theme="dark"] .queue-item.error .status-badge {
+  background: rgba(255, 138, 127, 0.22);
+  color: #ffc4bd;
 }
 
 * {
@@ -36,9 +81,7 @@ body,
 body {
   margin: 0;
   min-width: 960px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(247, 247, 245, 0.82)),
-    var(--bg);
+  background: var(--bg);
 }
 
 .control-panel,
@@ -85,16 +128,57 @@ button {
   min-height: 0;
   overflow: hidden;
   flex-direction: column;
-  gap: 18px;
-  padding: 24px;
+  gap: 10px;
+  padding: 0 14px 14px;
+  background: var(--bg);
 }
 
-.top-bar {
+.app-chrome {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
+  height: 34px;
   justify-content: space-between;
-  gap: 18px;
+  margin: 0 -14px;
+  padding: 0 10px 0 14px;
+  background: var(--bg);
+  -webkit-app-region: drag;
+}
+
+.drag-region {
+  flex: 1;
+  height: 100%;
+}
+
+.window-actions {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.chrome-button {
+  display: inline-grid;
+  width: 34px;
+  height: 30px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.chrome-button:hover {
+  background: var(--surface-soft);
+  color: var(--text);
+}
+
+.chrome-button.close:hover {
+  background: #d92d20;
+  color: #fff;
 }
 
 .eyebrow {
@@ -158,8 +242,8 @@ h2 {
 .workspace {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: minmax(292px, 324px) minmax(0, 1fr);
+  gap: 12px;
   min-height: 0;
   overflow: hidden;
 }
@@ -167,7 +251,7 @@ h2 {
 .control-panel,
 .queue-panel {
   min-height: 0;
-  border-radius: 8px;
+  border-radius: 7px;
   box-shadow: var(--shadow);
 }
 
@@ -176,8 +260,8 @@ h2 {
   overflow-x: hidden;
   overflow-y: auto;
   flex-direction: column;
-  gap: 18px;
-  padding: 18px;
+  gap: 12px;
+  padding: 14px;
 }
 
 .queue-panel {
@@ -185,8 +269,8 @@ h2 {
   overflow: hidden;
   min-width: 0;
   flex-direction: column;
-  gap: 16px;
-  padding: 18px;
+  gap: 12px;
+  padding: 14px;
 }
 
 .panel-heading,
@@ -202,25 +286,25 @@ h2 {
 
 .panel-heading {
   gap: 8px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 700;
 }
 
 .field-group {
   display: grid;
-  gap: 9px;
+  gap: 7px;
 }
 
 .field-group label {
   color: var(--muted-strong);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
 }
 
 .segmented-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 6px;
+  gap: 5px;
 }
 
 .segmented-grid.two-col {
@@ -228,13 +312,13 @@ h2 {
 }
 
 .segment {
-  min-height: 36px;
+  min-height: 32px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fbfbfa;
+  border-radius: 7px;
+  background: var(--surface-subtle);
   color: var(--muted-strong);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
   transition:
     border-color 160ms ease,
@@ -254,38 +338,38 @@ h2 {
 
 .text-input {
   width: 100%;
-  min-height: 38px;
+  min-height: 34px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fff;
+  border-radius: 7px;
+  background: var(--surface);
   color: var(--text);
   outline: none;
-  padding: 0 11px;
+  padding: 0 10px;
 }
 
 .text-input:focus {
   border-color: rgba(15, 118, 110, 0.56);
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12);
 }
 
 .split-inputs {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 7px;
 }
 
 .path-button {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 9px;
-  min-height: 42px;
+  gap: 8px;
+  min-height: 36px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fbfbfa;
+  border-radius: 7px;
+  background: var(--surface-subtle);
   color: var(--muted-strong);
   cursor: pointer;
-  padding: 0 11px;
+  padding: 0 10px;
   text-align: left;
 }
 
@@ -298,10 +382,10 @@ h2 {
 .hardware-box {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 10px;
-  border-radius: 8px;
-  background: #fbfbfa;
-  padding: 12px;
+  gap: 8px;
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 10px;
 }
 
 .hardware-box strong,
@@ -323,11 +407,11 @@ h2 {
 .device-status {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 9px;
+  gap: 8px;
   align-items: start;
-  border-radius: 8px;
-  background: #fbfbfa;
-  padding: 11px;
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 10px;
 }
 
 .device-status strong,
@@ -351,16 +435,16 @@ h2 {
 
 .usage-card {
   display: grid;
-  gap: 11px;
-  border-radius: 8px;
-  background: #fbfbfa;
-  padding: 12px;
+  gap: 9px;
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 10px;
 }
 
 .usage-header {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
 }
 
@@ -385,7 +469,7 @@ h2 {
 
 .meter-track {
   overflow: hidden;
-  height: 7px;
+  height: 5px;
   border-radius: 999px;
   background: var(--surface-soft);
 }
@@ -419,7 +503,7 @@ h2 {
 
 .actions {
   margin-top: auto;
-  gap: 8px;
+  gap: 7px;
 }
 
 .primary-button,
@@ -430,35 +514,35 @@ h2 {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 40px;
-  border-radius: 8px;
+  min-height: 36px;
+  border-radius: 7px;
   cursor: pointer;
   font-weight: 700;
 }
 
 .primary-button {
   flex: 1;
-  background: #171717;
-  color: #fff;
+  background: var(--button);
+  color: var(--button-text);
 }
 
 .secondary-button {
-  background: #171717;
-  color: #fff;
-  padding: 0 13px;
+  background: var(--button);
+  color: var(--button-text);
+  padding: 0 12px;
 }
 
 .ghost-button {
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--surface);
   color: var(--muted-strong);
   padding: 0 12px;
 }
 
 .icon-button {
-  width: 40px;
+  width: 36px;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--surface);
   color: var(--muted-strong);
 }
 
@@ -469,17 +553,17 @@ button:disabled {
 
 .queue-toolbar {
   justify-content: space-between;
-  gap: 14px;
+  gap: 12px;
 }
 
 .toolbar-actions {
-  gap: 8px;
+  gap: 7px;
 }
 
 .summary-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 7px;
 }
 
 .metric {
@@ -487,9 +571,9 @@ button:disabled {
   grid-template-columns: auto 1fr auto;
   gap: 8px;
   align-items: center;
-  border-radius: 8px;
-  background: #fbfbfa;
-  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 8px 10px;
   color: var(--muted);
   font-size: 13px;
 }
@@ -501,24 +585,24 @@ button:disabled {
 .notice {
   display: flex;
   align-items: center;
-  gap: 8px;
-  border-radius: 8px;
-  background: #fbfbfa;
+  gap: 7px;
+  border-radius: 7px;
+  background: var(--surface-subtle);
   color: var(--muted-strong);
   font-size: 13px;
-  padding: 11px 12px;
+  padding: 9px 10px;
 }
 
 .empty-state {
   display: grid;
   flex: 1;
-  min-height: 320px;
+  min-height: 300px;
   place-items: center;
   align-content: center;
   gap: 10px;
   border: 1px dashed var(--line-strong);
-  border-radius: 8px;
-  background: #fbfbfa;
+  border-radius: 7px;
+  background: var(--surface-subtle);
   color: var(--muted-strong);
   cursor: pointer;
   font-size: 15px;
@@ -532,16 +616,16 @@ button:disabled {
   flex: 1;
   min-height: 0;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   padding-right: 3px;
 }
 
 .queue-item {
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 12px;
-  border-radius: 8px;
-  padding: 12px;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 10px;
+  border-radius: 7px;
+  padding: 10px;
 }
 
 .queue-item.processing {
@@ -554,10 +638,10 @@ button:disabled {
 
 .file-icon {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   place-items: center;
-  border-radius: 8px;
+  border-radius: 7px;
   background: var(--surface-soft);
   color: var(--muted-strong);
 }
@@ -569,7 +653,7 @@ button:disabled {
 .file-row,
 .file-footer {
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
 .file-row h3 {
@@ -616,8 +700,8 @@ button:disabled {
 
 .progress-track {
   overflow: hidden;
-  height: 7px;
-  margin: 11px 0 9px;
+  height: 5px;
+  margin: 9px 0 7px;
   border-radius: 999px;
   background: var(--surface-soft);
 }
@@ -633,7 +717,7 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin: 0 0 8px;
   color: var(--muted-strong);
   font-size: 12px;
@@ -673,7 +757,7 @@ button:disabled {
   min-height: 28px;
   border: 1px solid var(--line);
   border-radius: 7px;
-  background: #fff;
+  background: var(--surface);
   color: var(--muted-strong);
   cursor: pointer;
   font-size: 12px;

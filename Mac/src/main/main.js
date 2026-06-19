@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -7,7 +7,11 @@ const path = require("path");
 
 let mainWindow;
 const activeProcesses = new Set();
+const jobSnapshots = new Map();
 let cancelRequested = false;
+let pauseRequested = false;
+let pauseStartedAt = null;
+let pauseIntervals = [];
 let queueBusy = false;
 let cachedCapabilities = null;
 let cpuUsageSnapshot = null;
@@ -16,6 +20,8 @@ let usageMonitor = null;
 let gpuSampleInFlight = false;
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function getAppIconPath() {
   const iconPath = path.join(__dirname, "../../build/icon.png");
@@ -28,6 +34,8 @@ function createWindow() {
     height: 760,
     minWidth: 980,
     minHeight: 640,
+    frame: false,
+    autoHideMenuBar: true,
     backgroundColor: "#f7f7f5",
     icon: getAppIconPath(),
     title: "DL Editor",
@@ -41,10 +49,17 @@ function createWindow() {
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
-    mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     mainWindow.loadFile(path.join(__dirname, "../../dist/index.html"));
   }
+
+  mainWindow.on("maximize", () => {
+    mainWindow?.webContents.send("window:maximized-change", true);
+  });
+
+  mainWindow.on("unmaximize", () => {
+    mainWindow?.webContents.send("window:maximized-change", false);
+  });
 }
 
 function getBundledBinary(name) {
@@ -97,6 +112,74 @@ function runBinary(command, args, options = {}) {
       }
     });
   });
+}
+
+function getPausedMsSince(startedAt, now = Date.now()) {
+  let pausedMs = 0;
+  const intervals = pauseStartedAt ? [...pauseIntervals, { start: pauseStartedAt, end: now }] : pauseIntervals;
+
+  for (const interval of intervals) {
+    const overlapStart = Math.max(Number(startedAt) || 0, interval.start);
+    const overlapEnd = Math.min(now, interval.end);
+    if (overlapEnd > overlapStart) {
+      pausedMs += overlapEnd - overlapStart;
+    }
+  }
+
+  return pausedMs;
+}
+
+function closeActivePauseInterval() {
+  if (!pauseStartedAt) {
+    return;
+  }
+
+  pauseIntervals.push({ start: pauseStartedAt, end: Date.now() });
+  pauseStartedAt = null;
+}
+
+async function waitWhilePaused() {
+  while (pauseRequested && !cancelRequested) {
+    await sleep(120);
+  }
+}
+
+async function setProcessPaused(processHandle, paused) {
+  if (!processHandle?.pid || processHandle.exitCode !== null) {
+    return false;
+  }
+
+  if (process.platform === "win32") {
+    return false;
+  }
+
+  processHandle.kill(paused ? "SIGSTOP" : "SIGCONT");
+  return true;
+}
+
+function trackProcess(child) {
+  activeProcesses.add(child);
+  child.once("error", () => activeProcesses.delete(child));
+  child.once("close", () => activeProcesses.delete(child));
+  if (pauseRequested) {
+    setProcessPaused(child, true).catch(() => undefined);
+  }
+}
+
+async function setActiveProcessesPaused(paused) {
+  const results = await Promise.all(
+    [...activeProcesses].map((processHandle) =>
+      setProcessPaused(processHandle, paused)
+        .then((changed) => ({ changed, failed: false }))
+        .catch((error) => ({ changed: false, failed: true, error }))
+    )
+  );
+
+  return {
+    total: results.length,
+    changed: results.filter((result) => result.changed).length,
+    failed: results.filter((result) => result.failed).length
+  };
 }
 
 function parseEncoders(output) {
@@ -547,7 +630,8 @@ function parseProgressLine(line, duration) {
 }
 
 function buildTimingPayload(startedAt, duration, currentTime) {
-  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const pausedMs = getPausedMsSince(startedAt);
+  const elapsedMs = Math.max(0, Date.now() - startedAt - pausedMs);
   const safeCurrentTime = Number(currentTime) || 0;
   let estimatedRemainingMs = null;
 
@@ -560,11 +644,15 @@ function buildTimingPayload(startedAt, duration, currentTime) {
   return {
     elapsedMs,
     elapsedSeconds: Math.round((elapsedMs / 1000) * 10) / 10,
+    pausedMs,
     estimatedRemainingMs
   };
 }
 
 function emitJobUpdate(payload) {
+  if (payload?.id) {
+    jobSnapshots.set(payload.id, { ...(jobSnapshots.get(payload.id) || {}), ...payload });
+  }
   mainWindow?.webContents.send("transcode:job-update", payload);
 }
 
@@ -572,7 +660,37 @@ function emitBatchUpdate(payload) {
   mainWindow?.webContents.send("transcode:batch-update", payload);
 }
 
+function emitPauseJobState(status, message) {
+  for (const [id, snapshot] of jobSnapshots.entries()) {
+    if (snapshot.status !== "processing" && snapshot.status !== "paused") {
+      continue;
+    }
+
+    const timing = Number.isFinite(Number(snapshot.startedAt))
+      ? buildTimingPayload(snapshot.startedAt, Number(snapshot.duration) || 0, Number(snapshot.currentTime) || 0)
+      : {};
+
+    emitJobUpdate({
+      ...snapshot,
+      ...timing,
+      id,
+      status,
+      message
+    });
+  }
+}
+
+function getActiveJobStatus() {
+  return pauseRequested ? "paused" : "processing";
+}
+
+function getActiveJobMessage(message) {
+  return pauseRequested ? "Paused" : message;
+}
+
 async function runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt) {
+  await waitWhilePaused();
+
   const ffmpegPath = getBundledBinary("ffmpeg");
   const args = buildFfmpegArgs({
     inputPath: job.path,
@@ -590,6 +708,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
     currentTime: 0,
     elapsedMs: 0,
     elapsedSeconds: 0,
+    pausedMs: 0,
     estimatedRemainingMs: null,
     startedAt,
     outputPath,
@@ -598,7 +717,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
-    activeProcesses.add(child);
+    trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
 
@@ -614,14 +733,14 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 
           emitJobUpdate({
             id: job.id,
-            status: "processing",
+            status: getActiveJobStatus(),
             progress: progressInfo.progress,
             duration,
             currentTime: progressInfo.currentTime,
             ...timing,
             startedAt,
             outputPath,
-            message: `Using ${encoder}`
+            message: getActiveJobMessage(`Using ${encoder}`)
           });
         }
       }
@@ -680,7 +799,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
       duration,
       outputPath,
       startedAt,
-      elapsedMs: Date.now() - startedAt,
+      ...buildTimingPayload(startedAt, duration, 0),
       estimatedRemainingMs: null,
       message: `${encoder} unavailable, retrying CPU`
     });
@@ -694,8 +813,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
     progress: 100,
     duration,
     currentTime: Math.round(duration * 10) / 10,
-    elapsedMs: Date.now() - startedAt,
-    elapsedSeconds: Math.round(((Date.now() - startedAt) / 1000) * 10) / 10,
+    ...buildTimingPayload(startedAt, duration, duration),
     estimatedRemainingMs: 0,
     outputPath,
     message: "Complete"
@@ -737,7 +855,7 @@ function escapeConcatPath(filePath) {
 function runTrackedProcess(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true });
-    activeProcesses.add(child);
+    trackProcess(child);
     let stdout = "";
     let stderr = "";
 
@@ -769,6 +887,8 @@ function runTrackedProcess(command, args) {
 }
 
 async function runFfmpegSegment({ job, options, segment, capabilities, encoder, startedAt, onProgress }) {
+  await waitWhilePaused();
+
   const ffmpegPath = getBundledBinary("ffmpeg");
   const args = buildFfmpegArgs({
     inputPath: job.path,
@@ -784,7 +904,7 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
-    activeProcesses.add(child);
+    trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
 
@@ -830,6 +950,8 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 }
 
 async function concatSegments(segments, outputPath) {
+  await waitWhilePaused();
+
   const ffmpegPath = getBundledBinary("ffmpeg");
   const listPath = path.join(path.dirname(segments[0].outputPath), "concat-list.txt");
   const content = segments.map((segment) => `file '${escapeConcatPath(segment.outputPath)}'`).join(os.EOL);
@@ -888,14 +1010,14 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
 
     emitJobUpdate({
       id: job.id,
-      status: "processing",
+      status: getActiveJobStatus(),
       progress: Math.max(0, Math.min(99, Math.round((currentTime / duration) * 100))),
       duration,
       currentTime: Math.round(currentTime * 10) / 10,
       ...timing,
       startedAt,
       outputPath,
-      message
+      message: getActiveJobMessage(message)
     });
   }
 
@@ -903,6 +1025,8 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
 
   async function worker() {
     while (!cancelRequested) {
+      await waitWhilePaused();
+
       const segment = segments[nextIndex];
       nextIndex += 1;
 
@@ -947,6 +1071,10 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
 async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   queueBusy = true;
   cancelRequested = false;
+  pauseRequested = false;
+  pauseStartedAt = null;
+  pauseIntervals = [];
+  jobSnapshots.clear();
 
   const options = normalizeOptions(rawOptions);
   const runtimeOptions = {
@@ -963,6 +1091,7 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   const reservedOutputPaths = new Set();
   emitBatchUpdate({
     status: "started",
+    paused: false,
     total: jobs.length,
     outputDirectory,
     encoder: activeEncoder,
@@ -979,6 +1108,8 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
     if (cancelRequested) {
       break;
     }
+
+    await waitWhilePaused();
 
     try {
       await transcodeJob(job, runtimeOptions, outputDirectory, capabilities, reservedOutputPaths);
@@ -1009,9 +1140,12 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   }
 
   queueBusy = false;
+  pauseRequested = false;
+  pauseStartedAt = null;
 
   emitBatchUpdate({
     status: cancelRequested ? "canceled" : "finished",
+    paused: false,
     total: jobs.length,
     completed,
     failed,
@@ -1024,6 +1158,7 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   createWindow();
   startUsageMonitor();
 
@@ -1045,6 +1180,30 @@ app.on("window-all-closed", () => {
     app.quit();
   }
 });
+
+ipcMain.handle("window:minimize", () => {
+  mainWindow?.minimize();
+});
+
+ipcMain.handle("window:toggle-maximize", () => {
+  if (!mainWindow) {
+    return false;
+  }
+
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize();
+    return false;
+  }
+
+  mainWindow.maximize();
+  return true;
+});
+
+ipcMain.handle("window:close", () => {
+  mainWindow?.close();
+});
+
+ipcMain.handle("window:is-maximized", () => Boolean(mainWindow?.isMaximized()));
 
 ipcMain.handle("videos:select", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -1088,7 +1247,9 @@ ipcMain.handle("transcode:start-batch", async (_event, payload) => {
 
   processBatch(jobs, payload?.options, payload?.outputDirectory).catch((error) => {
     queueBusy = false;
-    emitBatchUpdate({ status: "error", message: error.message || "Batch failed" });
+    pauseRequested = false;
+    pauseStartedAt = null;
+    emitBatchUpdate({ status: "error", paused: false, message: error.message || "Batch failed" });
   });
 
   return { started: true };
@@ -1096,12 +1257,59 @@ ipcMain.handle("transcode:start-batch", async (_event, payload) => {
 
 ipcMain.handle("transcode:cancel-batch", async () => {
   cancelRequested = true;
+  pauseRequested = false;
+  closeActivePauseInterval();
+  await setActiveProcessesPaused(false);
 
   for (const processHandle of activeProcesses) {
     processHandle.kill("SIGTERM");
   }
 
   return { cancelRequested: true };
+});
+
+ipcMain.handle("transcode:pause-batch", async () => {
+  if (!queueBusy || pauseRequested) {
+    return { paused: pauseRequested };
+  }
+
+  pauseRequested = true;
+  pauseStartedAt = Date.now();
+  emitPauseJobState("paused", "Paused");
+  emitBatchUpdate({ status: "started", paused: true, message: "Paused" });
+
+  const pauseResult = await setActiveProcessesPaused(true);
+  if (pauseResult.failed > 0) {
+    pauseRequested = false;
+    closeActivePauseInterval();
+    emitPauseJobState("processing", "Pause failed");
+    emitBatchUpdate({ status: "started", paused: false, message: "Pause failed" });
+    throw new Error("无法暂停当前 FFmpeg 进程");
+  }
+
+  return { paused: true, pauseResult };
+});
+
+ipcMain.handle("transcode:resume-batch", async () => {
+  if (!queueBusy || !pauseRequested) {
+    return { paused: pauseRequested };
+  }
+
+  closeActivePauseInterval();
+  pauseRequested = false;
+  emitPauseJobState("processing", "Resumed");
+  emitBatchUpdate({ status: "started", paused: false, resumed: true, message: "Resumed" });
+
+  const resumeResult = await setActiveProcessesPaused(false);
+  if (resumeResult.failed > 0) {
+    pauseRequested = true;
+    pauseStartedAt = Date.now();
+    emitPauseJobState("paused", "Resume failed");
+    emitBatchUpdate({ status: "started", paused: true, message: "Resume failed" });
+    throw new Error("无法恢复当前 FFmpeg 进程");
+  }
+
+  return { paused: false, resumeResult };
 });
 
 ipcMain.handle("shell:reveal-path", async (_event, targetPath) => {
