@@ -5,6 +5,7 @@ import {
   CircleStop,
   Clock3,
   Cpu,
+  FileSearch,
   FolderOpen,
   Gauge,
   ListVideo,
@@ -328,23 +329,39 @@ function App() {
 
   function openStartTimeEditor(job) {
     const startTimeMs = normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs);
-    const parts = getDateParts(startTimeMs);
     setStartTimeEditor({
       jobId: job.id,
-      ...parts
+      fileName: job.name,
+      value: formatDateTime(startTimeMs),
+      error: ""
     });
   }
 
   function saveStartTime() {
     if (!startTimeEditor) return;
 
-    const startTimeMs = parseLocalDateTimeParts(startTimeEditor);
-    if (!Number.isFinite(startTimeMs)) return;
+    const startTimeMs = parseDateTimeFromText(startTimeEditor.value);
+    if (!Number.isFinite(startTimeMs)) {
+      setStartTimeEditor((current) => (current ? { ...current, error: "请输入有效的年月日和时分秒" } : current));
+      return;
+    }
 
     setJobs((current) =>
       current.map((job) => (job.id === startTimeEditor.jobId ? { ...job, startTimeMs } : job))
     );
     setStartTimeEditor(null);
+  }
+
+  function parseStartTimeFromFileName() {
+    if (!startTimeEditor) return;
+
+    const startTimeMs = parseDateTimeFromText(startTimeEditor.fileName);
+    if (!Number.isFinite(startTimeMs)) {
+      setStartTimeEditor((current) => (current ? { ...current, error: "文件名里没有可识别的年月日和时分秒" } : current));
+      return;
+    }
+
+    setStartTimeEditor((current) => (current ? { ...current, value: formatDateTime(startTimeMs), error: "" } : current));
   }
 
   return (
@@ -575,6 +592,7 @@ function App() {
           editor={startTimeEditor}
           onCancel={() => setStartTimeEditor(null)}
           onChange={(changes) => setStartTimeEditor((current) => (current ? { ...current, ...changes } : current))}
+          onParseFileName={parseStartTimeFromFileName}
           onSave={saveStartTime}
         />
       )}
@@ -702,7 +720,7 @@ function Metric({ icon, label, value }) {
   );
 }
 
-function StartTimeDialog({ editor, onCancel, onChange, onSave }) {
+function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }) {
   return (
     <div
       className="modal-backdrop"
@@ -725,107 +743,34 @@ function StartTimeDialog({ editor, onCancel, onChange, onSave }) {
           <strong>开始时间</strong>
         </div>
         <div className="dialog-fields">
-          <div className="dialog-section">
-            <span className="dialog-section-label">日期</span>
-            <div className="date-time-grid date-grid">
-              <label>
-                <span>年</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  min="1970"
-                  onChange={(event) => onChange({ year: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.year}
-                />
-              </label>
-              <label>
-                <span>月</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  max="12"
-                  min="1"
-                  onChange={(event) => onChange({ month: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.month}
-                />
-              </label>
-              <label>
-                <span>日</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  max="31"
-                  min="1"
-                  onChange={(event) => onChange({ day: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.day}
-                />
-              </label>
-            </div>
-          </div>
-          <div className="dialog-section">
-            <span className="dialog-section-label">时间</span>
-            <div className="date-time-grid time-grid">
-              <label>
-                <span>时</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  max="23"
-                  min="0"
-                  onChange={(event) => onChange({ hour: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.hour}
-                />
-              </label>
-              <label>
-                <span>分</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  max="59"
-                  min="0"
-                  onChange={(event) => onChange({ minute: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.minute}
-                />
-              </label>
-              <label>
-                <span>秒</span>
-                <input
-                  className="text-input"
-                  inputMode="numeric"
-                  max="59"
-                  min="0"
-                  onChange={(event) => onChange({ second: event.target.value })}
-                  required
-                  step="1"
-                  type="number"
-                  value={editor.second}
-                />
-              </label>
-            </div>
-          </div>
+          <label className="single-time-field">
+            <span>时间</span>
+            <input
+              autoComplete="off"
+              autoFocus
+              className="text-input"
+              onChange={(event) => onChange({ value: event.target.value, error: "" })}
+              placeholder="2026-06-20 14:30:00"
+              required
+              type="text"
+              value={editor.value}
+            />
+          </label>
+          {editor.error && <span className="dialog-error">{editor.error}</span>}
         </div>
         <div className="dialog-actions">
-          <button className="ghost-button" onClick={onCancel} type="button">
-            取消
+          <button className="ghost-button file-name-parse-button" onClick={onParseFileName} title={editor.fileName} type="button">
+            <FileSearch size={15} />
+            <span>通过文件名解析</span>
           </button>
-          <button className="primary-button" type="submit">
-            确定
-          </button>
+          <div className="dialog-confirm-actions">
+            <button className="ghost-button" onClick={onCancel} type="button">
+              取消
+            </button>
+            <button className="primary-button" type="submit">
+              确定
+            </button>
+          </div>
         </div>
       </form>
     </div>
@@ -1012,19 +957,20 @@ function formatDateTime(timestamp) {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
-function parseIntegerPart(value) {
-  const text = String(value ?? "").trim();
-  return /^\d+$/.test(text) ? Number(text) : NaN;
-}
-
-function parseLocalDateTimeParts(parts) {
-  const year = parseIntegerPart(parts?.year);
-  const month = parseIntegerPart(parts?.month);
-  const day = parseIntegerPart(parts?.day);
-  const hour = parseIntegerPart(parts?.hour);
-  const minute = parseIntegerPart(parts?.minute);
-  const second = parseIntegerPart(parts?.second);
+function parseDateTimeParts(parts) {
+  const [year, month, day, hour, minute, second] = parts.map((part) => Number(part));
   const date = new Date(year, month - 1, day, hour, minute, second, 0);
+
+  if (
+    !parts.every((part) => /^\d+$/.test(String(part))) ||
+    year < 1970 ||
+    year > 2099 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return NaN;
+  }
 
   if (
     date.getFullYear() !== year ||
@@ -1038,6 +984,98 @@ function parseLocalDateTimeParts(parts) {
   }
 
   return Number.isFinite(date.getTime()) ? date.getTime() : NaN;
+}
+
+function parseCompactDateTime(value) {
+  const text = String(value ?? "");
+  const matches = text.matchAll(/(?:19|20)\d{12}/g);
+
+  for (const match of matches) {
+    const compact = match[0];
+    const timestamp = parseDateTimeParts([
+      compact.slice(0, 4),
+      compact.slice(4, 6),
+      compact.slice(6, 8),
+      compact.slice(8, 10),
+      compact.slice(10, 12),
+      compact.slice(12, 14)
+    ]);
+
+    if (Number.isFinite(timestamp)) {
+      return timestamp;
+    }
+  }
+
+  return NaN;
+}
+
+function parseYmd(value) {
+  const text = String(value ?? "");
+  if (!/^(?:19|20)\d{6}$/.test(text)) return null;
+  return [text.slice(0, 4), text.slice(4, 6), text.slice(6, 8)];
+}
+
+function parseHms(value) {
+  const text = String(value ?? "");
+  if (!/^\d{6}$/.test(text)) return null;
+  return [text.slice(0, 2), text.slice(2, 4), text.slice(4, 6)];
+}
+
+function parseDateTimeFromGroups(groups, index) {
+  const current = groups[index]?.value || "";
+  const compactTimestamp = parseCompactDateTime(current);
+  if (Number.isFinite(compactTimestamp)) return compactTimestamp;
+
+  const ymd = parseYmd(current);
+  const next = groups[index + 1]?.value;
+  const nextHms = parseHms(next);
+  if (ymd && nextHms) return parseDateTimeParts([...ymd, ...nextHms]);
+
+  if (ymd && groups[index + 1] && groups[index + 2] && groups[index + 3]) {
+    return parseDateTimeParts([ymd[0], ymd[1], ymd[2], groups[index + 1].value, groups[index + 2].value, groups[index + 3].value]);
+  }
+
+  if (/^(?:19|20)\d{2}$/.test(current) && groups[index + 1] && groups[index + 2] && groups[index + 3]) {
+    const hms = parseHms(groups[index + 3].value);
+    if (hms) {
+      return parseDateTimeParts([current, groups[index + 1].value, groups[index + 2].value, ...hms]);
+    }
+  }
+
+  if (/^(?:19|20)\d{2}$/.test(current) && groups[index + 1] && groups[index + 2] && groups[index + 3] && groups[index + 4] && groups[index + 5]) {
+    return parseDateTimeParts([
+      current,
+      groups[index + 1].value,
+      groups[index + 2].value,
+      groups[index + 3].value,
+      groups[index + 4].value,
+      groups[index + 5].value
+    ]);
+  }
+
+  return NaN;
+}
+
+function parseDateTimeFromText(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return NaN;
+
+  const groups = [];
+  const digitPattern = /\d+/g;
+  let match;
+
+  while ((match = digitPattern.exec(text))) {
+    groups.push({ value: match[0], index: match.index });
+  }
+
+  for (let index = 0; index < groups.length; index += 1) {
+    const timestamp = parseDateTimeFromGroups(groups, index);
+    if (Number.isFinite(timestamp)) {
+      return timestamp;
+    }
+  }
+
+  return NaN;
 }
 
 export default App;

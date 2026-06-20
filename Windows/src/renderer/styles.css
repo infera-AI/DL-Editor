@@ -871,20 +871,7 @@ button:disabled {
   font-weight: 700;
 }
 
-.date-time-grid {
-  display: grid;
-  gap: 7px;
-}
-
-.date-grid {
-  grid-template-columns: minmax(0, 1.35fr) repeat(2, minmax(0, 1fr));
-}
-
-.time-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.date-time-grid label {
+.single-time-field {
   display: grid;
   gap: 6px;
   color: var(--muted-strong);
@@ -892,21 +879,42 @@ button:disabled {
   font-weight: 650;
 }
 
-.date-time-grid .text-input {
-  min-width: 0;
-  padding: 0 8px;
+.single-time-field .text-input {
+  font-variant-numeric: tabular-nums;
+}
+
+.dialog-error {
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .dialog-actions {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.dialog-confirm-actions {
+  display: flex;
   justify-content: flex-end;
   gap: 7px;
+}
+
+.file-name-parse-button {
+  flex: 0 1 auto;
+  min-width: 136px;
 }
 
 .dialog-actions .primary-button,
 .dialog-actions .ghost-button {
   flex: 0 0 auto;
   min-width: 76px;
+}
+
+.dialog-actions .file-name-parse-button {
+  min-width: 136px;
 }
 
 @media (max-width: 1040px) {
