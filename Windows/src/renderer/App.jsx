@@ -139,8 +139,12 @@ function App() {
         );
         setNotice("处理已继续");
       } else if (update.status === "started") {
+        const modeLabel =
+          update.processingDevice === "cpu"
+            ? "CPU"
+            : `GPU 极速，视频并发：${update.videoConcurrency || 1}，分段并发：${update.concurrency || 1}`;
         setNotice(
-          `开始处理 ${update.total} 个视频，模式：${update.processingDevice === "cpu" ? "CPU" : "GPU"}，编码器：${update.encoder}，视频串行，分段并发：${update.concurrency || 1}`
+          `开始处理 ${update.total} 个视频，模式：${modeLabel}，编码器：${update.encoder}`
         );
       }
     });

@@ -4,6 +4,15 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { getMuxOriginalAudioArgs, getOutputStreamArgs } = require("./ffmpegArgs.cjs");
+const { parseMacGpuUsageFromIoreg } = require("./gpuUsage.cjs");
+const {
+  getFilterThreadCount,
+  getSegmentCount,
+  getSegmentedJobConcurrency,
+  getVideoConcurrency
+} = require("./gpuScheduler.cjs");
+const { buildVideoFilters } = require("./videoFilters.cjs");
 
 let mainWindow;
 const activeProcesses = new Set();
@@ -327,14 +336,22 @@ async function sampleGpuUsage() {
     return emptyGpuUsage();
   }
 
-  return {
-    status: "restricted",
-    total: null,
-    videoEncode: null,
-    threeD: null,
-    compute: null,
-    rawTotal: null
-  };
+  const acceleratorClasses = ["IOAccelerator", "AGXAccelerator", "IOGraphicsAccelerator2"];
+
+  for (const acceleratorClass of acceleratorClasses) {
+    try {
+      const result = await runBinary("ioreg", ["-r", "-d", "1", "-w", "0", "-c", acceleratorClass]);
+      const usage = parseMacGpuUsageFromIoreg(result.stdout);
+
+      if (usage.status === "ok") {
+        return usage;
+      }
+    } catch {
+      // Try the next accelerator class. macOS exposes different classes across GPU families.
+    }
+  }
+
+  return emptyGpuUsage("restricted");
 }
 
 async function buildUsageSnapshot() {
@@ -535,37 +552,51 @@ function createOutputPath(job, outputDirectory, reservedPaths = new Set()) {
   return candidate;
 }
 
-async function probeDuration(inputPath) {
+async function probeMediaInfo(inputPath) {
   const ffprobePath = getBundledBinary("ffprobe");
   const { stdout } = await runBinary(ffprobePath, [
     "-v",
     "error",
+    "-select_streams",
+    "v:0",
     "-show_entries",
-    "format=duration",
+    "stream=width,height,avg_frame_rate,r_frame_rate:format=duration",
     "-of",
-    "default=noprint_wrappers=1:nokey=1",
+    "json",
     inputPath
   ]);
 
-  const duration = Number(stdout.trim());
-  return Number.isFinite(duration) && duration > 0 ? duration : 0;
-}
+  const parsed = JSON.parse(stdout || "{}");
+  const stream = Array.isArray(parsed.streams) ? parsed.streams[0] || {} : {};
+  const duration = Number(parsed.format?.duration);
+  const width = Number(stream.width);
+  const height = Number(stream.height);
 
-function buildVideoFilters(options) {
-  const filters = [`fps=${options.fps}`];
-
-  if (options.resolutionMode !== "source") {
-    filters.push(
-      `scale=w='min(${options.width},iw)':h='min(${options.height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`
-    );
-  }
-
-  return filters.join(",");
+  return {
+    duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
+    width: Number.isFinite(width) && width > 0 ? width : null,
+    height: Number.isFinite(height) && height > 0 ? height : null,
+    avgFrameRate: stream.avg_frame_rate || null,
+    rFrameRate: stream.r_frame_rate || null
+  };
 }
 
 function getEncoderArgs(encoder, logicalCores) {
   if (encoder === "h264_videotoolbox") {
-    return ["-c:v", "h264_videotoolbox", "-realtime", "1", "-allow_sw", "0", "-b:v", "3500k", "-pix_fmt", "nv12"];
+    return [
+      "-c:v",
+      "h264_videotoolbox",
+      "-realtime",
+      "1",
+      "-prio_speed",
+      "1",
+      "-allow_sw",
+      "0",
+      "-b:v",
+      "3500k",
+      "-pix_fmt",
+      "nv12"
+    ];
   }
 
   if (encoder === "h264_nvenc") {
@@ -579,12 +610,18 @@ function getEncoderArgs(encoder, logicalCores) {
   return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", String(Math.max(1, logicalCores - 1))];
 }
 
-function buildFfmpegArgs({ inputPath, outputPath, options, encoder, logicalCores }) {
+function buildFfmpegArgs({ inputPath, outputPath, options, encoder, logicalCores, mediaInfo }) {
   const useGpuPath = options.processingDevice === "gpu" && encoder !== "libx264";
   const decoderArgs = useGpuPath ? ["-hwaccel", encoder === "h264_videotoolbox" ? "videotoolbox" : "auto"] : [];
   const seekArgs = Number.isFinite(options.segmentStart) && options.segmentStart > 0 ? ["-ss", options.segmentStart.toFixed(3)] : [];
   const durationArgs =
     Number.isFinite(options.segmentDuration) && options.segmentDuration > 0 ? ["-t", options.segmentDuration.toFixed(3)] : [];
+  const filterThreads = Number.isFinite(Number(options.filterThreads))
+    ? Number(options.filterThreads)
+    : Math.max(1, Math.min(logicalCores || 1, 8));
+  const videoFilters = buildVideoFilters(options, mediaInfo);
+  const filterArgs = videoFilters ? ["-vf", videoFilters] : [];
+  const fastStartArgs = options.fastStart === false ? [] : ["-movflags", "+faststart"];
 
   return [
     "-y",
@@ -593,27 +630,18 @@ function buildFfmpegArgs({ inputPath, outputPath, options, encoder, logicalCores
     "pipe:1",
     "-nostats",
     "-filter_threads",
-    String(Math.max(1, Math.min(logicalCores || 1, 8))),
+    String(Math.max(1, Math.round(filterThreads))),
     ...decoderArgs,
     ...seekArgs,
     "-i",
     inputPath,
     ...durationArgs,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a?",
-    "-vf",
-    buildVideoFilters(options),
+    ...getOutputStreamArgs({ videoOnly: options.videoOnly }),
+    ...filterArgs,
     ...getEncoderArgs(encoder, logicalCores),
-    "-c:a",
-    "aac",
-    "-b:a",
-    "160k",
     "-avoid_negative_ts",
     "make_zero",
-    "-movflags",
-    "+faststart",
+    ...fastStartArgs,
     outputPath
   ];
 }
@@ -712,7 +740,7 @@ function getActiveJobMessage(message) {
   return pauseRequested ? "Paused" : message;
 }
 
-async function runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt) {
+async function runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo) {
   await waitWhilePaused();
 
   const ffmpegPath = getBundledBinary("ffmpeg");
@@ -721,7 +749,8 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
     outputPath,
     options,
     encoder,
-    logicalCores: capabilities.logicalCores
+    logicalCores: capabilities.logicalCores,
+    mediaInfo
   });
 
   emitJobUpdate({
@@ -795,17 +824,18 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 
 async function transcodeJob(job, options, outputDirectory, capabilities, reservedOutputPaths) {
   const outputPath = createOutputPath(job, outputDirectory, reservedOutputPaths);
-  const duration = await probeDuration(job.path);
+  const mediaInfo = await probeMediaInfo(job.path);
+  const duration = mediaInfo.duration;
   const encoder = options.processingDevice === "cpu" ? "libx264" : capabilities.selectedGpuEncoder;
   const startedAt = Date.now();
 
   try {
     const segmented = options.enableSegmentation
-      ? await transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt)
+      ? await transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo)
       : false;
 
     if (!segmented) {
-      await runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt);
+      await runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo);
     }
   } catch (error) {
     if (cancelRequested || encoder === "libx264" || options.processingDevice === "cpu") {
@@ -828,7 +858,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
       message: `${encoder} unavailable, retrying CPU`
     });
 
-    await runFfmpegJob(job, options, outputPath, duration, capabilities, "libx264", startedAt);
+    await runFfmpegJob(job, options, outputPath, duration, capabilities, "libx264", startedAt, mediaInfo);
   }
 
   emitJobUpdate({
@@ -842,34 +872,6 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
     outputPath,
     message: "Complete"
   });
-}
-
-function getSegmentedJobConcurrency(encoder, capabilities) {
-  if (encoder === "libx264") {
-    return 1;
-  }
-
-  const cores = capabilities.logicalCores || 1;
-
-  if (encoder === "h264_videotoolbox") {
-    return Math.max(2, Math.min(5, Math.floor(cores / 2) || 2));
-  }
-
-  if (encoder === "h264_nvenc") {
-    return 3;
-  }
-
-  return Math.max(2, Math.min(3, Math.floor(cores / 4) || 2));
-}
-
-function getSegmentCount(duration, concurrency) {
-  if (!Number.isFinite(duration) || duration < 120 || concurrency <= 1) {
-    return 1;
-  }
-
-  const targetSegmentSeconds = duration >= 3600 ? 240 : 180;
-  const minimumSegments = Math.max(2, concurrency);
-  return Math.max(minimumSegments, Math.min(96, Math.ceil(duration / targetSegmentSeconds)));
 }
 
 function escapeConcatPath(filePath) {
@@ -910,7 +912,7 @@ function runTrackedProcess(command, args) {
   });
 }
 
-async function runFfmpegSegment({ job, options, segment, capabilities, encoder, startedAt, onProgress }) {
+async function runFfmpegSegment({ job, options, segment, capabilities, encoder, startedAt, mediaInfo, onProgress }) {
   await waitWhilePaused();
 
   const ffmpegPath = getBundledBinary("ffmpeg");
@@ -920,10 +922,13 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
     options: {
       ...options,
       segmentStart: segment.start,
-      segmentDuration: segment.duration
+      segmentDuration: segment.duration,
+      videoOnly: true,
+      fastStart: false
     },
     encoder,
-    logicalCores: capabilities.logicalCores
+    logicalCores: capabilities.logicalCores,
+    mediaInfo
   });
 
   await new Promise((resolve, reject) => {
@@ -994,15 +999,30 @@ async function concatSegments(segments, outputPath) {
     listPath,
     "-c",
     "copy",
-    "-movflags",
-    "+faststart",
     outputPath
   ]);
 }
 
-async function transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt) {
-  const concurrency = getSegmentedJobConcurrency(encoder, capabilities);
-  const segmentCount = getSegmentCount(duration, concurrency);
+async function muxOriginalAudio(videoPath, sourcePath, outputPath) {
+  await waitWhilePaused();
+
+  const ffmpegPath = getBundledBinary("ffmpeg");
+  try {
+    await runTrackedProcess(ffmpegPath, getMuxOriginalAudioArgs({ videoPath, sourcePath, outputPath, audioMode: "copy" }));
+  } catch (error) {
+    if (cancelRequested) {
+      throw error;
+    }
+
+    await waitWhilePaused();
+    await runTrackedProcess(ffmpegPath, getMuxOriginalAudioArgs({ videoPath, sourcePath, outputPath, audioMode: "aac" }));
+  }
+}
+
+async function transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo) {
+  const concurrency =
+    options.segmentConcurrency || getSegmentedJobConcurrency(encoder, capabilities, { videoConcurrency: options.videoConcurrency || 1 });
+  const segmentCount = getSegmentCount(duration, concurrency, encoder);
 
   if (segmentCount <= 1) {
     return false;
@@ -1060,11 +1080,15 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
 
       await runFfmpegSegment({
         job,
-        options,
+        options: {
+          ...options,
+          videoOnly: true
+        },
         segment,
         capabilities,
         encoder,
         startedAt,
+        mediaInfo,
         onProgress: (index, current) => {
           progressBySegment[index] = current;
           emitAggregate(`GPU segmented x${Math.min(concurrency, segmentCount)} · ${completedSegments}/${segmentCount}`);
@@ -1084,8 +1108,11 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
       throw new Error("Canceled by user.");
     }
 
-    emitAggregate("Merging GPU segments");
-    await concatSegments(segments, outputPath);
+    const mergedVideoPath = path.join(tempDir, "merged-video.mp4");
+    emitAggregate("Merging GPU video segments");
+    await concatSegments(segments, mergedVideoPath);
+    emitAggregate("Muxing audio");
+    await muxOriginalAudio(mergedVideoPath, job.path, outputPath);
     return true;
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1101,17 +1128,25 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   jobSnapshots.clear();
 
   const options = normalizeOptions(rawOptions);
-  const runtimeOptions = {
-    ...options,
-    enableSegmentation: options.processingDevice === "gpu"
-  };
   const outputDirectory = rawOutputDirectory || getDefaultOutputDirectory();
   ensureDirectory(outputDirectory);
 
   const capabilities = await getCapabilities();
-  const activeEncoder = runtimeOptions.processingDevice === "cpu" ? "libx264" : capabilities.selectedGpuEncoder;
-  const segmentConcurrency = runtimeOptions.enableSegmentation ? getSegmentedJobConcurrency(activeEncoder, capabilities) : 1;
-  const videoConcurrency = 1;
+  const activeEncoder = options.processingDevice === "cpu" ? "libx264" : capabilities.selectedGpuEncoder;
+  const enableSegmentation = options.processingDevice === "gpu";
+  const videoConcurrency = getVideoConcurrency(options, activeEncoder, jobs.length);
+  const segmentConcurrency = enableSegmentation
+    ? getSegmentedJobConcurrency(activeEncoder, capabilities, { videoConcurrency })
+    : 1;
+  const activeFfmpegWorkers = Math.max(1, videoConcurrency * segmentConcurrency);
+  const filterThreads = getFilterThreadCount(activeEncoder, capabilities, { activeWorkers: activeFfmpegWorkers });
+  const runtimeOptions = {
+    ...options,
+    enableSegmentation,
+    segmentConcurrency,
+    videoConcurrency,
+    filterThreads
+  };
   const reservedOutputPaths = new Set();
   emitBatchUpdate({
     status: "started",
@@ -1121,39 +1156,48 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
     encoder: activeEncoder,
     processingDevice: runtimeOptions.processingDevice,
     concurrency: segmentConcurrency,
-    videoConcurrency
+    videoConcurrency,
+    filterThreads
   });
 
   let completed = 0;
   let failed = 0;
   const settledJobs = new Set();
+  let nextJobIndex = 0;
 
-  for (const job of jobs) {
-    if (cancelRequested) {
-      break;
-    }
+  async function processNextJob() {
+    while (!cancelRequested) {
+      await waitWhilePaused();
 
-    await waitWhilePaused();
+      const job = jobs[nextJobIndex];
+      nextJobIndex += 1;
 
-    try {
-      await transcodeJob(job, runtimeOptions, outputDirectory, capabilities, reservedOutputPaths);
-      completed += 1;
-      settledJobs.add(job.id);
-    } catch (error) {
-      settledJobs.add(job.id);
-      if (cancelRequested) {
-        emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "Canceled" });
-      } else {
-        failed += 1;
-        emitJobUpdate({
-          id: job.id,
-          status: "error",
-          progress: 0,
-          message: error.message || "Failed to process video"
-        });
+      if (!job) {
+        return;
+      }
+
+      try {
+        await transcodeJob(job, runtimeOptions, outputDirectory, capabilities, reservedOutputPaths);
+        completed += 1;
+        settledJobs.add(job.id);
+      } catch (error) {
+        settledJobs.add(job.id);
+        if (cancelRequested) {
+          emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "Canceled" });
+        } else {
+          failed += 1;
+          emitJobUpdate({
+            id: job.id,
+            status: "error",
+            progress: 0,
+            message: error.message || "Failed to process video"
+          });
+        }
       }
     }
   }
+
+  await Promise.all(Array.from({ length: videoConcurrency }, () => processNextJob()));
 
   if (cancelRequested) {
     for (const job of jobs) {
@@ -1177,7 +1221,8 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
     encoder: activeEncoder,
     processingDevice: runtimeOptions.processingDevice,
     concurrency: segmentConcurrency,
-    videoConcurrency
+    videoConcurrency,
+    filterThreads
   });
 }
 
