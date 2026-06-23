@@ -8,6 +8,7 @@ import {
   FileSearch,
   FolderOpen,
   Gauge,
+  Info,
   ListVideo,
   Maximize2,
   Minimize2,
@@ -27,6 +28,7 @@ import {
   Zap
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import packageJson from "../../package.json";
 
 const FPS_PRESETS = [1, 2, 4, 5, 10];
 const RESOLUTION_PRESETS = [
@@ -43,6 +45,14 @@ const STATUS_LABELS = {
   error: "失败",
   canceled: "取消",
   paused: "暂停"
+};
+
+const APP_INFO = {
+  name: "DL Editor",
+  version: packageJson.version,
+  updatedAt: "2026-06-23",
+  engine: "FFmpeg / FFprobe",
+  stack: "Electron + React"
 };
 
 const dlEditor = window.dlEditor || {
@@ -102,6 +112,7 @@ function App() {
   });
   const [isMaximized, setIsMaximized] = useState(false);
   const [startTimeEditor, setStartTimeEditor] = useState(null);
+  const [showAppInfo, setShowAppInfo] = useState(false);
 
   const isRunning = batchState.status === "started";
   const isPaused = isRunning && Boolean(batchState.paused);
@@ -374,6 +385,7 @@ function App() {
         isMaximized={isMaximized}
         onClose={() => dlEditor.closeWindow()}
         onMinimize={() => dlEditor.minimizeWindow()}
+        onInfoClick={() => setShowAppInfo(true)}
         onThemeToggle={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
         onToggleMaximize={() => dlEditor.toggleMaximizeWindow().then(setIsMaximized).catch(() => undefined)}
         theme={theme}
@@ -530,7 +542,7 @@ function App() {
               {isPaused ? <Play size={16} /> : <Pause size={16} />}
               <span>{isPaused ? "继续" : "暂停"}</span>
             </button>
-            <button className="ghost-button" disabled={!isRunning} onClick={cancelBatch} type="button">
+            <button className="ghost-button danger-button" disabled={!isRunning} onClick={cancelBatch} type="button">
               <CircleStop size={17} />
               <span>取消</span>
             </button>
@@ -600,15 +612,27 @@ function App() {
           onSave={saveStartTime}
         />
       )}
+      {showAppInfo && (
+        <AppInfoDialog
+          activeEncoder={activeEncoder}
+          capabilities={capabilities}
+          info={APP_INFO}
+          onClose={() => setShowAppInfo(false)}
+          outputDirectory={outputDirectory}
+        />
+      )}
     </main>
   );
 }
 
-function AppChrome({ isMaximized, onClose, onMinimize, onThemeToggle, onToggleMaximize, theme }) {
+function AppChrome({ isMaximized, onClose, onInfoClick, onMinimize, onThemeToggle, onToggleMaximize, theme }) {
   return (
     <section className="app-chrome">
       <div className="drag-region" />
       <div className="window-actions">
+        <button className="chrome-button" onClick={onInfoClick} title="软件信息" type="button">
+          <Info size={14} />
+        </button>
         <button className="chrome-button" onClick={onThemeToggle} title={theme === "dark" ? "切换浅色主题" : "切换深色主题"} type="button">
           {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
         </button>
@@ -623,6 +647,53 @@ function AppChrome({ isMaximized, onClose, onMinimize, onThemeToggle, onToggleMa
         </button>
       </div>
     </section>
+  );
+}
+
+function AppInfoDialog({ activeEncoder, capabilities, info, onClose, outputDirectory }) {
+  const gpuNames = capabilities?.gpuNames?.length ? capabilities.gpuNames.join(", ") : "未检测到";
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+      role="presentation"
+    >
+      <section aria-modal="true" className="app-info-dialog" role="dialog">
+        <div className="dialog-heading app-info-heading">
+          <Info size={18} />
+          <div>
+            <strong>软件信息</strong>
+            <span>{info.name}</span>
+          </div>
+        </div>
+        <div className="app-info-grid">
+          <span>版本</span>
+          <strong>{info.version}</strong>
+          <span>更新时间</span>
+          <strong>{info.updatedAt}</strong>
+          <span>处理引擎</span>
+          <strong>{info.engine}</strong>
+          <span>界面框架</span>
+          <strong>{info.stack}</strong>
+          <span>当前编码器</span>
+          <strong>{activeEncoder}</strong>
+          <span>GPU</span>
+          <strong>{gpuNames}</strong>
+          <span>输出位置</span>
+          <strong title={outputDirectory}>{outputDirectory || "-"}</strong>
+        </div>
+        <div className="dialog-actions app-info-actions">
+          <button className="primary-button" onClick={onClose} type="button">
+            知道了
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
