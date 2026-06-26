@@ -5,6 +5,7 @@ import {
   CircleStop,
   Clock3,
   Cpu,
+  Download,
   FileSearch,
   FolderOpen,
   Gauge,
@@ -77,7 +78,9 @@ const dlEditor = window.dlEditor || {
   pauseBatch: async () => ({ paused: true }),
   resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
+  checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
   openPath: async () => undefined,
+  openExternal: async () => undefined,
   revealPath: async () => undefined,
   minimizeWindow: async () => undefined,
   toggleMaximizeWindow: async () => false,
@@ -113,6 +116,7 @@ function App() {
   const [isMaximized, setIsMaximized] = useState(false);
   const [startTimeEditor, setStartTimeEditor] = useState(null);
   const [showAppInfo, setShowAppInfo] = useState(false);
+  const [updateState, setUpdateState] = useState({ status: "idle", message: "" });
 
   const isRunning = batchState.status === "started";
   const isPaused = isRunning && Boolean(batchState.paused);
@@ -377,6 +381,35 @@ function App() {
     setStartTimeEditor((current) => (current ? { ...current, value: formatDateTime(startTimeMs), error: "" } : current));
   }
 
+  async function checkForUpdates() {
+    setUpdateState({ status: "checking", message: "正在检查 GitHub 最新版本..." });
+
+    try {
+      const result = await dlEditor.checkForUpdates();
+      setUpdateState({ ...result, message: getUpdateMessage(result) });
+    } catch (error) {
+      setUpdateState({
+        status: "error",
+        message: error.message || "无法检查更新，请稍后再试"
+      });
+    }
+  }
+
+  async function openUpdateLink(update) {
+    const targetUrl = update?.downloadUrl || update?.releaseUrl;
+    if (!targetUrl) return;
+
+    try {
+      await dlEditor.openExternal(targetUrl);
+    } catch (error) {
+      setUpdateState((current) => ({
+        ...current,
+        status: "error",
+        message: error.message || "无法打开更新链接"
+      }));
+    }
+  }
+
   return (
     <main className="app-shell">
       <AppChrome
@@ -615,8 +648,11 @@ function App() {
           activeEncoder={activeEncoder}
           capabilities={capabilities}
           info={APP_INFO}
+          onCheckUpdates={checkForUpdates}
           onClose={() => setShowAppInfo(false)}
+          onOpenUpdate={openUpdateLink}
           outputDirectory={outputDirectory}
+          updateState={updateState}
         />
       )}
     </main>
@@ -648,8 +684,11 @@ function AppChrome({ isMaximized, onClose, onInfoClick, onMinimize, onThemeToggl
   );
 }
 
-function AppInfoDialog({ activeEncoder, capabilities, info, onClose, outputDirectory }) {
+function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onClose, onOpenUpdate, outputDirectory, updateState }) {
   const gpuNames = capabilities?.gpuNames?.length ? capabilities.gpuNames.join(", ") : "未检测到";
+  const isCheckingUpdate = updateState?.status === "checking";
+  const canOpenUpdate =
+    updateState?.status === "available" || updateState?.status === "no_asset" || updateState?.status === "no_release";
 
   return (
     <div
@@ -685,14 +724,47 @@ function AppInfoDialog({ activeEncoder, capabilities, info, onClose, outputDirec
           <span>输出位置</span>
           <strong title={outputDirectory}>{outputDirectory || "-"}</strong>
         </div>
+        <div className={`update-status ${updateState?.status || "idle"}`}>
+          <span>{updateState?.message || "从 GitHub Releases 检查最新安装包"}</span>
+        </div>
         <div className="dialog-actions app-info-actions">
-          <button className="primary-button" onClick={onClose} type="button">
+          <button className="ghost-button" disabled={isCheckingUpdate} onClick={onCheckUpdates} type="button">
+            <RotateCcw size={14} />
+            {isCheckingUpdate ? "检查中" : "检查更新"}
+          </button>
+          {canOpenUpdate && (
+            <button className="primary-button" onClick={() => onOpenUpdate(updateState)} type="button">
+              <Download size={14} />
+              {updateState.status === "available" ? "下载更新" : "打开发布页"}
+            </button>
+          )}
+          <button className={canOpenUpdate ? "ghost-button" : "primary-button"} onClick={onClose} type="button">
             知道了
           </button>
         </div>
       </section>
     </div>
   );
+}
+
+function getUpdateMessage(result) {
+  if (result?.status === "available") {
+    return `发现新版本 ${result.latestVersion}：${result.assetName || "安装包可下载"}`;
+  }
+
+  if (result?.status === "latest") {
+    return `当前已是最新版本 ${result.latestVersion || result.currentVersion}`;
+  }
+
+  if (result?.status === "no_asset") {
+    return `发现新版本 ${result.latestVersion}，但没有匹配当前系统的安装包`;
+  }
+
+  if (result?.status === "no_release") {
+    return "GitHub 还没有发布版本，请先在 Releases 上传安装包";
+  }
+
+  return "无法读取更新状态";
 }
 
 function DeviceStatus({ capabilities, device, encoder, usage }) {

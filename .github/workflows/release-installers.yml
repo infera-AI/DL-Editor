@@ -1,0 +1,65 @@
+name: Build release installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload installers to"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    name: macOS arm64 installers
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: Mac
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Mac/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npx electron-builder --mac dmg pkg --arm64 --config.directories.output=release-upload
+      - name: Upload macOS assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            release-upload/DL-Editor-Mac-1.0.0-arm64.dmg \
+            release-upload/DL-Editor-Mac-1.0.0-arm64.pkg \
+            release-upload/DL-Editor-Mac-1.0.0-arm64.dmg.blockmap \
+            --clobber \
+            --repo "${{ github.repository }}"
+
+  windows:
+    name: Windows x64 installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+      - run: npm ci
+      - run: npm run dist
+      - name: Upload Windows assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" `
+            "release/DL-Editor-Windows-Setup-1.0.0.exe" `
+            "release/DL-Editor-Windows-Setup-1.0.0.exe.blockmap" `
+            --clobber `
+            --repo "${{ github.repository }}"

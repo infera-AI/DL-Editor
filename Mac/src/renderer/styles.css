@@ -963,8 +963,49 @@ button:disabled {
   white-space: nowrap;
 }
 
+.update-status {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 9px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.update-status span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.update-status.available {
+  border-color: rgba(23, 114, 69, 0.25);
+  background: rgba(23, 114, 69, 0.08);
+  color: var(--success);
+}
+
+.update-status.error {
+  border-color: rgba(180, 35, 24, 0.22);
+  background: rgba(180, 35, 24, 0.06);
+  color: var(--danger);
+}
+
+.update-status.no_asset,
+.update-status.no_release {
+  border-color: rgba(154, 103, 0, 0.24);
+  background: rgba(154, 103, 0, 0.07);
+  color: var(--warning);
+}
+
 .app-info-actions {
+  flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.app-info-actions .primary-button,
+.app-info-actions .ghost-button {
+  min-width: 96px;
 }
 
 .dialog-fields {

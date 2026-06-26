@@ -5,6 +5,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { getMuxOriginalAudioArgs, getOutputStreamArgs } = require("./ffmpegArgs.cjs");
+const { deriveStartTimeMs } = require("./mediaStartTime.cjs");
+const { checkForUpdate } = require("./updateChecker.cjs");
 const {
   getFilterThreadCount,
   getSegmentCount,
@@ -508,9 +510,16 @@ function formatBytes(bytes) {
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function getFileMetadata(filePath) {
+async function getFileMetadata(filePath) {
   const stats = fs.statSync(filePath);
   const modifiedAtMs = Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : Date.now();
+  let mediaInfo = null;
+
+  try {
+    mediaInfo = await probeMediaInfo(filePath);
+  } catch {
+    mediaInfo = null;
+  }
 
   return {
     id: crypto.randomUUID(),
@@ -520,7 +529,7 @@ function getFileMetadata(filePath) {
     sizeLabel: formatBytes(stats.size),
     modifiedAt: new Date(modifiedAtMs).toISOString(),
     modifiedAtMs,
-    startTimeMs: modifiedAtMs,
+    startTimeMs: deriveStartTimeMs({ mediaInfo, modifiedAtMs }),
     status: "queued",
     progress: 0
   };
@@ -597,15 +606,17 @@ async function probeMediaInfo(inputPath) {
     "-select_streams",
     "v:0",
     "-show_entries",
-    "stream=width,height,avg_frame_rate,r_frame_rate:format=duration",
+    "stream=width,height,avg_frame_rate,r_frame_rate:stream_tags:format=duration:format_tags",
     "-of",
     "json",
     inputPath
   ]);
 
   const parsed = JSON.parse(stdout || "{}");
-  const stream = Array.isArray(parsed.streams) ? parsed.streams[0] || {} : {};
-  const duration = Number(parsed.format?.duration);
+  const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+  const format = parsed.format || {};
+  const stream = streams[0] || {};
+  const duration = Number(format.duration);
   const width = Number(stream.width);
   const height = Number(stream.height);
 
@@ -614,7 +625,9 @@ async function probeMediaInfo(inputPath) {
     width: Number.isFinite(width) && width > 0 ? width : null,
     height: Number.isFinite(height) && height > 0 ? height : null,
     avgFrameRate: stream.avg_frame_rate || null,
-    rFrameRate: stream.r_frame_rate || null
+    rFrameRate: stream.r_frame_rate || null,
+    format,
+    streams
   };
 }
 
@@ -1316,7 +1329,7 @@ ipcMain.handle("videos:select", async () => {
     return [];
   }
 
-  return result.filePaths.map(getFileMetadata);
+  return Promise.all(result.filePaths.map(getFileMetadata));
 });
 
 ipcMain.handle("output:select-directory", async () => {
@@ -1331,6 +1344,13 @@ ipcMain.handle("output:select-directory", async () => {
 
 ipcMain.handle("system:get-capabilities", async () => getCapabilities());
 ipcMain.handle("system:get-usage", async () => latestUsage || buildUsageSnapshot());
+
+ipcMain.handle("updates:check", async () =>
+  checkForUpdate({
+    currentVersion: app.getVersion(),
+    platform: process.platform
+  })
+);
 
 ipcMain.handle("transcode:start-batch", async (_event, payload) => {
   if (queueBusy) {
@@ -1420,4 +1440,14 @@ ipcMain.handle("shell:open-path", async (_event, targetPath) => {
     return shell.openPath(targetPath);
   }
   return "Path does not exist.";
+});
+
+ipcMain.handle("shell:open-external", async (_event, targetUrl) => {
+  const url = String(targetUrl || "");
+  if (!/^https:\/\/github\.com\/infera-AI\/DL-Editor\/releases(?:\/|$)/.test(url)) {
+    throw new Error("Unsupported update URL.");
+  }
+
+  await shell.openExternal(url);
+  return { opened: true };
 });
