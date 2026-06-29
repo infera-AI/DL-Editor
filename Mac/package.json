@@ -1,10 +1,10 @@
 {
-  "name": "dl-editor-mac",
-  "version": "1.0.0",
+  "name": "dl-studio-mac",
+  "version": "1.0.1",
   "private": true,
   "description": "Desktop batch video downsampler for macOS.",
   "main": "src/main/main.js",
-  "author": "DL Editor",
+  "author": "DL Studio",
   "license": "UNLICENSED",
   "type": "commonjs",
   "scripts": {
@@ -14,7 +14,8 @@
     "dist:arm64": "npm run build && electron-builder --mac dmg pkg --arm64",
     "dist:x64": "npm run build && electron-builder --mac dmg pkg --x64",
     "pack": "npm run build && electron-builder --dir",
-    "smoke": "node scripts/smoke.cjs"
+    "smoke": "node scripts/smoke.cjs",
+    "test:app-shell": "node scripts/app-shell.test.cjs"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
@@ -31,8 +32,8 @@
     "wait-on": "^8.0.2"
   },
   "build": {
-    "appId": "com.dleditor.mac",
-    "productName": "DL Editor",
+    "appId": "com.dlstudio.mac",
+    "productName": "DL Studio",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -65,13 +66,13 @@
         "dmg",
         "pkg"
       ],
-      "artifactName": "DL-Editor-Mac-${version}-${arch}.${ext}",
+      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
       "category": "public.app-category.video",
       "hardenedRuntime": false,
       "gatekeeperAssess": false
     },
     "dmg": {
-      "artifactName": "DL-Editor-Mac-${version}-${arch}.${ext}",
+      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
       "contents": [
         {
           "x": 130,
@@ -86,7 +87,7 @@
       ]
     },
     "pkg": {
-      "artifactName": "DL-Editor-Mac-${version}-${arch}.${ext}",
+      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
       "installLocation": "/Applications"
     }
   }

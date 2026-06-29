@@ -1,10 +1,10 @@
 {
-  "name": "dl-editor-windows",
-  "version": "1.0.0",
+  "name": "dl-studio-windows",
+  "version": "1.0.1",
   "private": true,
   "description": "Desktop batch video downsampler for Windows.",
   "main": "src/main/main.js",
-  "author": "DL Editor",
+  "author": "DL Studio",
   "license": "UNLICENSED",
   "type": "commonjs",
   "scripts": {
@@ -13,7 +13,8 @@
     "prepare:win-ffmpeg": "cross-env npm_config_platform=win32 npm_config_arch=x64 node node_modules/ffmpeg-static/install.js",
     "dist": "npm run prepare:win-ffmpeg && npm run build && electron-builder --win nsis --x64",
     "pack": "npm run prepare:win-ffmpeg && npm run build && electron-builder --dir --x64",
-    "smoke": "node scripts/smoke.cjs"
+    "smoke": "node scripts/smoke.cjs",
+    "test:app-shell": "node scripts/app-shell.test.cjs"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
@@ -30,8 +31,8 @@
     "wait-on": "^8.0.2"
   },
   "build": {
-    "appId": "com.dleditor.windows",
-    "productName": "DL Editor",
+    "appId": "com.dlstudio.windows",
+    "productName": "DL Studio",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -64,7 +65,7 @@
           ]
         }
       ],
-      "artifactName": "DL-Editor-Windows-Setup-${version}.${ext}"
+      "artifactName": "DL-Studio-Windows-Setup-${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -73,7 +74,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "DL Editor"
+      "shortcutName": "DL Studio"
     }
   }
 }

@@ -5,23 +5,23 @@ const { buildNoReleaseResult, buildUpdateResult, compareVersions, selectDownload
 const release = {
   tag_name: "v1.2.0",
   html_url: "https://github.com/infera-AI/DL-Editor/releases/tag/v1.2.0",
-  name: "DL Editor 1.2.0",
+  name: "DL Studio 1.2.0",
   published_at: "2026-06-26T08:00:00Z",
   assets: [
     {
-      name: "DL-Editor-Mac-1.2.0-arm64.pkg",
+      name: "DL-Studio-Mac-1.2.0-arm64.pkg",
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/pkg"
     },
     {
-      name: "DL-Editor-Mac-1.2.0-arm64.dmg",
+      name: "DL-Studio-Mac-1.2.0-arm64.dmg",
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/dmg"
     },
     {
-      name: "DL-Editor-Windows-Setup-1.2.0.exe",
+      name: "DL-Studio-Windows-Setup-1.2.0.exe",
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/exe"
     },
     {
-      name: "DL-Editor-Windows-Setup-1.2.0.exe.blockmap",
+      name: "DL-Studio-Windows-Setup-1.2.0.exe.blockmap",
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/blockmap"
     }
   ]
@@ -31,8 +31,8 @@ assert.equal(compareVersions("1.2.0", "1.1.9"), 1);
 assert.equal(compareVersions("v1.0.0", "1.0.0"), 0);
 assert.equal(compareVersions("1.0.0", "1.0.1"), -1);
 
-assert.equal(selectDownloadAsset(release, "darwin").name, "DL-Editor-Mac-1.2.0-arm64.dmg");
-assert.equal(selectDownloadAsset(release, "win32").name, "DL-Editor-Windows-Setup-1.2.0.exe");
+assert.equal(selectDownloadAsset(release, "darwin").name, "DL-Studio-Mac-1.2.0-arm64.dmg");
+assert.equal(selectDownloadAsset(release, "win32").name, "DL-Studio-Windows-Setup-1.2.0.exe");
 
 const macUpdate = buildUpdateResult({
   currentVersion: "1.0.0",

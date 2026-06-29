@@ -2,6 +2,8 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron")
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const os = require("os");
 const path = require("path");
 const { getMuxOriginalAudioArgs, getOutputStreamArgs } = require("./ffmpegArgs.cjs");
@@ -15,8 +17,16 @@ const {
 } = require("./gpuScheduler.cjs");
 const { buildVideoFilters } = require("./videoFilters.cjs");
 
+const APP_NAME = "DL Studio";
+const INFERA_API_BASE_URL = process.env.INFERA_API_BASE_URL || process.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
+const TITLE_BAR_HEIGHT = 42;
+const ZOOM_MIN = -3;
+const ZOOM_MAX = 3;
+const ZOOM_STEP = 0.5;
+
 let mainWindow;
 const activeProcesses = new Set();
+const activeUploadRequests = new Map();
 const jobSnapshots = new Map();
 let cancelRequested = false;
 let pauseRequested = false;
@@ -30,8 +40,428 @@ let usageMonitor = null;
 let gpuSampleInFlight = false;
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
+const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
+const VIDEO_MIME_TYPES = {
+  avi: "video/x-msvideo",
+  m4v: "video/x-m4v",
+  mkv: "video/x-matroska",
+  mov: "video/quicktime",
+  mp4: "video/mp4",
+  webm: "video/webm",
+  wmv: "video/x-ms-wmv"
+};
+
+app.setName(APP_NAME);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function resolveInferaUrl(value) {
+  if (!value) {
+    throw new Error("Missing infera request path.");
+  }
+
+  const rawPath = String(value);
+  if (/^https?:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+
+  const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
+  const normalizedPath = rawPath.replace(/^\/+/, "");
+  return new URL(normalizedPath, `${normalizedBase}/`).toString();
+}
+
+async function requestInfera(payload = {}) {
+  const method = String(payload.method || "GET").toUpperCase();
+  const headers = { Accept: "application/json" };
+
+  if (payload.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (payload.token) {
+    headers.Authorization = `Bearer ${payload.token}`;
+  }
+
+  const response = await fetch(resolveInferaUrl(payload.path), {
+    method,
+    headers,
+    body: payload.body === undefined ? undefined : JSON.stringify(payload.body)
+  });
+
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {
+    result = null;
+  }
+
+  if (!response.ok) {
+    const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+
+  return result;
+}
+
+function parseJsonSafely(value) {
+  try {
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseRawSseEventBlock(block) {
+  let eventName = "message";
+  const dataLines = [];
+
+  for (const line of String(block || "").split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim() || "message";
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  if (!dataLines.length) {
+    return null;
+  }
+
+  const rawData = dataLines.join("\n");
+  return {
+    event: eventName,
+    payload: parseJsonSafely(rawData) ?? rawData
+  };
+}
+
+function parseInferaUploadEvents(responseText) {
+  const parsedJson = parseJsonSafely(responseText);
+  if (parsedJson && typeof parsedJson === "object" && "success" in parsedJson) {
+    if (parsedJson.success === false) {
+      throw new Error(parsedJson.message || "上传失败");
+    }
+
+    return parsedJson.result ?? parsedJson;
+  }
+
+  const blocks = String(responseText || "").split(/\r?\n\r?\n/).map((block) => block.trim()).filter(Boolean);
+  let lastPayload = null;
+
+  for (const block of blocks) {
+    const parsed = parseRawSseEventBlock(block);
+    if (!parsed) {
+      continue;
+    }
+
+    lastPayload = parsed.payload;
+    if (parsed.event === "error") {
+      const detail = parsed.payload?.message || parsed.payload?.detail || parsed.payload;
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+
+    if (parsed.event === "preview_ready" || parsed.event === "done") {
+      const envelope = parsed.payload;
+      if (envelope && typeof envelope === "object" && "success" in envelope) {
+        if (envelope.success === false) {
+          throw new Error(envelope.message || "上传失败");
+        }
+
+        return envelope.result ?? {};
+      }
+
+      return envelope ?? {};
+    }
+  }
+
+  return lastPayload ?? {};
+}
+
+function getVideoMimeType(filePath) {
+  const extension = path.extname(filePath).replace(".", "").toLowerCase();
+  return VIDEO_MIME_TYPES[extension] || "video/mp4";
+}
+
+function escapeMultipartValue(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, " ");
+}
+
+function buildMultipartField(boundary, name, value) {
+  return Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartValue(name)}"\r\n\r\n${String(value)}\r\n`
+  );
+}
+
+function normalizeUploadTimestamp(value) {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp >= 0 ? Math.round(timestamp) : Date.now();
+}
+
+function emitUploadProgress(sender, payload) {
+  if (!sender || sender.isDestroyed?.()) {
+    return;
+  }
+
+  sender.send("infera:upload-progress", payload);
+}
+
+function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, uploadId, url }) {
+  return new Promise((resolve, reject) => {
+    const stats = fs.statSync(filePath);
+    const boundary = `----dl-studio-${crypto.randomBytes(12).toString("hex")}`;
+    const fieldParts = Object.entries(fields).map(([name, value]) => buildMultipartField(boundary, name, value));
+    const fileHeader = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${escapeMultipartValue(fileName)}"\r\nContent-Type: ${getVideoMimeType(filePath)}\r\n\r\n`
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const contentLength =
+      fieldParts.reduce((total, part) => total + part.length, 0) + fileHeader.length + stats.size + footer.length;
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? https : http;
+    let settled = false;
+    let bytesUploaded = 0;
+    const uploadStartedAt = Date.now();
+    const uploadRecord = {
+      canceled: false,
+      request: null,
+      stream: null,
+      cancel: null
+    };
+
+    const settle = (callback, value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (uploadId) {
+        activeUploadRequests.delete(uploadId);
+      }
+      callback(value);
+    };
+
+    const sendProgress = (status, extra = {}) => {
+      const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt) / 1000);
+      emitUploadProgress(sender, {
+        bytesUploaded,
+        filePath,
+        jobId,
+        percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
+        speedBytesPerSecond: Math.round(bytesUploaded / elapsedSeconds),
+        status,
+        totalBytes: stats.size,
+        uploadId,
+        ...extra
+      });
+    };
+
+    const request = transport.request(
+      target,
+      {
+        method: "POST",
+        headers: {
+          Accept: "text/event-stream",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          "Content-Length": contentLength,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            const payload = parseJsonSafely(text);
+            const detail = payload?.message || payload?.detail || text || `上传失败 (${response.statusCode})`;
+            settle(reject, new Error(typeof detail === "string" ? detail : JSON.stringify(detail)));
+            return;
+          }
+
+          try {
+            settle(resolve, parseInferaUploadEvents(text));
+          } catch (error) {
+            settle(reject, error);
+          }
+        });
+      }
+    );
+
+    uploadRecord.request = request;
+    uploadRecord.cancel = () => {
+      if (uploadRecord.canceled) {
+        return;
+      }
+
+      uploadRecord.canceled = true;
+      sendProgress("canceled", { message: "上传已取消" });
+      uploadRecord.stream?.destroy(new Error("上传已取消"));
+      request.destroy(new Error("上传已取消"));
+    };
+
+    if (uploadId) {
+      activeUploadRequests.set(uploadId, uploadRecord);
+    }
+
+    request.on("error", (error) => {
+      settle(reject, uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    for (const part of fieldParts) {
+      request.write(part);
+    }
+    request.write(fileHeader);
+
+    sendProgress("uploading");
+    uploadRecord.stream = fs.createReadStream(filePath);
+    uploadRecord.stream
+      .on("data", (chunk) => {
+        bytesUploaded += chunk.length;
+        sendProgress("uploading");
+      })
+      .on("error", (error) => {
+        request.destroy(error);
+        settle(reject, uploadRecord.canceled ? new Error("上传已取消") : error);
+      })
+      .on("end", () => {
+        bytesUploaded = stats.size;
+        sendProgress("processing", { percent: 100 });
+        request.end(footer);
+      })
+      .pipe(request, { end: false });
+  });
+}
+
+async function uploadInferaVideo(payload = {}, sender) {
+  const filePath = String(payload.path || payload.filePath || "");
+  if (!filePath || !fs.existsSync(filePath)) {
+    throw new Error("找不到要上传的视频文件");
+  }
+
+  const stats = fs.statSync(filePath);
+  if (!stats.isFile()) {
+    throw new Error("只能上传文件");
+  }
+
+  if (!payload.token) {
+    throw new Error("请先登录后上传");
+  }
+
+  const uploadId = String(payload.uploadId || crypto.randomUUID());
+
+  return uploadMultipart({
+    fields: {
+      start_timestamp_ms: normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms)
+    },
+    fileName: payload.fileName || path.basename(filePath),
+    filePath,
+    jobId: payload.jobId,
+    sender,
+    token: payload.token,
+    uploadId,
+    url: resolveInferaUrl(payload.uploadPath || WEB_VIDEO_UPLOAD_PATH)
+  });
+}
+
+function cancelInferaUpload(uploadId) {
+  const id = String(uploadId || "");
+  const upload = activeUploadRequests.get(id);
+  if (!upload) {
+    return { canceled: false };
+  }
+
+  upload.cancel?.();
+  return { canceled: true };
+}
+
+function clampZoomLevel(level) {
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, level));
+}
+
+function setWindowZoomLevel(delta) {
+  if (!mainWindow) {
+    return;
+  }
+
+  const currentLevel = mainWindow.webContents.getZoomLevel();
+  mainWindow.webContents.setZoomLevel(clampZoomLevel(currentLevel + delta));
+}
+
+function resetWindowZoomLevel() {
+  mainWindow?.webContents.setZoomLevel(0);
+}
+
+function isZoomShortcut(input) {
+  if (input.type !== "keyDown") {
+    return false;
+  }
+
+  return process.platform === "darwin"
+    ? input.alt && !input.control && !input.meta
+    : input.control && !input.alt && !input.meta;
+}
+
+function registerWindowShortcuts(window) {
+  window.webContents.on("before-input-event", (event, input) => {
+    if (!isZoomShortcut(input)) {
+      return;
+    }
+
+    const key = String(input.key || "").toLowerCase();
+    if (key === "-" || key === "_" || key === "−" || key === "–" || key === "—") {
+      event.preventDefault();
+      setWindowZoomLevel(-ZOOM_STEP);
+      return;
+    }
+
+    if (key === "=" || key === "+") {
+      event.preventDefault();
+      setWindowZoomLevel(ZOOM_STEP);
+      return;
+    }
+
+    if (key === "0") {
+      event.preventDefault();
+      resetWindowZoomLevel();
+    }
+  });
+}
+
+function emitFullscreenState() {
+  mainWindow?.webContents.send("window:fullscreen-change", Boolean(mainWindow?.isFullScreen()));
+}
+
+function getNativeTitleBarOptions() {
+  if (process.platform === "darwin") {
+    return {
+      titleBarStyle: "hiddenInset",
+      trafficLightPosition: { x: 14, y: 13 }
+    };
+  }
+
+  return {
+    titleBarStyle: "hidden",
+    titleBarOverlay: {
+      color: "#f7f7f5",
+      height: TITLE_BAR_HEIGHT,
+      symbolColor: "#4f5a56"
+    }
+  };
+}
+
+function setTitleBarTheme(theme) {
+  if (!mainWindow || process.platform === "darwin" || typeof mainWindow.setTitleBarOverlay !== "function") {
+    return { applied: false };
+  }
+
+  const isDark = theme === "dark";
+  mainWindow.setTitleBarOverlay({
+    color: isDark ? "#111413" : "#f7f7f5",
+    height: TITLE_BAR_HEIGHT,
+    symbolColor: isDark ? "#d8dfdc" : "#4f5a56"
+  });
+  return { applied: true };
+}
 
 function getAppIconPath() {
   const iconPath = path.join(__dirname, "../../build/icon.png");
@@ -44,11 +474,11 @@ function createWindow() {
     height: 760,
     minWidth: 980,
     minHeight: 640,
-    frame: false,
     autoHideMenuBar: true,
     backgroundColor: "#f7f7f5",
     icon: getAppIconPath(),
-    title: "DL Editor",
+    title: APP_NAME,
+    ...getNativeTitleBarOptions(),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -57,18 +487,20 @@ function createWindow() {
     }
   });
 
+  registerWindowShortcuts(mainWindow);
+
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
     mainWindow.loadFile(path.join(__dirname, "../../dist/index.html"));
   }
 
-  mainWindow.on("maximize", () => {
-    mainWindow?.webContents.send("window:maximized-change", true);
+  mainWindow.on("enter-full-screen", () => {
+    emitFullscreenState();
   });
 
-  mainWindow.on("unmaximize", () => {
-    mainWindow?.webContents.send("window:maximized-change", false);
+  mainWindow.on("leave-full-screen", () => {
+    emitFullscreenState();
   });
 }
 
@@ -489,7 +921,7 @@ async function getCapabilities() {
 }
 
 function getDefaultOutputDirectory() {
-  return path.join(app.getPath("videos"), "DL Editor Outputs");
+  return path.join(app.getPath("videos"), "DL Studio Outputs");
 }
 
 function ensureDirectory(directory) {
@@ -510,6 +942,36 @@ function formatBytes(bytes) {
   return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function parseFrameRate(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "0/0") {
+    return null;
+  }
+
+  if (raw.includes("/")) {
+    const [numerator, denominator] = raw.split("/").map(Number);
+    if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+      return null;
+    }
+
+    const frameRate = numerator / denominator;
+    return Number.isFinite(frameRate) && frameRate > 0 ? Math.round(frameRate * 100) / 100 : null;
+  }
+
+  const frameRate = Number(raw);
+  return Number.isFinite(frameRate) && frameRate > 0 ? Math.round(frameRate * 100) / 100 : null;
+}
+
+function formatFrameRateLabel(value) {
+  const frameRate = Number(value);
+  if (!Number.isFinite(frameRate) || frameRate <= 0) {
+    return "";
+  }
+
+  const precision = frameRate < 10 ? 2 : frameRate % 1 === 0 ? 0 : 1;
+  return `${frameRate.toFixed(precision)} fps`;
+}
+
 async function getFileMetadata(filePath) {
   const stats = fs.statSync(filePath);
   const modifiedAtMs = Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : Date.now();
@@ -520,6 +982,7 @@ async function getFileMetadata(filePath) {
   } catch {
     mediaInfo = null;
   }
+  const frameRate = parseFrameRate(mediaInfo?.avgFrameRate || mediaInfo?.rFrameRate);
 
   return {
     id: crypto.randomUUID(),
@@ -530,6 +993,8 @@ async function getFileMetadata(filePath) {
     modifiedAt: new Date(modifiedAtMs).toISOString(),
     modifiedAtMs,
     startTimeMs: deriveStartTimeMs({ mediaInfo, modifiedAtMs }),
+    frameRate,
+    frameRateLabel: formatFrameRateLabel(frameRate),
     status: "queued",
     progress: 0
   };
@@ -722,6 +1187,42 @@ function parseProgressLine(line, duration) {
   return null;
 }
 
+function roundEncodingMetric(value, precision = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return null;
+  }
+
+  const factor = 10 ** precision;
+  return Math.round(number * factor) / factor;
+}
+
+function parseEncodingProgressLine(line) {
+  const [key, value] = line.trim().split("=");
+  if (!key || value === undefined) {
+    return null;
+  }
+
+  if (key === "fps") {
+    return { encodingFps: roundEncodingMetric(value) };
+  }
+
+  if (key === "speed") {
+    return { encodingSpeed: roundEncodingMetric(String(value).replace(/x$/i, ""), 2) };
+  }
+
+  return null;
+}
+
+function getEncodingPayload(encoder, stats = {}) {
+  return {
+    encoder,
+    encodingFps: Number.isFinite(Number(stats.encodingFps)) ? Number(stats.encodingFps) : null,
+    encodingSpeed: Number.isFinite(Number(stats.encodingSpeed)) ? Number(stats.encodingSpeed) : null,
+    hardwareEncoding: encoder !== "libx264"
+  };
+}
+
 function buildTimingPayload(startedAt, duration, currentTime) {
   const pausedMs = getPausedMsSince(startedAt);
   const elapsedMs = Math.max(0, Date.now() - startedAt - pausedMs);
@@ -806,6 +1307,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
     estimatedRemainingMs: null,
     startedAt,
     outputPath,
+    ...getEncodingPayload(encoder),
     message: `Using ${encoder}`
   });
 
@@ -814,6 +1316,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
+    const encodingStats = {};
 
     child.stdout.on("data", (chunk) => {
       stdoutBuffer += chunk.toString();
@@ -821,6 +1324,11 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
       stdoutBuffer = lines.pop() || "";
 
       for (const line of lines) {
+        const encodingInfo = parseEncodingProgressLine(line);
+        if (encodingInfo) {
+          Object.assign(encodingStats, encodingInfo);
+        }
+
         const progressInfo = parseProgressLine(line, duration);
         if (progressInfo !== null) {
           const timing = buildTimingPayload(startedAt, duration, progressInfo.currentTime);
@@ -834,6 +1342,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
             ...timing,
             startedAt,
             outputPath,
+            ...getEncodingPayload(encoder, encodingStats),
             message: getActiveJobMessage(`Using ${encoder}`)
           });
         }
@@ -868,6 +1377,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
   const mediaInfo = await probeMediaInfo(job.path);
   const duration = mediaInfo.duration;
   const encoder = options.processingDevice === "cpu" ? "libx264" : capabilities.selectedGpuEncoder;
+  let completedEncoder = encoder;
   const startedAt = Date.now();
 
   try {
@@ -896,9 +1406,11 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
       startedAt,
       ...buildTimingPayload(startedAt, duration, 0),
       estimatedRemainingMs: null,
+      ...getEncodingPayload("libx264"),
       message: `${encoder} unavailable, retrying CPU`
     });
 
+    completedEncoder = "libx264";
     await runFfmpegJob(job, options, outputPath, duration, capabilities, "libx264", startedAt, mediaInfo);
   }
 
@@ -911,6 +1423,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
     ...buildTimingPayload(startedAt, duration, duration),
     estimatedRemainingMs: 0,
     outputPath,
+    ...getEncodingPayload(completedEncoder),
     message: "Complete"
   });
 }
@@ -977,6 +1490,7 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
+    const encodingStats = {};
 
     child.stdout.on("data", (chunk) => {
       stdoutBuffer += chunk.toString();
@@ -984,9 +1498,14 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
       stdoutBuffer = lines.pop() || "";
 
       for (const line of lines) {
+        const encodingInfo = parseEncodingProgressLine(line);
+        if (encodingInfo) {
+          Object.assign(encodingStats, encodingInfo);
+        }
+
         const progressInfo = parseProgressLine(line, segment.duration);
         if (progressInfo !== null) {
-          onProgress(segment.index, Math.min(segment.duration, progressInfo.currentTime), startedAt);
+          onProgress(segment.index, Math.min(segment.duration, progressInfo.currentTime), startedAt, encodingStats);
         }
       }
     });
@@ -1009,7 +1528,7 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
       }
 
       if (code === 0) {
-        onProgress(segment.index, segment.duration, startedAt);
+        onProgress(segment.index, segment.duration, startedAt, encodingStats);
         resolve();
         return;
       }
@@ -1069,7 +1588,7 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
     return false;
   }
 
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-editor-segments-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-studio-segments-"));
   const segmentDuration = duration / segmentCount;
   const segments = Array.from({ length: segmentCount }, (_item, index) => {
     const start = index * segmentDuration;
@@ -1083,8 +1602,19 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
     };
   });
   const progressBySegment = new Array(segmentCount).fill(0);
+  const encodingStatsBySegment = new Map();
   let nextIndex = 0;
   let completedSegments = 0;
+
+  function getAggregateEncodingStats() {
+    const stats = [...encodingStatsBySegment.values()].filter(Boolean);
+    const encodingFps = stats.reduce((sum, item) => sum + (Number(item.encodingFps) || 0), 0);
+    const encodingSpeed = stats.reduce((sum, item) => sum + (Number(item.encodingSpeed) || 0), 0);
+    return {
+      encodingFps: roundEncodingMetric(encodingFps),
+      encodingSpeed: roundEncodingMetric(encodingSpeed, 2)
+    };
+  }
 
   function emitAggregate(message) {
     const currentTime = Math.min(
@@ -1102,6 +1632,7 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
       ...timing,
       startedAt,
       outputPath,
+      ...getEncodingPayload(encoder, getAggregateEncodingStats()),
       message: getActiveJobMessage(message)
     });
   }
@@ -1130,8 +1661,11 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
         encoder,
         startedAt,
         mediaInfo,
-        onProgress: (index, current) => {
+        onProgress: (index, current, _startedAt, stats) => {
           progressBySegment[index] = current;
+          if (stats) {
+            encodingStatsBySegment.set(index, stats);
+          }
           emitAggregate(`GPU segmented x${Math.min(concurrency, segmentCount)} · ${completedSegments}/${segmentCount}`);
         }
       });
@@ -1295,25 +1829,22 @@ ipcMain.handle("window:minimize", () => {
   mainWindow?.minimize();
 });
 
-ipcMain.handle("window:toggle-maximize", () => {
+ipcMain.handle("window:toggle-fullscreen", () => {
   if (!mainWindow) {
     return false;
   }
 
-  if (mainWindow.isMaximized()) {
-    mainWindow.unmaximize();
-    return false;
-  }
-
-  mainWindow.maximize();
-  return true;
+  const shouldEnterFullscreen = !mainWindow.isFullScreen();
+  mainWindow.setFullScreen(shouldEnterFullscreen);
+  return shouldEnterFullscreen;
 });
 
 ipcMain.handle("window:close", () => {
   mainWindow?.close();
 });
 
-ipcMain.handle("window:is-maximized", () => Boolean(mainWindow?.isMaximized()));
+ipcMain.handle("window:is-fullscreen", () => Boolean(mainWindow?.isFullScreen()));
+ipcMain.handle("window:set-title-bar-theme", (_event, theme) => setTitleBarTheme(theme));
 
 ipcMain.handle("videos:select", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -1351,6 +1882,10 @@ ipcMain.handle("updates:check", async () =>
     platform: process.platform
   })
 );
+
+ipcMain.handle("infera:request", async (_event, payload) => requestInfera(payload));
+ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVideo(payload, event.sender));
+ipcMain.handle("infera:cancel-upload", async (_event, uploadId) => cancelInferaUpload(uploadId));
 
 ipcMain.handle("transcode:start-batch", async (_event, payload) => {
   if (queueBusy) {

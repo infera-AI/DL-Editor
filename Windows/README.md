@@ -1,4 +1,4 @@
-# DL Editor Windows
+# DL Studio Windows
 
 Windows desktop video downsampler built with Electron, React, FFmpeg, and an NSIS installer.
 
@@ -10,7 +10,7 @@ npm run dev
 npm run dist
 ```
 
-The generated installer is written to `release/DL-Editor-Windows-Setup-0.1.0.exe`.
+The generated installer is written to `release/DL-Studio-Windows-Setup-0.1.0.exe`.
 
 ## Behavior
 
@@ -24,4 +24,4 @@ The generated installer is written to `release/DL-Editor-Windows-Setup-0.1.0.exe
 - CPU/GPU utilization is sampled live while the app is open.
 - Each processing job shows current video time, total video time, estimated remaining time, and elapsed wall time with two-digit subsecond precision.
 - The app shell is locked to the window height; settings and queue panes scroll independently with thin scrollbars.
-- Output files are saved to the selected local output folder, defaulting to the user's Videos directory under `DL Editor Outputs`.
+- Output files are saved to the selected local output folder, defaulting to the user's Videos directory under `DL Studio Outputs`.

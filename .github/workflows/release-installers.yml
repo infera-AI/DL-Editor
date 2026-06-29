@@ -1,20 +1,44 @@
 name: Build release installers
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag to upload installers to"
         required: true
-        default: "v1.0.0"
+        default: "v1.0.1"
 
 permissions:
   contents: write
 
 jobs:
+  release:
+    name: Ensure GitHub release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Create release if needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --title "DL Studio ${version}" \
+              --notes "DL Studio ${version}" \
+              --latest \
+              --repo "${{ github.repository }}"
+
   mac:
     name: macOS arm64 installers
     runs-on: macos-14
+    needs: release
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     defaults:
       run:
         working-directory: Mac
@@ -32,16 +56,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ inputs.tag }}" \
-            release-upload/DL-Editor-Mac-1.0.0-arm64.dmg \
-            release-upload/DL-Editor-Mac-1.0.0-arm64.pkg \
-            release-upload/DL-Editor-Mac-1.0.0-arm64.dmg.blockmap \
+          version="$(node -p "require('./package.json').version")"
+          gh release upload "$RELEASE_TAG" \
+            "release-upload/DL-Studio-Mac-${version}-arm64.dmg" \
+            "release-upload/DL-Studio-Mac-${version}-arm64.pkg" \
+            "release-upload/DL-Studio-Mac-${version}-arm64.dmg.blockmap" \
             --clobber \
             --repo "${{ github.repository }}"
 
   windows:
     name: Windows x64 installer
     runs-on: windows-latest
+    needs: release
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     defaults:
       run:
         working-directory: Windows
@@ -58,8 +86,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ inputs.tag }}" `
-            "release/DL-Editor-Windows-Setup-1.0.0.exe" `
-            "release/DL-Editor-Windows-Setup-1.0.0.exe.blockmap" `
+          $version = node -p "require('./package.json').version"
+          gh release upload "$env:RELEASE_TAG" `
+            "release/DL-Studio-Windows-Setup-$version.exe" `
+            "release/DL-Studio-Windows-Setup-$version.exe.blockmap" `
             --clobber `
             --repo "${{ github.repository }}"

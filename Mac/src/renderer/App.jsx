@@ -1,36 +1,69 @@
 import {
   Activity,
+  Archive,
   CalendarClock,
+  CheckCheck,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   CircleStop,
   Clock3,
+  Cloud,
   Cpu,
   Download,
+  Ellipsis,
+  FileAudio,
   FileSearch,
+  FileVideo,
+  Folder,
   FolderOpen,
   Gauge,
+  HardDrive,
   Info,
+  LayoutGrid,
+  List,
   ListVideo,
-  Maximize2,
-  Minimize2,
-  Minus,
+  LockKeyhole,
+  Mail,
   Moon,
   Pause,
   Play,
   Plus,
   RotateCcw,
+  Search,
   Settings2,
   Sparkles,
+  Square,
+  SquareCheck,
   Sun,
   Timer,
   TriangleAlert,
+  Upload,
+  UserRound,
   Video,
   X,
   Zap
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import packageJson from "../../package.json";
+import appIconUrl from "../../build/icon.svg";
 
+const APP_NAME = "DL Studio";
+const THEME_STORAGE_KEY = "dl-studio-theme";
+const LEGACY_THEME_STORAGE_KEY = "dl-editor-theme";
+const AUTH_STORAGE_KEY = "dl-studio-auth";
+const AUTOMATION_STORAGE_KEY = "dl-studio-editor-automation";
+const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
+const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
+const RAW_DATA_LIST_PATH = "/memory/raw-data";
+const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine"];
+const ENGINE_PASSWORD = "111111";
+const DEFAULT_AUTOMATION_OPTIONS = {
+  autoUpload: false,
+  autoBackup: false,
+  autoClearLocal: false
+};
 const FPS_PRESETS = [1, 2, 4, 5, 10];
 const RESOLUTION_PRESETS = [
   { label: "1080p", width: 1920, height: 1080 },
@@ -48,8 +81,31 @@ const STATUS_LABELS = {
   paused: "暂停"
 };
 
+const CLOUD_FILTERS = [
+  { id: "all", label: "全部文件" },
+  { id: "video", label: "视频" },
+  { id: "audio", label: "音频" },
+  { id: "parsed", label: "已解析" },
+  { id: "processing", label: "处理中" }
+];
+const CLOUD_VIEW_MODES = ["list", "grid"];
+const CLOUD_SPACES = [
+  { id: "repository", label: "DL Repository" },
+  { id: "rawdata", label: "DL Rawdata" }
+];
+const UPLOAD_STATUS_LABELS = {
+  queued: "等待上传",
+  uploading: "上传中",
+  processing: "服务器处理中",
+  done: "完成",
+  error: "失败",
+  canceled: "已取消",
+  canceling: "取消中",
+  paused: "已暂停"
+};
+
 const APP_INFO = {
-  name: "DL Editor",
+  name: "DL Studio",
   version: packageJson.version,
   updatedAt: "2026-06-23",
   engine: "FFmpeg / FFprobe",
@@ -57,6 +113,7 @@ const APP_INFO = {
 };
 
 const dlEditor = window.dlEditor || {
+  platform: navigator.platform?.toLowerCase().includes("win") ? "win32" : navigator.platform?.toLowerCase().includes("mac") ? "darwin" : "browser",
   selectVideos: async () => [],
   selectOutputDirectory: async () => null,
   getCapabilities: async () => ({
@@ -68,7 +125,7 @@ const dlEditor = window.dlEditor || {
     cpuEncoder: "libx264",
     hardwareEncoders: [],
     gpuNames: [],
-    outputDirectory: "Videos/DL Editor Outputs"
+    outputDirectory: "Videos/DL Studio Outputs"
   }),
   getUsage: async () => ({
     cpu: { status: "ok", usage: 0 },
@@ -79,18 +136,208 @@ const dlEditor = window.dlEditor || {
   resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
   checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
+  uploadInferaVideo: async () => ({}),
+  cancelInferaUpload: async () => ({ canceled: false }),
+  pauseInferaUpload: async () => ({ paused: false }),
+  resumeInferaUpload: async () => ({ resumed: false }),
+  deleteLocalFile: async () => ({ deleted: false }),
   openPath: async () => undefined,
   openExternal: async () => undefined,
   revealPath: async () => undefined,
   minimizeWindow: async () => undefined,
-  toggleMaximizeWindow: async () => false,
+  toggleFullscreenWindow: async () => false,
   closeWindow: async () => undefined,
-  isWindowMaximized: async () => false,
+  isWindowFullscreen: async () => false,
+  setTitleBarTheme: async () => ({ applied: false }),
   onJobUpdate: () => () => undefined,
   onBatchUpdate: () => () => undefined,
+  onInferaUploadProgress: () => () => undefined,
   onSystemUsageUpdate: () => () => undefined,
-  onWindowMaximizedChange: () => () => undefined
+  onWindowFullscreenChange: () => () => undefined
 };
+
+const EMAIL_IDENTIFIER_PATTERN = /^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$/;
+const PHONE_IDENTIFIER_PATTERN = /^\+?\d{6,20}$/;
+
+function readStoredAuth() {
+  try {
+    const stored = window.localStorage?.getItem(AUTH_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readStoredAutomationOptions() {
+  try {
+    const stored = window.localStorage?.getItem(AUTOMATION_STORAGE_KEY);
+    return { ...DEFAULT_AUTOMATION_OPTIONS, ...(stored ? JSON.parse(stored) : {}) };
+  } catch {
+    return DEFAULT_AUTOMATION_OPTIONS;
+  }
+}
+
+function inferIdentifierType(identifier) {
+  const value = String(identifier || "").trim();
+  if (EMAIL_IDENTIFIER_PATTERN.test(value)) return "email";
+  if (PHONE_IDENTIFIER_PATTERN.test(value)) return "phone";
+  return "";
+}
+
+function unwrapInferaResult(payload) {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+
+  if (payload.success === false) {
+    throw new Error(payload.message || "请求失败");
+  }
+
+  if ("result" in payload) {
+    return payload.result;
+  }
+
+  if ("data" in payload) {
+    return payload.data;
+  }
+
+  return payload;
+}
+
+function resolveInferaUrl(value) {
+  if (!value) return "";
+  const rawPath = String(value);
+  if (/^https?:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+
+  const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
+  const normalizedPath = rawPath.replace(/^\/+/, "");
+  try {
+    return new URL(normalizedPath, `${normalizedBase}/`).toString();
+  } catch {
+    return rawPath;
+  }
+}
+
+async function requestInfera(path, { method = "GET", token, body, signal } = {}) {
+  if (typeof dlEditor.requestInfera === "function") {
+    return unwrapInferaResult(await dlEditor.requestInfera({ path, method, token, body }));
+  }
+
+  const headers = { Accept: "application/json" };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(resolveInferaUrl(path), {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal
+  });
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+
+  return unwrapInferaResult(payload);
+}
+
+function normalizeAuthPayload(result, fallbackAccountName = "") {
+  const user = result?.user || result?.profile || {};
+
+  return {
+    token: result?.token || "",
+    refreshToken: result?.refreshToken || result?.refresh_token || "",
+    userId: result?.userId || result?.user_id || user?.userId || user?.user_id || user?.id || "",
+    accountName:
+      result?.accountName ||
+      result?.account_name ||
+      result?.account ||
+      result?.username ||
+      user?.accountName ||
+      user?.account_name ||
+      user?.account ||
+      user?.username ||
+      fallbackAccountName ||
+      "",
+    displayName:
+      result?.displayName ||
+      result?.display_name ||
+      result?.name ||
+      user?.displayName ||
+      user?.display_name ||
+      user?.name ||
+      "",
+    phone: result?.phone || user?.phone || "",
+    email: result?.email || user?.email || "",
+    nickname: result?.nickname || user?.nickname || "",
+    avatar: result?.avatar || user?.avatar || "",
+    exist: Boolean(result?.exist),
+    password: Boolean(result?.password)
+  };
+}
+
+async function loginToInfera({ identifier, password }) {
+  return requestInfera("/auth/login", {
+    method: "POST",
+    body: {
+      type: inferIdentifierType(identifier),
+      identifier: String(identifier || "").trim(),
+      password
+    }
+  });
+}
+
+async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id) {
+  const result = await requestInfera(spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files?limit=50&include_page=true", { token });
+  const items = normalizeCloudItems(result);
+
+  return {
+    items,
+    total: Number.isFinite(Number(result?.total)) ? Number(result.total) : items.length,
+    hasMore: Boolean(result?.has_more),
+    nextCursor: result?.next_cursor || null
+  };
+}
+
+function normalizeCloudItems(result) {
+  if (Array.isArray(result)) {
+    return result;
+  }
+
+  const candidates = [result?.items, result?.archives, result?.raw_data, result?.rawData, result?.records, result?.list, result?.data];
+  return candidates.find(Array.isArray) || [];
+}
+
+async function deleteRawDataArchive(token, item) {
+  const rawDataId = getRawDataId(item);
+  if (!rawDataId) {
+    throw new Error("缺少 raw data id，无法删除");
+  }
+
+  return requestInfera(RAW_DATA_LIST_PATH, {
+    method: "DELETE",
+    token,
+    body: {
+      id: rawDataId,
+      raw_data_id: rawDataId,
+      raw_data_ids: [rawDataId]
+    }
+  });
+}
 
 function App() {
   const [jobs, setJobs] = useState([]);
@@ -109,11 +356,56 @@ function App() {
   const [clockNow, setClockNow] = useState(Date.now());
   const [pauseTransitioning, setPauseTransitioning] = useState(false);
   const [theme, setTheme] = useState(() => {
-    const saved = window.localStorage?.getItem("dl-editor-theme");
+    const saved =
+      window.localStorage?.getItem(THEME_STORAGE_KEY) || window.localStorage?.getItem(LEGACY_THEME_STORAGE_KEY);
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
   });
-  const [isMaximized, setIsMaximized] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [activeNav, setActiveNav] = useState(NAV_ITEMS[0]);
+  const [showSplash, setShowSplash] = useState(true);
+  const [showLogin, setShowLogin] = useState(false);
+  const [engineUnlocked, setEngineUnlocked] = useState(false);
+  const [enginePassword, setEnginePassword] = useState("");
+  const [engineError, setEngineError] = useState("");
+  const [authState, setAuthState] = useState(readStoredAuth);
+  const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
+  const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
+  const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
+  const [automationOptions, setAutomationOptions] = useState(readStoredAutomationOptions);
+  const [uploadState, setUploadState] = useState({
+    status: "idle",
+    visible: false,
+    expanded: false,
+    uploadId: "",
+    items: [],
+    message: ""
+  });
+  const [autoUploadNotice, setAutoUploadNotice] = useState({
+    visible: false,
+    message: ""
+  });
+  const uploadCancelRequestedRef = useRef(false);
+  const jobsRef = useRef(jobs);
+  const uploadStateRef = useRef(uploadState);
+  const authStateRef = useRef(authState);
+  const automationOptionsRef = useRef(automationOptions);
+  const autoUploadQueueRef = useRef([]);
+  const autoQueuedJobIdsRef = useRef(new Set());
+  const autoUploadRunningRef = useRef(false);
+  const automationDrainTimerRef = useRef(null);
+  const autoLoginPromptedRef = useRef(false);
+  const [repositoryState, setRepositoryState] = useState({
+    status: "idle",
+    spaceId: cloudSpaceId,
+    items: [],
+    total: 0,
+    hasMore: false,
+    nextCursor: null,
+    message: ""
+  });
   const [startTimeEditor, setStartTimeEditor] = useState(null);
   const [showAppInfo, setShowAppInfo] = useState(false);
   const [updateState, setUpdateState] = useState({ status: "idle", message: "" });
@@ -122,6 +414,15 @@ function App() {
   const isPaused = isRunning && Boolean(batchState.paused);
   const pendingJobs = jobs.filter((job) => job.status !== "done");
   const hasProcessingJobs = jobs.some((job) => job.status === "processing" || job.status === "paused");
+  const activeEncodingJob = getActiveEncodingJob(jobs);
+  const selectedJobs = useMemo(() => jobs.filter((job) => selectedJobIds.has(job.id)), [jobs, selectedJobIds]);
+  const allJobsSelected = jobs.length > 0 && selectedJobIds.size === jobs.length;
+  const canBackupSelection = selectedJobs.length > 0 && !isRunning && !isUploadActive(uploadState);
+  const canUploadSelection =
+    selectedJobs.length > 0 &&
+    selectedJobs.every(isJobUploadable) &&
+    !isRunning &&
+    !isUploadActive(uploadState);
 
   useEffect(() => {
     dlEditor.getCapabilities().then((data) => {
@@ -163,24 +464,127 @@ function App() {
     });
 
     const offUsage = dlEditor.onSystemUsageUpdate(setSystemUsage);
-    const offMaximized = dlEditor.onWindowMaximizedChange(setIsMaximized);
-    dlEditor.isWindowMaximized().then(setIsMaximized).catch(() => undefined);
+    const offFullscreen = dlEditor.onWindowFullscreenChange(setIsFullscreen);
+    const offUpload = dlEditor.onInferaUploadProgress((progress) => {
+      setUploadState((current) => applyUploadProgress(current, progress));
+    });
+    dlEditor.isWindowFullscreen().then(setIsFullscreen).catch(() => undefined);
 
     return () => {
       offJob();
       offBatch();
       offUsage();
-      offMaximized();
+      offFullscreen();
+      offUpload();
+      if (automationDrainTimerRef.current) {
+        window.clearTimeout(automationDrainTimerRef.current);
+        automationDrainTimerRef.current = null;
+      }
     };
   }, []);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    window.localStorage?.setItem("dl-editor-theme", theme);
+    dlEditor.setTitleBarTheme?.(theme).catch(() => undefined);
   }, [theme]);
 
   useEffect(() => {
-    if (!hasProcessingJobs) {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage?.setItem(THEME_STORAGE_KEY, theme);
+    window.localStorage?.removeItem(LEGACY_THEME_STORAGE_KEY);
+  }, [theme]);
+
+  useEffect(() => {
+    authStateRef.current = authState;
+    if (authState?.token) {
+      autoLoginPromptedRef.current = false;
+      drainAutomationQueue();
+    }
+  }, [authState]);
+
+  useEffect(() => {
+    automationOptionsRef.current = automationOptions;
+    window.localStorage?.setItem(AUTOMATION_STORAGE_KEY, JSON.stringify(automationOptions));
+  }, [automationOptions]);
+
+  useEffect(() => {
+    uploadStateRef.current = uploadState;
+    if (!isUploadActive(uploadState)) {
+      drainAutomationQueue();
+    }
+  }, [uploadState]);
+
+  useEffect(() => {
+    jobsRef.current = jobs;
+
+    if (!jobs.length) {
+      setSelectionMode(false);
+    }
+
+    const knownIds = new Set(jobs.map((job) => job.id));
+    for (const id of autoQueuedJobIdsRef.current) {
+      const job = jobs.find((item) => item.id === id);
+      if (!job || job.status !== "done") {
+        autoQueuedJobIdsRef.current.delete(id);
+      }
+    }
+    autoUploadQueueRef.current = autoUploadQueueRef.current.filter((job) => knownIds.has(job.id));
+
+    setSelectedJobIds((current) => {
+      const next = new Set([...current].filter((id) => knownIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [jobs]);
+
+  useEffect(() => {
+    if (!automationOptions.autoUpload && !automationOptions.autoBackup) {
+      return;
+    }
+
+    const readyJobs = jobs.filter((job) => hasPendingAutomationActions(job, automationOptions) && !autoQueuedJobIdsRef.current.has(job.id));
+    if (!readyJobs.length) {
+      return;
+    }
+
+    if (!authState?.token) {
+      if (!autoLoginPromptedRef.current) {
+        autoLoginPromptedRef.current = true;
+        setShowLogin(true);
+        setNotice("自动上传/备份需要先登录");
+      }
+      return;
+    }
+
+    enqueueAutomationJobs(readyJobs);
+  }, [automationOptions.autoUpload, automationOptions.autoBackup, authState?.token, jobs]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setShowSplash(false), 2400);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (activeNav !== "Cloud") {
+      return;
+    }
+
+    if (!authState?.token) {
+      setRepositoryState({
+        status: "auth",
+        spaceId: cloudSpaceId,
+        items: [],
+        total: 0,
+        hasMore: false,
+        nextCursor: null,
+        message: "请先登录后查看 Cloud repository"
+      });
+      return;
+    }
+
+    loadCloudRepository(authState, cloudSpaceId);
+  }, [activeNav, authState?.token, cloudSpaceId]);
+
+  useEffect(() => {
+    if (!hasProcessingJobs && !isUploadActive(uploadState)) {
       return undefined;
     }
 
@@ -189,7 +593,7 @@ function App() {
     }, 80);
 
     return () => window.clearInterval(timer);
-  }, [hasProcessingJobs]);
+  }, [hasProcessingJobs, uploadState.status]);
 
   const selectedResolution = useMemo(() => {
     if (useSourceResolution) {
@@ -245,6 +649,472 @@ function App() {
     setNotice(`已加入 ${selected.length} 个视频`);
   }
 
+  function toggleSelectionMode() {
+    if (!jobs.length) return;
+
+    setSelectionMode((current) => {
+      const next = !current;
+      if (!next) {
+        setSelectedJobIds(new Set());
+      }
+      return next;
+    });
+  }
+
+  function toggleJobSelection(jobId) {
+    setSelectedJobIds((current) => {
+      const next = new Set(current);
+      if (next.has(jobId)) {
+        next.delete(jobId);
+      } else {
+        next.add(jobId);
+      }
+      return next;
+    });
+  }
+
+  function toggleAllSelectedJobs() {
+    setSelectedJobIds((current) => {
+      if (jobs.length > 0 && current.size === jobs.length) {
+        return new Set();
+      }
+
+      return new Set(jobs.map((job) => job.id));
+    });
+  }
+
+  async function backupSelectedJobs() {
+    if (!canBackupSelection) return;
+
+    const jobsToBackup = selectedJobs.map(prepareBackupJob);
+
+    try {
+      await uploadJobsToRepository(jobsToBackup, {
+        destination: "DL Rawdata",
+        endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
+        mode: "backup"
+      });
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    }
+  }
+
+  function updateAutomationOption(key, value) {
+    setAutomationOptions((current) => ({ ...current, [key]: Boolean(value) }));
+    if (key === "autoBackup" && value) {
+      setNotice("自动备份已开启，处理完成后会备份原视频");
+    }
+  }
+
+  function enqueueAutomationJobs(nextJobs) {
+    const freshJobs = nextJobs.filter((job) => {
+      if (!job?.id || autoQueuedJobIdsRef.current.has(job.id)) {
+        return false;
+      }
+
+      autoQueuedJobIdsRef.current.add(job.id);
+      return true;
+    });
+
+    if (!freshJobs.length) {
+      return;
+    }
+
+    autoUploadQueueRef.current.push(...freshJobs);
+    scheduleAutomationDrain();
+  }
+
+  function scheduleAutomationDrain(delay = 0) {
+    if (automationDrainTimerRef.current) {
+      return;
+    }
+
+    automationDrainTimerRef.current = window.setTimeout(() => {
+      automationDrainTimerRef.current = null;
+      drainAutomationQueue();
+    }, delay);
+  }
+
+  function getFreshAutomationJobs(queuedJobs) {
+    const options = automationOptionsRef.current;
+    return queuedJobs
+      .map((queuedJob) => jobsRef.current.find((job) => job.id === queuedJob.id) || queuedJob)
+      .filter((job) => hasPendingAutomationActions(job, options));
+  }
+
+  async function drainAutomationQueue() {
+    if (!autoUploadQueueRef.current.length) {
+      return;
+    }
+
+    if (autoUploadRunningRef.current || isUploadActive(uploadStateRef.current)) {
+      scheduleAutomationDrain(300);
+      return;
+    }
+
+    const auth = authStateRef.current;
+    if (!auth?.token) {
+      if (!autoLoginPromptedRef.current) {
+        autoLoginPromptedRef.current = true;
+        setShowLogin(true);
+        setNotice("自动上传/备份需要先登录");
+      }
+      return;
+    }
+
+    autoUploadRunningRef.current = true;
+    try {
+      while (autoUploadQueueRef.current.length > 0) {
+        if (isUploadActive(uploadStateRef.current)) {
+          break;
+        }
+
+        const queuedJobs = autoUploadQueueRef.current.splice(0, autoUploadQueueRef.current.length);
+        const jobsToProcess = getFreshAutomationJobs(queuedJobs);
+        try {
+          if (jobsToProcess.length > 0) {
+            await runAutomationTransfers(jobsToProcess);
+          }
+        } finally {
+          for (const job of queuedJobs) {
+            autoQueuedJobIdsRef.current.delete(job.id);
+          }
+        }
+      }
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    } finally {
+      autoUploadRunningRef.current = false;
+      if (autoUploadQueueRef.current.length > 0) {
+        scheduleAutomationDrain(isUploadActive(uploadStateRef.current) ? 300 : 0);
+      }
+    }
+  }
+
+  async function runAutomationTransfers(candidateJobs) {
+    const options = automationOptionsRef.current;
+    const uploadJobs = options.autoUpload ? candidateJobs.filter((job) => shouldAutoUploadJob(job)) : [];
+    const backupJobs = options.autoBackup ? candidateJobs.filter((job) => shouldAutoBackupJob(job)).map(prepareBackupJob) : [];
+
+    if (uploadJobs.length > 0) {
+      try {
+        await uploadJobsToRepository(uploadJobs, {
+          autoClearLocal: options.autoClearLocal,
+          clearLocalTarget: "output",
+          destination: "Delphi Repository",
+          endpoint: WEB_VIDEO_UPLOAD_PATH,
+          mode: "auto-upload"
+        });
+      } catch {
+        // Keep the automation worker alive so backup can still run for the same finished jobs.
+      }
+    }
+
+    if (backupJobs.length > 0) {
+      try {
+        await uploadJobsToRepository(backupJobs, {
+          autoClearLocal: options.autoClearLocal,
+          clearLocalTarget: "source",
+          destination: "DL Rawdata",
+          endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
+          mode: "auto-backup"
+        });
+      } catch {
+        // Errors are already reflected in the upload panel and job status.
+      }
+    }
+  }
+
+  async function uploadJobsToRepository(
+    rawJobs,
+    {
+      autoClearLocal = false,
+      clearLocalTarget = "",
+      destination = "Delphi Repository",
+      endpoint = WEB_VIDEO_UPLOAD_PATH,
+      mode = "manual"
+    } = {}
+  ) {
+    const auth = authStateRef.current;
+    const isAutoUpload = mode === "auto" || mode === "auto-upload";
+    const isAutoBackup = mode === "auto-backup";
+    const isAutomatic = isAutoUpload || isAutoBackup;
+    const isBackup = mode === "backup" || isAutoBackup;
+    const actionLabel = isAutoBackup ? "自动备份" : isAutoUpload ? "自动上传" : isBackup ? "备份" : "上传";
+
+    if (!auth?.token) {
+      setShowLogin(true);
+      setNotice(`请先登录后上传到 ${destination}`);
+      throw new Error(`请先登录后上传到 ${destination}`);
+    }
+
+    const jobsToUpload = rawJobs
+      .map((job) => {
+        const uploadPath = job.uploadPath || getJobUploadPath(job);
+        return {
+          ...job,
+          uploadName: getUploadFileName({ ...job, uploadPath }),
+          uploadPath
+        };
+      })
+      .filter((job) => Boolean(job.uploadPath));
+
+    if (!jobsToUpload.length) {
+      setNotice("没有可上传的视频");
+      return { completed: 0 };
+    }
+
+    const uploadKind = isAutoBackup ? "auto-backup" : isAutoUpload ? "auto-upload" : isBackup ? "backup" : "upload";
+    const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    uploadCancelRequestedRef.current = false;
+    if (isAutomatic) {
+      const attemptedAt = new Date().toISOString();
+      setJobs((current) =>
+        current.map((job) =>
+          jobsToUpload.some((item) => item.id === job.id)
+            ? {
+                ...job,
+                ...(isAutoBackup
+                  ? { autoBackupAttemptedAt: attemptedAt, autoBackupStatus: "queued" }
+                  : { autoUploadAttemptedAt: attemptedAt, autoUploadStatus: "queued" }),
+                message: isAutoBackup ? "等待自动备份" : "等待自动上传"
+              }
+            : job
+        )
+      );
+    }
+
+    setUploadState({
+      status: "uploading",
+      visible: true,
+      expanded: false,
+      uploadId,
+      destination,
+      mode,
+      items: createUploadItems(jobsToUpload),
+      message: `${isAutomatic ? actionLabel : `准备${actionLabel}`} ${jobsToUpload.length} 个视频`
+    });
+    setNotice(`${isAutomatic ? actionLabel : `正在${actionLabel}`} ${jobsToUpload.length} 个视频到 ${destination}`);
+    if (isAutomatic) {
+      setAutoUploadNotice({
+        visible: true,
+        message: `${actionLabel} ${jobsToUpload.length} 个视频到 ${destination}`
+      });
+    }
+
+    let completed = 0;
+    let activeJobId = "";
+    try {
+      for (const job of jobsToUpload) {
+        activeJobId = job.id;
+        if (uploadCancelRequestedRef.current) {
+          throw new Error("上传已取消");
+        }
+
+        setUploadState((current) =>
+          markUploadItem(current, job.id, {
+            elapsedMs: 0,
+            estimatedRemainingMs: null,
+            message: "正在上传",
+            percent: 0,
+            startedAt: Date.now(),
+            status: "uploading"
+          })
+        );
+        const result = await dlEditor.uploadInferaVideo({
+          durationSeconds: job.duration,
+          jobId: job.id,
+          path: job.uploadPath,
+          fileName: job.uploadName,
+          startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
+          token: auth.token,
+          uploadId,
+          uploadPath: endpoint
+        });
+        const cleared =
+          isAutomatic && autoClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isAutoBackup ? "source" : "output")) : { deleted: false };
+        completed += 1;
+        const uploadedAt = new Date().toISOString();
+        const doneMessage = getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
+        setUploadState((current) => {
+          const now = Date.now();
+          const currentItem = current.items.find((item) => item.jobId === job.id);
+          return markUploadItem(current, job.id, {
+            bytesUploaded: currentItem?.totalBytes || 0,
+            completedAt: now,
+            elapsedMs: getUploadItemElapsedMs(currentItem, now),
+            estimatedRemainingMs: 0,
+            message: doneMessage,
+            percent: 100,
+            status: "done"
+          });
+        });
+        setJobs((current) =>
+          current.map((item) =>
+            item.id === job.id
+              ? {
+                  ...item,
+                  ...getTransferSuccessPatch({
+                    clearTarget: clearLocalTarget || (isAutoBackup ? "source" : "output"),
+                    cleared,
+                    isAutoBackup,
+                    isAutoUpload,
+                    isBackup,
+                    result,
+                    timestamp: uploadedAt,
+                    uploadPath: job.uploadPath
+                  }),
+                  message: doneMessage,
+                }
+              : item
+          )
+        );
+      }
+
+      setUploadState((current) => ({
+        ...current,
+        status: "ready",
+        visible: current.visible,
+        message: `${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频`
+      }));
+      setNotice(`${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频到 ${destination}`);
+      return { completed };
+    } catch (error) {
+      const message = error.message || "上传失败";
+      const canceled = message.includes("取消");
+      const doneField = isAutoBackup ? "backedUpAt" : "uploadedAt";
+      setUploadState((current) => {
+        const now = Date.now();
+        return {
+          ...current,
+          status: canceled ? "canceled" : "error",
+          visible: current.visible,
+          message,
+          items: current.items.map((item) =>
+            item.status === "done"
+              ? item
+              : {
+                  ...item,
+                  completedAt: item.startedAt ? now : item.completedAt,
+                  elapsedMs: item.startedAt ? getUploadItemElapsedMs(item, now) : item.elapsedMs,
+                  estimatedRemainingMs: null,
+                  message: item.status === "uploading" || item.status === "processing" ? message : item.message,
+                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : "error"
+                }
+          )
+        };
+      });
+      if (isAutomatic) {
+        setJobs((current) =>
+          current.map((job) =>
+            jobsToUpload.some((item) => item.id === job.id) && (!activeJobId || job.id === activeJobId || !job[doneField])
+              ? {
+                  ...job,
+                  ...(isAutoBackup
+                    ? { autoBackupStatus: canceled ? "canceled" : "error" }
+                    : { autoUploadStatus: canceled ? "canceled" : "error" }),
+                  message
+                }
+              : job
+          )
+        );
+      }
+      setNotice(message);
+      throw error;
+    }
+  }
+
+  async function clearUploadedLocalFile(job, target) {
+    const isSourceTarget = target === "source";
+    const expectedPath = isSourceTarget ? job.path : job.outputPath;
+    if (!expectedPath || !job.uploadPath || !isSamePath(expectedPath, job.uploadPath)) {
+      return { deleted: false };
+    }
+
+    try {
+      return { ...(await dlEditor.deleteLocalFile(job.uploadPath)), target };
+    } catch (error) {
+      return { deleted: false, error: error.message || "本地文件清除失败", target };
+    }
+  }
+
+  async function uploadSelectedJobs() {
+    if (!canUploadSelection) return;
+
+    try {
+      await uploadJobsToRepository(selectedJobs);
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    }
+  }
+
+  async function toggleCurrentUploadPaused() {
+    if (!isUploadPausable(uploadState) || !uploadState.uploadId) return;
+    const uploadId = uploadState.uploadId;
+    const shouldResume = uploadState.status === "paused";
+    setUploadState((current) => ({
+      ...current,
+      status: shouldResume ? "uploading" : "paused",
+      visible: true,
+      message: shouldResume ? "继续上传" : "上传已暂停",
+      items: current.items.map((item) =>
+        item.status === "uploading" || item.status === "processing" || item.status === "paused"
+          ? {
+              ...item,
+              message: shouldResume ? "继续上传" : "上传已暂停",
+              speedBytesPerSecond: shouldResume ? item.speedBytesPerSecond : 0,
+              status: shouldResume ? "uploading" : "paused"
+            }
+          : item
+      )
+    }));
+
+    try {
+      if (shouldResume) {
+        await dlEditor.resumeInferaUpload(uploadId);
+      } else {
+        await dlEditor.pauseInferaUpload(uploadId);
+      }
+    } catch (error) {
+      setNotice(error.message || (shouldResume ? "继续上传失败" : "暂停上传失败"));
+    }
+  }
+
+  async function cancelCurrentUpload({ hide = false } = {}) {
+    if (!isUploadActive(uploadState) || !uploadState.uploadId) return;
+    const uploadId = uploadState.uploadId;
+    uploadCancelRequestedRef.current = true;
+    setUploadState((current) => ({
+      ...current,
+      status: "canceling",
+      visible: !hide,
+      message: "正在取消上传",
+      items: current.items.map((item) =>
+        item.status === "uploading" || item.status === "processing" || item.status === "paused"
+          ? { ...item, status: "canceling", message: "正在取消" }
+          : item
+      )
+    }));
+    try {
+      await dlEditor.cancelInferaUpload(uploadId);
+    } catch (error) {
+      setNotice(error.message || "取消上传失败");
+    }
+  }
+
+  async function closeUploadPanel() {
+    if (isUploadActive(uploadState)) {
+      await cancelCurrentUpload({ hide: true });
+      return;
+    }
+
+    setUploadState((current) => ({ ...current, visible: false }));
+  }
+
+  function toggleUploadDetails() {
+    setUploadState((current) => ({ ...current, expanded: !current.expanded, visible: true }));
+  }
+
   async function chooseOutputDirectory() {
     const directory = await dlEditor.selectOutputDirectory();
     if (directory) {
@@ -264,7 +1134,23 @@ function App() {
         currentTime: 0,
         elapsedSeconds: 0,
         message: "",
-        outputPath: job.status === "done" ? job.outputPath : ""
+        outputPath: job.status === "done" ? job.outputPath : "",
+        autoClearError: job.status === "done" ? job.autoClearError : undefined,
+        autoClearOriginalError: job.status === "done" ? job.autoClearOriginalError : undefined,
+        autoClearOriginalStatus: job.status === "done" ? job.autoClearOriginalStatus : undefined,
+        autoClearStatus: job.status === "done" ? job.autoClearStatus : undefined,
+        autoClearedAt: job.status === "done" ? job.autoClearedAt : undefined,
+        autoClearedOriginalAt: job.status === "done" ? job.autoClearedOriginalAt : undefined,
+        autoBackupAttemptedAt: job.status === "done" ? job.autoBackupAttemptedAt : undefined,
+        autoBackupStatus: job.status === "done" ? job.autoBackupStatus : undefined,
+        autoUploadAttemptedAt: job.status === "done" ? job.autoUploadAttemptedAt : undefined,
+        autoUploadStatus: job.status === "done" ? job.autoUploadStatus : undefined,
+        backedUpAt: job.status === "done" ? job.backedUpAt : undefined,
+        backupResult: job.status === "done" ? job.backupResult : undefined,
+        deletedOriginalPath: job.status === "done" ? job.deletedOriginalPath : undefined,
+        deletedOutputPath: job.status === "done" ? job.deletedOutputPath : undefined,
+        uploadedAt: job.status === "done" ? job.uploadedAt : undefined,
+        uploadResult: job.status === "done" ? job.uploadResult : undefined
       }))
     );
 
@@ -382,7 +1268,7 @@ function App() {
   }
 
   async function checkForUpdates() {
-    setUpdateState({ status: "checking", message: "正在检查 GitHub 最新版本..." });
+    setUpdateState({ status: "checking", message: "正在检查最新版本..." });
 
     try {
       const result = await dlEditor.checkForUpdates();
@@ -410,19 +1296,182 @@ function App() {
     }
   }
 
+  function changeCloudSpace(nextSpaceId) {
+    setCloudSpaceId(nextSpaceId);
+    setRepositoryState({
+      status: authStateRef.current?.token ? "loading" : "auth",
+      spaceId: nextSpaceId,
+      items: [],
+      total: 0,
+      hasMore: false,
+      nextCursor: null,
+      message: authStateRef.current?.token ? "" : "请先登录后查看 Cloud repository"
+    });
+  }
+
+  async function submitLogin() {
+    const identifier = loginForm.identifier.trim();
+    if (!identifier || !loginForm.password) {
+      setLoginStatus({ status: "error", message: "请输入账号和密码" });
+      return;
+    }
+
+    setLoginStatus({ status: "checking", message: "正在验证 infera-button-demo 账号..." });
+    try {
+      const result = await loginToInfera({ identifier, password: loginForm.password });
+      const nextAuth = normalizeAuthPayload(result, identifier);
+      if (!nextAuth.token) {
+        throw new Error("登录响应缺少 token");
+      }
+
+      if (loginForm.remember) {
+        window.localStorage?.setItem(AUTH_STORAGE_KEY, JSON.stringify(nextAuth));
+      } else {
+        window.localStorage?.removeItem(AUTH_STORAGE_KEY);
+      }
+
+      setAuthState(nextAuth);
+      setLoginStatus({ status: "idle", message: "" });
+      setLoginForm((current) => ({ ...current, identifier, password: "" }));
+      setShowLogin(false);
+
+      if (activeNav === "Cloud") {
+        loadCloudRepository(nextAuth, cloudSpaceId);
+      }
+    } catch (error) {
+      setLoginStatus({
+        status: "error",
+        message: error.message || "登录验证失败"
+      });
+    }
+  }
+
+  function logout() {
+    window.localStorage?.removeItem(AUTH_STORAGE_KEY);
+    setAuthState(null);
+    setLoginStatus({ status: "idle", message: "" });
+    setRepositoryState({
+      status: "auth",
+      spaceId: cloudSpaceId,
+      items: [],
+      total: 0,
+      hasMore: false,
+      nextCursor: null,
+      message: "请先登录后查看 Cloud repository"
+    });
+  }
+
+  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId) {
+    const token = authOverride?.token;
+    if (!token) {
+      setRepositoryState({
+        status: "auth",
+        spaceId: spaceIdOverride,
+        items: [],
+        total: 0,
+        hasMore: false,
+        nextCursor: null,
+        message: "请先登录后查看 Cloud repository"
+      });
+      return;
+    }
+
+    setRepositoryState((current) => ({
+      ...current,
+      items: current.spaceId === spaceIdOverride ? current.items : [],
+      spaceId: spaceIdOverride,
+      status: "loading",
+      message: ""
+    }));
+
+    try {
+      const repository = await fetchCloudRepository(token, spaceIdOverride);
+      setRepositoryState((current) =>
+        current.spaceId === spaceIdOverride
+          ? {
+              status: "ready",
+              spaceId: spaceIdOverride,
+              items: repository.items,
+              total: repository.total,
+              hasMore: repository.hasMore,
+              nextCursor: repository.nextCursor,
+              message: ""
+            }
+          : current
+      );
+    } catch (error) {
+      setRepositoryState((current) =>
+        current.spaceId === spaceIdOverride
+          ? {
+              ...current,
+              spaceId: spaceIdOverride,
+              status: "error",
+              message: error.message || "无法读取 Cloud repository"
+            }
+          : current
+      );
+    }
+  }
+
+  async function deleteCloudRepositoryItem(item, spaceIdOverride = cloudSpaceId) {
+    if (spaceIdOverride !== "rawdata") {
+      setNotice("Repository 删除稍后接入");
+      return;
+    }
+
+    if (!authState?.token) {
+      setShowLogin(true);
+      setNotice("请先登录后删除 Rawdata");
+      return;
+    }
+
+    const title = getRepositoryTitle(item);
+    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, status: "loading", message: "" }));
+    try {
+      await deleteRawDataArchive(authState.token, item);
+      setNotice(`已删除 ${title}`);
+      await loadCloudRepository(authState, spaceIdOverride);
+    } catch (error) {
+      setRepositoryState((current) => ({
+        ...current,
+        spaceId: spaceIdOverride,
+        status: "error",
+        message: error.message || "删除 Rawdata 失败"
+      }));
+      setNotice(error.message || "删除 Rawdata 失败");
+    }
+  }
+
+  function unlockEngine() {
+    if (enginePassword === ENGINE_PASSWORD) {
+      setEngineUnlocked(true);
+      setEnginePassword("");
+      setEngineError("");
+      return;
+    }
+
+    setEngineError("密码错误");
+  }
+
   return (
-    <main className="app-shell">
+    <>
+      <main
+        aria-hidden={showSplash}
+        className={["app-shell", `platform-${dlEditor.platform || "browser"}`, isFullscreen ? "is-fullscreen" : ""].filter(Boolean).join(" ")}
+      >
       <AppChrome
-        isMaximized={isMaximized}
-        onClose={() => dlEditor.closeWindow()}
-        onMinimize={() => dlEditor.minimizeWindow()}
+        activeNav={activeNav}
+        authState={authState}
+        isFullscreen={isFullscreen}
+        onLoginClick={() => setShowLogin(true)}
+        onNavChange={setActiveNav}
         onInfoClick={() => setShowAppInfo(true)}
         onThemeToggle={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-        onToggleMaximize={() => dlEditor.toggleMaximizeWindow().then(setIsMaximized).catch(() => undefined)}
         theme={theme}
       />
 
-      <section className="workspace">
+      {activeNav === "Editor" ? (
+        <section className="workspace">
         <aside className="control-panel">
           <div className="panel-heading">
             <Settings2 size={18} />
@@ -562,7 +1611,9 @@ function App() {
             </div>
           </div>
 
-          <UsageCard device={processingDevice} usage={systemUsage} />
+          <UsageCard activeEncodingJob={activeEncodingJob} device={processingDevice} usage={systemUsage} />
+
+          <AutomationOptions options={automationOptions} onChange={updateAutomationOption} />
 
           <div className="actions">
             <button className="primary-button" disabled={!canStart} onClick={startBatch} type="button">
@@ -587,6 +1638,31 @@ function App() {
               <h2>处理队列</h2>
             </div>
             <div className="toolbar-actions">
+              {selectionMode && (
+                <>
+                  <button className="icon-button" disabled={!jobs.length} onClick={toggleAllSelectedJobs} title={allJobsSelected ? "取消全选" : "全选视频"} type="button">
+                    <CheckCheck size={18} />
+                  </button>
+                  <span className="selection-count">
+                    {selectedJobs.length}/{jobs.length}
+                  </span>
+                </>
+              )}
+              <button
+                className={selectionMode ? "icon-button active" : "icon-button"}
+                disabled={!jobs.length}
+                onClick={toggleSelectionMode}
+                title="选择视频"
+                type="button"
+              >
+                <SquareCheck size={18} />
+              </button>
+              <button className="icon-button" disabled={!canBackupSelection} onClick={backupSelectedJobs} title="备份所选视频" type="button">
+                <Archive size={18} />
+              </button>
+              <button className="icon-button" disabled={!canUploadSelection} onClick={uploadSelectedJobs} title="上传到 Delphi Repository" type="button">
+                <Upload size={18} />
+              </button>
               <button className="icon-button" disabled={isRunning} onClick={clearFinished} title="清除已完成" type="button">
                 <RotateCcw size={18} />
               </button>
@@ -611,6 +1687,23 @@ function App() {
             </div>
           )}
 
+          {autoUploadNotice.visible && (
+            <AutoUploadNotice
+              message={autoUploadNotice.message}
+              onClose={() => setAutoUploadNotice((current) => ({ ...current, visible: false }))}
+            />
+          )}
+
+          {uploadState.visible && (
+            <UploadProgressPanel
+              now={clockNow}
+              onClose={closeUploadPanel}
+              onPauseToggle={toggleCurrentUploadPaused}
+              onToggleDetails={toggleUploadDetails}
+              state={uploadState}
+            />
+          )}
+
           {jobs.length === 0 ? (
             <button className="empty-state" onClick={addVideos} type="button">
               <Video size={32} />
@@ -628,13 +1721,43 @@ function App() {
                   onOpen={() => job.outputPath && dlEditor.openPath(job.outputPath)}
                   onRemove={() => removeJob(job.id)}
                   onReveal={() => job.outputPath && dlEditor.revealPath(job.outputPath)}
+                  onToggleSelection={() => toggleJobSelection(job.id)}
+                  selected={selectedJobIds.has(job.id)}
+                  selectionMode={selectionMode}
                 />
               ))}
             </div>
           )}
         </section>
-      </section>
-      {startTimeEditor && (
+        </section>
+      ) : activeNav === "Cloud" ? (
+        <CloudRepository
+          authState={authState}
+          cloudSpaceId={cloudSpaceId}
+          onDeleteItem={deleteCloudRepositoryItem}
+          onLogin={() => setShowLogin(true)}
+          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId)}
+          onSpaceChange={changeCloudSpace}
+          repositoryState={repositoryState}
+        />
+      ) : activeNav === "Engine" ? (
+        engineUnlocked ? (
+          <PlaceholderPage title="DL Engine" />
+        ) : (
+          <EngineGate
+            error={engineError}
+            onChange={(value) => {
+              setEnginePassword(value);
+              setEngineError("");
+            }}
+            onSubmit={unlockEngine}
+            value={enginePassword}
+          />
+        )
+      ) : (
+        <PlaceholderPage title={activeNav} />
+      )}
+      {activeNav === "Editor" && startTimeEditor && (
         <StartTimeDialog
           editor={startTimeEditor}
           onCancel={() => setStartTimeEditor(null)}
@@ -655,13 +1778,643 @@ function App() {
           updateState={updateState}
         />
       )}
-    </main>
+      {showLogin && (
+        <LoginDialog
+          authState={authState}
+          form={loginForm}
+          loginStatus={loginStatus}
+          onChange={(changes) => setLoginForm((current) => ({ ...current, ...changes }))}
+          onClose={() => setShowLogin(false)}
+          onLogout={logout}
+          onSubmit={submitLogin}
+        />
+      )}
+      </main>
+      {showSplash && <SplashScreen />}
+    </>
   );
 }
 
-function AppChrome({ isMaximized, onClose, onInfoClick, onMinimize, onThemeToggle, onToggleMaximize, theme }) {
+function PlaceholderPage({ title }) {
+  return (
+    <section className="placeholder-page">
+      <h1>{title}</h1>
+    </section>
+  );
+}
+
+function EngineGate({ error, onChange, onSubmit, value }) {
+  return (
+    <section className="engine-page">
+      <form
+        className="engine-gate"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <div className="engine-gate-heading">
+          <LockKeyhole size={18} />
+          <div>
+            <strong>DL Engine</strong>
+            <span>Engine</span>
+          </div>
+        </div>
+        <label className="login-field">
+          <span>密码</span>
+          <div className="login-input-wrap">
+            <LockKeyhole size={15} />
+            <input
+              autoComplete="current-password"
+              autoFocus
+              onChange={(event) => onChange(event.target.value)}
+              placeholder="输入密码"
+              type="password"
+              value={value}
+            />
+          </div>
+        </label>
+        {error && <div className="login-status error">{error}</div>}
+        <button className="primary-button" type="submit">
+          进入
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function AutoUploadNotice({ message, onClose }) {
+  return (
+    <div className="auto-upload-notice">
+      <div>
+        <Upload size={16} />
+        <span>{message}</span>
+      </div>
+      <button onClick={onClose} title="关闭卡片" type="button">
+        <X size={15} />
+      </button>
+    </div>
+  );
+}
+
+function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRefresh, onSpaceChange, repositoryState }) {
+  const items = repositoryState.items || [];
+  const isLoading = repositoryState.status === "loading";
+  const [cloudQuery, setCloudQuery] = useState("");
+  const [cloudViewMode, setCloudViewMode] = useState("list");
+  const [activeCloudFilter, setActiveCloudFilter] = useState("all");
+  const [isCloudSpaceMenuOpen, setCloudSpaceMenuOpen] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState("");
+  const [repositoryMenuPosition, setRepositoryMenuPosition] = useState(null);
+  const displaySpaceId = repositoryState.spaceId || cloudSpaceId;
+  const isRawDataSpace = displaySpaceId === "rawdata";
+  const visibleFilters = useMemo(() => getCloudFiltersForSpace(displaySpaceId), [displaySpaceId]);
+  const stats = useMemo(() => getCloudRepositoryStats(items), [items]);
+  const filteredItems = useMemo(
+    () => filterCloudRepositoryItems(items, activeCloudFilter, cloudQuery),
+    [activeCloudFilter, cloudQuery, items]
+  );
+  const openMenuItem = useMemo(
+    () => filteredItems.find((item) => getRepositoryItemKey(item) === openMenuId) || null,
+    [filteredItems, openMenuId]
+  );
+  const activeFilterLabel = visibleFilters.find((filter) => filter.id === activeCloudFilter)?.label || visibleFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === displaySpaceId) || CLOUD_SPACES[0];
+  const storagePercent = Math.min(92, Math.max(4, Math.round((stats.totalBytes / (5 * 1024 * 1024 * 1024)) * 100)));
+
+  function closeRepositoryMenu() {
+    setOpenMenuId("");
+    setRepositoryMenuPosition(null);
+  }
+
+  function toggleRepositoryMenu(item, event) {
+    event.stopPropagation();
+    const itemId = getRepositoryItemKey(item);
+    if (openMenuId === itemId) {
+      closeRepositoryMenu();
+      return;
+    }
+
+    setOpenMenuId(itemId);
+    setRepositoryMenuPosition(getRepositoryActionMenuPosition(event.currentTarget));
+  }
+
+  useEffect(() => {
+    if (!visibleFilters.some((filter) => filter.id === activeCloudFilter)) {
+      setActiveCloudFilter("all");
+    }
+    closeRepositoryMenu();
+  }, [activeCloudFilter, displaySpaceId, visibleFilters]);
+
+  useEffect(() => {
+    if (!openMenuId) {
+      return undefined;
+    }
+
+    window.addEventListener("resize", closeRepositoryMenu);
+    window.addEventListener("scroll", closeRepositoryMenu, true);
+    return () => {
+      window.removeEventListener("resize", closeRepositoryMenu);
+      window.removeEventListener("scroll", closeRepositoryMenu, true);
+    };
+  }, [openMenuId]);
+
+  return (
+    <section className="cloud-page">
+      <div className="cloud-drive">
+        <aside className="cloud-sidebar">
+          <div className="cloud-brand">
+            <span className="cloud-brand-icon">
+              <Cloud size={18} />
+            </span>
+            <div>
+              <strong>DL Cloud</strong>
+              <div className="cloud-space-wrap">
+                <button
+                  className="cloud-space-button"
+                  onClick={() => setCloudSpaceMenuOpen((current) => !current)}
+                  title="选择空间"
+                  type="button"
+                >
+                  <span>{activeCloudSpace.label}</span>
+                  <ChevronDown size={13} />
+                </button>
+                {isCloudSpaceMenuOpen && (
+                  <div className="cloud-space-menu">
+                    {CLOUD_SPACES.map((space) => (
+                      <button
+                        className={displaySpaceId === space.id ? "active" : ""}
+                        key={space.id}
+                        onClick={() => {
+                          onSpaceChange(space.id);
+                          setCloudSpaceMenuOpen(false);
+                        }}
+                        type="button"
+                      >
+                        {space.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <nav aria-label="Cloud files" className="cloud-nav">
+            {visibleFilters.map((filter) => (
+              <button
+                className={activeCloudFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
+                key={filter.id}
+                onClick={() => setActiveCloudFilter(filter.id)}
+                type="button"
+              >
+                <CloudFilterIcon id={filter.id} />
+                <span>{filter.label}</span>
+                <b>{getCloudFilterCount(stats, filter.id)}</b>
+              </button>
+            ))}
+          </nav>
+
+          <div className="cloud-storage">
+            <div className="cloud-storage-head">
+              <HardDrive size={16} />
+              <span>Storage</span>
+              <strong>{formatBytes(stats.totalBytes) || "0 B"}</strong>
+            </div>
+            <div className="cloud-storage-meter">
+              <span style={{ width: `${storagePercent}%` }} />
+            </div>
+            <p>{stats.total} files</p>
+          </div>
+        </aside>
+
+        <section className="cloud-main">
+          {!authState?.token ? (
+            <div className="cloud-empty">
+              <LockKeyhole size={30} />
+              <h1>Cloud</h1>
+                  <p>登录 infera-button-demo 账号后查看 {isRawDataSpace ? "rawdata" : "repository"}。</p>
+              <button className="primary-button" onClick={onLogin} type="button">
+                <UserRound size={16} />
+                <span>登录</span>
+              </button>
+            </div>
+          ) : (
+            <>
+              <header className="cloud-toolbar">
+                <div className="cloud-breadcrumb">
+                  <span>Cloud</span>
+                  <ChevronRight size={14} />
+                  <strong>{activeFilterLabel}</strong>
+                </div>
+                <label className="cloud-search">
+                  <Search size={15} />
+                  <input
+                    autoComplete="off"
+                    onChange={(event) => setCloudQuery(event.target.value)}
+                    placeholder="搜索文件、设备或摘要"
+                    type="search"
+                    value={cloudQuery}
+                  />
+                </label>
+                <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={() => onRefresh(displaySpaceId)} type="button">
+                  <RotateCcw size={16} />
+                  <span>{isLoading ? "同步中" : "刷新"}</span>
+                </button>
+              </header>
+
+              <div className="cloud-overview">
+                <CloudMetric icon={<FolderOpen size={17} />} label="文件" value={stats.total} />
+                <CloudMetric icon={<Video size={17} />} label="视频" value={stats.video} />
+                {isRawDataSpace ? (
+                  <CloudMetric icon={<Timer size={17} />} label="时长" value={formatDurationCompact(Math.round(stats.totalDurationSeconds * 1000)) || "-"} />
+                ) : (
+                  <CloudMetric icon={<CheckCircle2 size={17} />} label="已解析" value={stats.parsed} />
+                )}
+                <CloudMetric icon={<Gauge size={17} />} label="容量" value={formatBytes(stats.totalBytes) || "0 B"} />
+              </div>
+
+              {repositoryState.status === "error" && (
+                <div className="repository-alert">
+                  <TriangleAlert size={16} />
+                  <span>{repositoryState.message}</span>
+                </div>
+              )}
+
+              <section className="repository-panel">
+                <div className="repository-panel-head">
+                  <div>
+                    <h2>Files</h2>
+                    <span>
+                      {filteredItems.length} of {repositoryState.total || items.length}
+                    </span>
+                  </div>
+                  <div className="cloud-view-toggle">
+                    {CLOUD_VIEW_MODES.map((mode) => (
+                      <button
+                        aria-pressed={cloudViewMode === mode}
+                        className={cloudViewMode === mode ? "active" : ""}
+                        key={mode}
+                        onClick={() => setCloudViewMode(mode)}
+                        title={mode === "list" ? "列表" : "网格"}
+                        type="button"
+                      >
+                        {mode === "list" ? <List size={15} /> : <LayoutGrid size={15} />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {isLoading && items.length === 0 ? (
+                  <div className="repository-empty">正在读取 repository...</div>
+                ) : filteredItems.length === 0 ? (
+                  <div className="repository-empty">没有匹配的文件</div>
+                ) : cloudViewMode === "grid" ? (
+                  <div className="cloud-file-grid">
+                    <div className="repository-list">
+                      {filteredItems.map((item) => (
+                        <RepositoryItem
+                          isRawDataSpace={isRawDataSpace}
+                          item={item}
+                          key={item.asset_id || item.id || item.media_url}
+                          onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="cloud-file-table">
+                    <div className={isRawDataSpace ? "repository-table-head rawdata" : "repository-table-head"}>
+                      <span>名称</span>
+                      {isRawDataSpace ? (
+                        <>
+                          <span>状态</span>
+                          <span>上传时间</span>
+                          <span>拍摄时间</span>
+                          <span>视频时长</span>
+                          <span>文件大小</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>类型</span>
+                          <span>状态</span>
+                          <span>时间</span>
+                        </>
+                      )}
+                      <span />
+                    </div>
+                    <div className="repository-list">
+                      {filteredItems.map((item) => (
+                        <RepositoryTableRow
+                          isRawDataSpace={isRawDataSpace}
+                          item={item}
+                          key={getRepositoryItemKey(item)}
+                          onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {openMenuItem && repositoryMenuPosition && (
+                  <div
+                    className="repository-action-menu floating"
+                    style={{
+                      "--menu-left": `${repositoryMenuPosition.left}px`,
+                      "--menu-top": `${repositoryMenuPosition.top}px`
+                    }}
+                  >
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        const item = openMenuItem;
+                        closeRepositoryMenu();
+                        onDeleteItem(item, displaySpaceId);
+                      }}
+                      type="button"
+                    >
+                      删除
+                    </button>
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function CloudFilterIcon({ id }) {
+  if (id === "video") return <FileVideo size={15} />;
+  if (id === "audio") return <FileAudio size={15} />;
+  if (id === "parsed") return <CheckCircle2 size={15} />;
+  if (id === "processing") return <Clock3 size={15} />;
+  return <Folder size={15} />;
+}
+
+function CloudMetric({ icon, label, value }) {
+  return (
+    <div className="cloud-metric">
+      {icon}
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function RepositoryItem({ isRawDataSpace, item, onToggleMenu }) {
+  return <RepositoryGridCard isRawDataSpace={isRawDataSpace} item={item} onToggleMenu={onToggleMenu} />;
+}
+
+function RepositoryGridCard({ isRawDataSpace, item, onToggleMenu }) {
+  const title = getRepositoryTitle(item);
+  const status = isRawDataSpace ? getRawDataStorageStatus(item) : item.parse_status || "UNKNOWN";
+
+  return (
+    <article className="repository-item">
+      <div className="repository-card">
+        <RepositoryFileIcon item={item} />
+        <div className="repository-card-body">
+          <h3 title={title}>{title}</h3>
+          <span>{formatRepositoryDate(item.captured_at || item.timestamp_ms || item.create_time) || "No date"}</span>
+        </div>
+        <div className="repository-card-foot">
+          <span className={`repository-status ${isRawDataSpace ? "storage " : ""}${String(status).toLowerCase()}`}>
+            {isRawDataSpace ? formatRawDataStorageStatus(status) : formatRepositoryStatus(status)}
+          </span>
+          <button onClick={onToggleMenu} title="更多" type="button">
+            <Ellipsis size={15} />
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function RepositoryTableRow({ isRawDataSpace, item, onToggleMenu }) {
+  const title = getRepositoryTitle(item);
+  const status = item.parse_status || "UNKNOWN";
+  const rawDataStorageStatus = getRawDataStorageStatus(item);
+  const type = item.asset_type || item.media_type || item.file_type || "file";
+
+  return (
+    <article className={isRawDataSpace ? "repository-row rawdata" : "repository-row"}>
+      <div className="repository-name-cell">
+        <RepositoryFileIcon item={item} />
+        <div>
+          <h3 title={title}>{title}</h3>
+          {!isRawDataSpace && <p>{item.summary_text || item.device_id || item.media_url || "No summary"}</p>}
+        </div>
+      </div>
+      {isRawDataSpace ? (
+        <>
+          <span className={`repository-status storage ${String(rawDataStorageStatus).toLowerCase()}`}>
+            {formatRawDataStorageStatus(rawDataStorageStatus)}
+          </span>
+          <span>{formatRepositoryDate(getRepositoryUploadTime(item)) || "-"}</span>
+          <span>{formatRepositoryDate(getRepositoryCapturedTime(item)) || "-"}</span>
+          <span>{formatRepositoryDuration(getRepositoryDurationSeconds(item)) || "-"}</span>
+          <span>{formatBytes(getRepositorySizeBytes(item)) || "-"}</span>
+        </>
+      ) : (
+        <>
+          <span>{type}</span>
+          <span className={`repository-status ${String(status).toLowerCase()}`}>{formatRepositoryStatus(status)}</span>
+          <span>{formatRepositoryDate(item.captured_at || item.timestamp_ms || item.create_time) || "-"}</span>
+        </>
+      )}
+      <div className="repository-actions">
+        <button onClick={onToggleMenu} title="更多" type="button">
+          <Ellipsis size={15} />
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function RepositoryFileIcon({ item }) {
+  const type = getRepositoryType(item);
+  const hasThumbnail = Boolean(item.thumbnail_url);
+  const Icon = type === "audio" ? FileAudio : type === "video" ? FileVideo : Folder;
+
+  return (
+    <div className={`repository-thumbnail ${type}`} data-has-thumbnail={hasThumbnail ? "true" : undefined}>
+      <Icon size={20} />
+    </div>
+  );
+}
+
+function SplashScreen() {
+  return (
+    <section aria-label={`${APP_NAME} 启动中`} className="splash-screen">
+      <div className="splash-content">
+        <div className="splash-logo-frame">
+          <img alt="" className="splash-logo" draggable="false" src={appIconUrl} />
+        </div>
+        <h1>{APP_NAME}</h1>
+        <div className="splash-progress" />
+      </div>
+    </section>
+  );
+}
+
+function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout, onSubmit }) {
+  const isChecking = loginStatus.status === "checking";
+  const displayName = getAuthDisplayName(authState);
+  const accountName = getAuthAccountName(authState);
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+      role="presentation"
+    >
+      <section aria-modal="true" className="login-dialog" role="dialog">
+        <div className="dialog-heading login-heading">
+          <UserRound size={18} />
+          <div>
+            <strong>登录</strong>
+            <span>{displayName || APP_NAME}</span>
+          </div>
+        </div>
+        {authState?.token && (
+          <div className="login-account">
+            <div className="login-account-identity">
+              <strong>{displayName}</strong>
+              {accountName && accountName !== displayName && <span>{accountName}</span>}
+            </div>
+            <button onClick={onLogout} type="button">
+              退出
+            </button>
+          </div>
+        )}
+        <form
+          className="login-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit();
+          }}
+        >
+          <label className="login-field">
+            <span>账号</span>
+            <div className="login-input-wrap">
+              <Mail size={15} />
+              <input
+                autoComplete="username"
+                disabled={isChecking}
+                name="identifier"
+                onChange={(event) => onChange({ identifier: event.target.value })}
+                placeholder="邮箱或手机号"
+                type="text"
+                value={form.identifier}
+              />
+            </div>
+          </label>
+          <label className="login-field">
+            <span>密码</span>
+            <div className="login-input-wrap">
+              <LockKeyhole size={15} />
+              <input
+                autoComplete="current-password"
+                disabled={isChecking}
+                onChange={(event) => onChange({ password: event.target.value })}
+                placeholder="••••••••"
+                type="password"
+                value={form.password}
+              />
+            </div>
+          </label>
+          <label className="login-remember">
+            <input
+              checked={form.remember}
+              disabled={isChecking}
+              onChange={(event) => onChange({ remember: event.target.checked })}
+              type="checkbox"
+            />
+            <span>记住登录</span>
+          </label>
+          {loginStatus.message && <div className={`login-status ${loginStatus.status}`}>{loginStatus.message}</div>}
+          <div className="dialog-actions login-actions">
+            <button className="ghost-button" disabled={isChecking} onClick={onClose} type="button">
+              取消
+            </button>
+            <button className="primary-button" disabled={isChecking} type="submit">
+              {isChecking ? "验证中" : "登录"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function AppChrome({
+  activeNav,
+  authState,
+  isFullscreen,
+  onInfoClick,
+  onLoginClick,
+  onNavChange,
+  onThemeToggle,
+  theme
+}) {
+  const navRef = useRef(null);
+  const navLabelRefs = useRef([]);
+  const displayName = getAuthDisplayName(authState);
+  const accountName = getAuthAccountName(authState);
+  const [navUnderlineStyle, setNavUnderlineStyle] = useState({
+    "--nav-underline-left": "0px",
+    "--nav-underline-width": "0px"
+  });
+
+  useLayoutEffect(() => {
+    function updateNavUnderline() {
+      const activeIndex = NAV_ITEMS.indexOf(activeNav);
+      const nav = navRef.current;
+      const label = navLabelRefs.current[activeIndex];
+      if (!nav || !label) return;
+
+      const navRect = nav.getBoundingClientRect();
+      const labelRect = label.getBoundingClientRect();
+      setNavUnderlineStyle({
+        "--nav-underline-left": `${labelRect.left - navRect.left}px`,
+        "--nav-underline-width": `${labelRect.width}px`
+      });
+    }
+
+    updateNavUnderline();
+    window.addEventListener("resize", updateNavUnderline);
+    return () => window.removeEventListener("resize", updateNavUnderline);
+  }, [activeNav, isFullscreen]);
+
   return (
     <section className="app-chrome">
+      <div className="chrome-left">
+        <button className="profile-button" onClick={onLoginClick} title={displayName || "登录"} type="button">
+          {authState?.token ? <span className="profile-initial">{getAuthInitial(accountName)}</span> : <UserRound size={16} />}
+        </button>
+        <nav aria-label="Primary" className="top-nav" ref={navRef}>
+          {NAV_ITEMS.map((item, index) => (
+            <button
+              aria-current={activeNav === item ? "page" : undefined}
+              className={activeNav === item ? "nav-item active" : "nav-item"}
+              key={item}
+              onClick={() => onNavChange(item)}
+              type="button"
+            >
+              <span className="nav-label" ref={(node) => { navLabelRefs.current[index] = node; }}>
+                {item}
+              </span>
+            </button>
+          ))}
+          <span className="nav-underline" style={navUnderlineStyle} />
+        </nav>
+      </div>
       <div className="drag-region" />
       <div className="window-actions">
         <button className="chrome-button" onClick={onInfoClick} title="软件信息" type="button">
@@ -669,15 +2422,6 @@ function AppChrome({ isMaximized, onClose, onInfoClick, onMinimize, onThemeToggl
         </button>
         <button className="chrome-button" onClick={onThemeToggle} title={theme === "dark" ? "切换浅色主题" : "切换深色主题"} type="button">
           {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
-        </button>
-        <button className="chrome-button" onClick={onMinimize} title="最小化" type="button">
-          <Minus size={15} />
-        </button>
-        <button className="chrome-button" onClick={onToggleMaximize} title={isMaximized ? "还原" : "最大化"} type="button">
-          {isMaximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-        </button>
-        <button className="chrome-button close" onClick={onClose} title="关闭" type="button">
-          <X size={15} />
         </button>
       </div>
     </section>
@@ -725,7 +2469,7 @@ function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onCl
           <strong title={outputDirectory}>{outputDirectory || "-"}</strong>
         </div>
         <div className={`update-status ${updateState?.status || "idle"}`}>
-          <span>{updateState?.message || "从 GitHub Releases 检查最新安装包"}</span>
+          <span>{updateState?.message || "检查最新安装包"}</span>
         </div>
         <div className="dialog-actions app-info-actions">
           <button className="ghost-button" disabled={isCheckingUpdate} onClick={onCheckUpdates} type="button">
@@ -761,7 +2505,7 @@ function getUpdateMessage(result) {
   }
 
   if (result?.status === "no_release") {
-    return "GitHub 还没有发布版本，请先在 Releases 上传安装包";
+    return "当前还没有可用发布版本，请稍后再试";
   }
 
   return "无法读取更新状态";
@@ -806,10 +2550,11 @@ function DeviceStatus({ capabilities, device, encoder, usage }) {
   );
 }
 
-function UsageCard({ device, usage }) {
+function UsageCard({ activeEncodingJob, device, usage }) {
   const isCpu = device === "cpu";
   const data = isCpu ? usage?.cpu : usage?.gpu;
   const total = isCpu ? data?.usage : data?.total;
+  const hasActiveHardwareEncoding = !isCpu && activeEncodingJob?.hardwareEncoding;
   const isGpuRestricted = !isCpu && data?.status === "restricted";
   const statusLabel = Number.isFinite(Number(data?.total))
     ? "可读取"
@@ -825,9 +2570,17 @@ function UsageCard({ device, usage }) {
         <Activity size={18} />
         <div>
           <strong>{isCpu ? "CPU 使用情况" : "GPU 使用情况"}</strong>
-          <span>{isCpu ? "系统总负载" : isGpuRestricted ? "硬件编码运行状态" : "总利用率与编码引擎"}</span>
+          <span>
+            {isCpu
+              ? "系统总负载"
+              : hasActiveHardwareEncoding
+                ? "VideoToolbox 硬件编码中"
+                : isGpuRestricted
+                  ? "硬件编码运行状态"
+                  : "总利用率与编码引擎"}
+          </span>
         </div>
-        <b>{percentLabel(total)}</b>
+        <b>{hasActiveHardwareEncoding ? "编码中" : percentLabel(total)}</b>
       </div>
       <div className="meter-track">
         <div className="meter-fill" style={{ width: `${clampPercent(total)}%` }} />
@@ -841,14 +2594,14 @@ function UsageCard({ device, usage }) {
         </div>
       ) : (
         <div className="usage-grid">
-          <span>Video Encode</span>
-          <strong>{percentLabel(data?.videoEncode)}</strong>
+          <span>{hasActiveHardwareEncoding ? "编码速度" : "Video Encode"}</span>
+          <strong>{hasActiveHardwareEncoding ? formatEncodingSpeed(activeEncodingJob) : percentLabel(data?.videoEncode)}</strong>
           <span>3D</span>
           <strong>{percentLabel(data?.threeD)}</strong>
-          <span>Compute</span>
-          <strong>{percentLabel(data?.compute)}</strong>
+          <span>{hasActiveHardwareEncoding ? "编码器" : "Compute"}</span>
+          <strong>{hasActiveHardwareEncoding ? activeEncodingJob.encoder : percentLabel(data?.compute)}</strong>
           <span>状态</span>
-          <strong>{statusLabel}</strong>
+          <strong>{hasActiveHardwareEncoding ? "硬件编码" : statusLabel}</strong>
         </div>
       )}
     </div>
@@ -863,6 +2616,835 @@ function Metric({ icon, label, value }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function AutomationOptions({ onChange, options }) {
+  const rows = [
+    { icon: <Upload size={15} />, id: "autoUpload", label: "自动上传", title: "处理完成后上传降帧视频" },
+    { icon: <Archive size={15} />, id: "autoBackup", label: "自动备份", title: "处理完成后备份原视频" },
+    { icon: <HardDrive size={15} />, id: "autoClearLocal", label: "自动清除本地文件", title: "上传后清除降帧文件，备份后清除原视频" }
+  ];
+
+  return (
+    <div className="automation-options">
+      {rows.map((row) => (
+        <label className="automation-option" key={row.id} title={row.title}>
+          <input
+            checked={Boolean(options[row.id])}
+            onChange={(event) => onChange(row.id, event.target.checked)}
+            type="checkbox"
+          />
+          <span className="automation-check" />
+          {row.icon}
+          <span>{row.label}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function UploadProgressPanel({ now, onClose, onPauseToggle, onToggleDetails, state }) {
+  const total = state.items.length;
+  const completed = state.items.filter((item) => item.status === "done").length;
+  const active = isUploadActive(state);
+  const paused = state.status === "paused";
+  const canPause = isUploadPausable(state);
+  const overallPercent = getUploadOverallPercent(state);
+  const statusLabel = UPLOAD_STATUS_LABELS[state.status] || (state.status === "ready" ? "完成" : "上传");
+  const destination = state.destination || "Delphi Repository";
+  const title =
+    state.mode === "auto-backup"
+      ? `自动备份到 ${destination}`
+      : state.mode === "auto" || state.mode === "auto-upload"
+        ? `自动上传到 ${destination}`
+        : state.mode === "backup"
+          ? `${destination} 备份`
+          : `${destination} 上传`;
+
+  return (
+    <section className={`upload-panel ${state.status}`}>
+      <div className="upload-panel-main">
+        <div className="upload-icon">
+          <Upload size={16} />
+        </div>
+        <div className="upload-panel-body">
+          <div className="upload-title-row">
+            <strong>{title}</strong>
+            <span>
+              {completed}/{total || 0} · {Math.round(overallPercent)}% · {formatUploadSpeed(getUploadCurrentSpeed(state))}
+            </span>
+          </div>
+          <div className="upload-progress-track">
+            <div className="upload-progress-fill" style={{ width: `${overallPercent}%` }} />
+          </div>
+          <p>{state.message || statusLabel}</p>
+        </div>
+        <div className="upload-actions">
+          <button disabled={!canPause} onClick={onPauseToggle} title={paused ? "继续上传" : "暂停上传"} type="button">
+            {paused ? <Play size={15} /> : <Pause size={15} />}
+          </button>
+          <button onClick={onClose} title={active ? "关闭并取消上传" : "关闭卡片"} type="button">
+            <X size={15} />
+          </button>
+          <button
+            aria-expanded={state.expanded}
+            className={state.expanded ? "expanded" : ""}
+            onClick={onToggleDetails}
+            title={state.expanded ? "收起视频进度" : "展开视频进度"}
+            type="button"
+          >
+            <ChevronDown size={15} />
+          </button>
+        </div>
+      </div>
+      {state.expanded && (
+        <div className="upload-detail-list">
+          {state.items.map((item) => (
+            <div className="upload-detail-item" key={item.jobId}>
+              <div className="upload-detail-top">
+                <span title={item.path}>{item.name}</span>
+                <strong>{UPLOAD_STATUS_LABELS[item.status] || item.status}</strong>
+              </div>
+              <div className="upload-progress-track">
+                <div className="upload-progress-fill" style={{ width: `${clampPercent(item.percent)}%` }} />
+              </div>
+              <div className="upload-detail-meta">
+                <span>{item.message || UPLOAD_STATUS_LABELS[item.status] || ""}</span>
+                <span>
+                  {formatUploadBytes(item)} · {formatUploadSpeed(item.speedBytesPerSecond)}
+                </span>
+              </div>
+              <div className="upload-detail-time">
+                <span>
+                  耗时 <DurationValue value={getUploadItemElapsedMs(item, now)} />
+                </span>
+                <span>
+                  预计剩余 <DurationValue value={getUploadItemRemainingMs(item, now)} />
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function createUploadItems(jobs) {
+  return jobs.map((job) => ({
+    bytesUploaded: 0,
+    jobId: job.id,
+    message: "等待上传",
+    name: job.name,
+    path: job.uploadPath || getJobUploadPath(job),
+    percent: 0,
+    speedBytesPerSecond: 0,
+    status: "queued",
+    totalBytes: 0
+  }));
+}
+
+function getUploadDoneMessage(clearResult, operation = "upload") {
+  if (clearResult?.deleted) {
+    return clearResult.target === "source" ? "备份完成，本地原视频已清除" : "上传完成，本地降帧文件已清除";
+  }
+
+  if (clearResult?.error) {
+    return `${operation === "backup" ? "备份" : "上传"}完成，本地文件清除失败：${clearResult.error}`;
+  }
+
+  return operation === "backup" ? "备份完成" : "上传完成";
+}
+
+function getTransferSuccessPatch({ clearTarget, cleared, isAutoBackup, isAutoUpload, isBackup, result, timestamp, uploadPath }) {
+  const patch = isBackup
+    ? {
+        backedUpAt: timestamp,
+        backupResult: result
+      }
+    : {
+        uploadedAt: timestamp,
+        uploadResult: result
+      };
+
+  if (isAutoUpload) {
+    patch.autoUploadStatus = "done";
+  }
+  if (isAutoBackup) {
+    patch.autoBackupStatus = "done";
+  }
+
+  if (cleared?.error) {
+    if (clearTarget === "source") {
+      patch.autoClearOriginalError = cleared.error;
+      patch.autoClearOriginalStatus = "error";
+    } else {
+      patch.autoClearError = cleared.error;
+      patch.autoClearStatus = "error";
+    }
+    return patch;
+  }
+
+  if (!cleared?.deleted) {
+    return patch;
+  }
+
+  if (clearTarget === "source") {
+    return {
+      ...patch,
+      autoClearOriginalStatus: "done",
+      autoClearedOriginalAt: timestamp,
+      deletedOriginalPath: uploadPath
+    };
+  }
+
+  return {
+    ...patch,
+    autoClearStatus: "done",
+    autoClearedAt: timestamp,
+    deletedOutputPath: uploadPath,
+    outputPath: ""
+  };
+}
+
+function isUploadActive(state) {
+  return state?.status === "uploading" || state?.status === "paused" || state?.status === "canceling";
+}
+
+function isUploadPausable(state) {
+  return state?.status === "uploading" || state?.status === "paused";
+}
+
+function markUploadItem(state, jobId, patch) {
+  return {
+    ...state,
+    items: state.items.map((item) => (item.jobId === jobId ? { ...item, ...patch } : item))
+  };
+}
+
+function applyUploadProgress(state, progress) {
+  if (!progress?.uploadId || progress.uploadId !== state.uploadId) {
+    return state;
+  }
+
+  const status = progress.status || "uploading";
+  const message = progress.message || (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
+  const now = Date.now();
+  const nextItems = state.items.map((item) => {
+    const matches = progress.jobId ? item.jobId === progress.jobId : item.path === progress.filePath;
+    if (!matches) {
+      return item;
+    }
+
+    const startedAt = item.startedAt || now;
+    const bytesUploaded = Number(progress.bytesUploaded) || item.bytesUploaded;
+    const totalBytes = Number(progress.totalBytes) || item.totalBytes;
+    const speedBytesPerSecond = Number(progress.speedBytesPerSecond) || 0;
+    const elapsedMs = status === "paused" ? getUploadItemElapsedMs(item, now) : Math.max(getUploadItemElapsedMs(item, now), now - startedAt);
+
+    return {
+      ...item,
+      bytesUploaded,
+      elapsedMs,
+      estimatedRemainingMs: getUploadEstimatedRemainingMs({
+        bytesUploaded,
+        elapsedMs,
+        percent: progress.percent,
+        speedBytesPerSecond,
+        status,
+        totalBytes
+      }),
+      message,
+      percent: clampPercent(progress.percent),
+      speedBytesPerSecond,
+      startedAt,
+      status,
+      totalBytes
+    };
+  });
+
+  return {
+    ...state,
+    message,
+    status: getNextUploadPanelStatus(state.status, status),
+    visible: state.visible,
+    items: nextItems
+  };
+}
+
+function getNextUploadPanelStatus(currentStatus, progressStatus) {
+  if (progressStatus === "canceled") {
+    return "canceling";
+  }
+
+  if (progressStatus === "paused" || progressStatus === "uploading") {
+    return progressStatus;
+  }
+
+  return currentStatus;
+}
+
+function getUploadOverallPercent(state) {
+  if (!state.items.length) {
+    return 0;
+  }
+
+  const total = state.items.reduce((sum, item) => sum + (item.status === "done" ? 100 : clampPercent(item.percent)), 0);
+  return clampPercent(total / state.items.length);
+}
+
+function formatUploadBytes(item) {
+  const uploaded = formatBytes(item.bytesUploaded, { precision: 2 }) || "0.00 B";
+  const total = formatBytes(item.totalBytes, { precision: 2 });
+  return total ? `${uploaded} / ${total}` : uploaded;
+}
+
+function getUploadItemElapsedMs(item, now = Date.now()) {
+  if (!item) {
+    return 0;
+  }
+
+  if (item.status === "queued" || !Number.isFinite(Number(item.startedAt))) {
+    return Number(item.elapsedMs) || 0;
+  }
+
+  if (item.status === "done" || item.status === "error" || item.status === "canceled") {
+    return Number(item.elapsedMs) || Math.max(0, Number(item.completedAt || now) - Number(item.startedAt));
+  }
+
+  if (item.status === "paused") {
+    return Number(item.elapsedMs) || Math.max(0, now - Number(item.startedAt));
+  }
+
+  return Math.max(Number(item.elapsedMs) || 0, now - Number(item.startedAt));
+}
+
+function getUploadEstimatedRemainingMs({ bytesUploaded, elapsedMs, percent, speedBytesPerSecond, status, totalBytes }) {
+  if (status === "done") {
+    return 0;
+  }
+
+  const uploaded = Number(bytesUploaded);
+  const total = Number(totalBytes);
+  const speed = Number(speedBytesPerSecond);
+
+  if (Number.isFinite(uploaded) && Number.isFinite(total) && total > uploaded && speed > 0) {
+    return Math.max(0, Math.round(((total - uploaded) / speed) * 1000));
+  }
+
+  if (status === "processing" && Number.isFinite(uploaded) && Number.isFinite(total) && total > 0 && uploaded >= total) {
+    return null;
+  }
+
+  const progress = Number(percent);
+  if (Number.isFinite(progress) && progress > 0 && progress < 100 && Number.isFinite(Number(elapsedMs))) {
+    return Math.max(0, Math.round(Number(elapsedMs) * ((100 - progress) / progress)));
+  }
+
+  return null;
+}
+
+function getUploadItemRemainingMs(item, now = Date.now()) {
+  if (!item) {
+    return null;
+  }
+
+  if (item.status === "done") {
+    return 0;
+  }
+
+  const liveElapsedMs = getUploadItemElapsedMs(item, now);
+  return getUploadEstimatedRemainingMs({
+    bytesUploaded: item.bytesUploaded,
+    elapsedMs: liveElapsedMs,
+    percent: item.percent,
+    speedBytesPerSecond: item.speedBytesPerSecond,
+    status: item.status,
+    totalBytes: item.totalBytes
+  });
+}
+
+function getUploadCurrentSpeed(state) {
+  if (state.status === "paused") {
+    return 0;
+  }
+
+  const activeItem =
+    state.items.find(
+      (item) => item.status === "uploading" || item.status === "processing" || item.status === "paused" || item.status === "canceling"
+    ) ||
+    [...state.items].reverse().find((item) => item.speedBytesPerSecond > 0);
+  return activeItem?.speedBytesPerSecond || 0;
+}
+
+function formatUploadSpeed(value) {
+  return `${formatBytes(value) || "0 B"}/s`;
+}
+
+function getActiveEncodingJob(jobs) {
+  return (
+    jobs.find((job) => job.status === "processing" && job.hardwareEncoding) ||
+    jobs.find((job) => job.status === "processing" && (job.encoder || job.encodingFps || job.encodingSpeed)) ||
+    null
+  );
+}
+
+function formatEncodingSpeed(job) {
+  const parts = [];
+  const fps = Number(job?.encodingFps);
+  const speed = Number(job?.encodingSpeed);
+
+  if (Number.isFinite(fps) && fps > 0) {
+    parts.push(`${fps.toFixed(fps >= 10 ? 0 : 1)} fps`);
+  }
+
+  if (Number.isFinite(speed) && speed > 0) {
+    parts.push(`${speed.toFixed(speed >= 10 ? 1 : 2)}x`);
+  }
+
+  return parts.length ? parts.join(" · ") : job?.hardwareEncoding ? "硬件编码中" : job?.encoder || "-";
+}
+
+function isJobReadyForUpload(job) {
+  return job?.status === "done" && Boolean(job.outputPath);
+}
+
+function isLowFrameRateJob(job) {
+  const frameRate = Number(job?.frameRate);
+  return Number.isFinite(frameRate) && frameRate > 0 && frameRate < 10;
+}
+
+function getJobUploadPath(job) {
+  if (isJobReadyForUpload(job)) {
+    return job.outputPath;
+  }
+
+  return isLowFrameRateJob(job) ? job.path : "";
+}
+
+function isJobUploadable(job) {
+  return Boolean(getJobUploadPath(job));
+}
+
+function shouldAutoUploadJob(job) {
+  return job?.status === "done" && Boolean(job.outputPath) && !job.uploadedAt && !job.autoUploadAttemptedAt;
+}
+
+function shouldAutoBackupJob(job) {
+  return job?.status === "done" && Boolean(job.path) && !job.backedUpAt && !job.autoBackupAttemptedAt && !job.deletedOriginalPath;
+}
+
+function hasPendingAutomationActions(job, options) {
+  return Boolean((options?.autoUpload && shouldAutoUploadJob(job)) || (options?.autoBackup && shouldAutoBackupJob(job)));
+}
+
+function prepareBackupJob(job) {
+  return {
+    ...job,
+    uploadPath: job.path,
+    uploadName: getProcessedStyleFileName(job)
+  };
+}
+
+function getUploadFileName(job) {
+  if (job?.uploadName) {
+    return job.uploadName;
+  }
+
+  const fileName = String(job.uploadPath || getJobUploadPath(job) || "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop();
+  return fileName || job.name || "video.mp4";
+}
+
+function getProcessedStyleFileName(job) {
+  const timestamp = Number(job?.startTimeMs ?? job?.modifiedAtMs);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return getUploadFileName({ ...job, uploadPath: job?.path });
+  }
+
+  return `${formatTimestampFileName(timestamp)}.mp4`;
+}
+
+function formatTimestampFileName(timestamp) {
+  const date = new Date(normalizeTimestamp(timestamp));
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds())
+  ].join("_");
+}
+
+function isSamePath(left, right) {
+  return String(left || "") === String(right || "");
+}
+
+function getCloudFiltersForSpace(spaceId) {
+  if (spaceId === "rawdata") {
+    return CLOUD_FILTERS.filter((filter) => filter.id !== "parsed" && filter.id !== "processing");
+  }
+
+  return CLOUD_FILTERS;
+}
+
+function getRepositoryItemKey(item) {
+  return String(getRawDataId(item) || item.asset_id || item.id || item.media_url || item.file_name || item.name || "repository-item");
+}
+
+function getRepositoryActionMenuPosition(anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const margin = 8;
+  const menuWidth = 96;
+  const menuHeight = 40;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || menuWidth + margin * 2;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || menuHeight + margin * 2;
+  const left = Math.min(viewportWidth - menuWidth - margin, Math.max(margin, rect.right - menuWidth));
+  const belowTop = rect.bottom + 5;
+  const top =
+    belowTop + menuHeight > viewportHeight - margin
+      ? Math.max(margin, rect.top - menuHeight - 5)
+      : belowTop;
+
+  return { left, top };
+}
+
+function getRawDataId(item) {
+  return item?.raw_data_id || item?.rawDataId || item?.archive_id || item?.archiveId || item?.id || "";
+}
+
+function getRawDataStorageStatus(item) {
+  const rawStatus =
+    item?.storage_status ??
+    item?.storageStatus ??
+    item?.save_status ??
+    item?.saveStatus ??
+    item?.persist_status ??
+    item?.persistStatus ??
+    item?.upload_status ??
+    item?.uploadStatus ??
+    item?.archive_status ??
+    item?.archiveStatus ??
+    item?.status ??
+    item?.state;
+  const status = String(rawStatus || "").trim().toUpperCase();
+  return status || (getRawDataId(item) ? "SAVED" : "UNKNOWN");
+}
+
+function formatRawDataStorageStatus(status) {
+  const normalized = String(status || "").toUpperCase();
+  if (["SAVED", "STORED", "COMPLETED", "COMPLETE", "DONE", "READY", "SUCCESS"].includes(normalized)) {
+    return "已保存";
+  }
+  if (["SAVING", "STORING", "UPLOADING", "PENDING", "PROCESSING", "IN_PROGRESS"].includes(normalized)) {
+    return "保存中";
+  }
+  if (["FAILED", "ERROR", "CANCELED", "CANCELLED"].includes(normalized)) {
+    return "保存失败";
+  }
+  return normalized || "未知";
+}
+
+function getRepositoryTitle(item) {
+  return item.file_name || item.name || `Asset ${item.asset_id || item.id || "-"}`;
+}
+
+function getRepositoryType(item) {
+  const type = String(item.asset_type || item.media_type || item.file_type || "").toLowerCase();
+  const name = String(item.file_name || item.name || item.media_url || "").toLowerCase();
+  if (type.includes("audio") || type === "vad") return "audio";
+  if (type.includes("video") || type === "stream" || type === "composed_frames") return "video";
+  if (/\.(mp4|mov|mkv|avi|webm|m4v|wmv)(?:$|\?)/.test(name) || getRawDataId(item)) return "video";
+  return "file";
+}
+
+function isRepositoryParsed(item) {
+  return String(item.parse_status || "").toUpperCase() === "PARSED";
+}
+
+function isRepositoryProcessing(item) {
+  const status = String(item.parse_status || "").toUpperCase();
+  return ["PENDING", "PROCESSING", "PREVIEW_READY"].includes(status);
+}
+
+function getCloudRepositoryStats(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+
+  return safeItems.reduce(
+    (stats, item) => {
+      const type = getRepositoryType(item);
+      const sizeBytes = getRepositorySizeBytes(item);
+      const durationSeconds = getRepositoryDurationSeconds(item);
+
+      return {
+        total: stats.total + 1,
+        video: stats.video + (type === "video" ? 1 : 0),
+        audio: stats.audio + (type === "audio" ? 1 : 0),
+        parsed: stats.parsed + (isRepositoryParsed(item) ? 1 : 0),
+        processing: stats.processing + (isRepositoryProcessing(item) ? 1 : 0),
+        totalBytes: stats.totalBytes + (Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0),
+        totalDurationSeconds: stats.totalDurationSeconds + (Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 0)
+      };
+    },
+    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, totalBytes: 0, totalDurationSeconds: 0 }
+  );
+}
+
+function getCloudFilterCount(stats, filterId) {
+  if (filterId === "video") return stats.video;
+  if (filterId === "audio") return stats.audio;
+  if (filterId === "parsed") return stats.parsed;
+  if (filterId === "processing") return stats.processing;
+  return stats.total;
+}
+
+function filterCloudRepositoryItems(items, filterId, query) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  const safeItems = Array.isArray(items) ? items : [];
+
+  return safeItems.filter((item) => {
+    const type = getRepositoryType(item);
+    const matchesFilter =
+      filterId === "all" ||
+      (filterId === "video" && type === "video") ||
+      (filterId === "audio" && type === "audio") ||
+      (filterId === "parsed" && isRepositoryParsed(item)) ||
+      (filterId === "processing" && isRepositoryProcessing(item));
+
+    if (!matchesFilter) return false;
+    if (!normalizedQuery) return true;
+
+    return [
+      item.file_name,
+      item.name,
+      item.device_id,
+      item.source_kind,
+      item.asset_type,
+      item.media_type,
+      item.parse_status,
+      getRawDataStorageStatus(item),
+      item.summary_text,
+      getRawDataId(item)
+    ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery));
+  });
+}
+
+function getAuthDisplayName(authState) {
+  if (!authState?.token) return "";
+  return authState.displayName || authState.nickname || authState.email || authState.phone || (authState.userId ? `User ${authState.userId}` : "已登录");
+}
+
+function getAuthAccountName(authState) {
+  if (!authState?.token) return "";
+  const emailName = authState.email ? String(authState.email).split("@")[0] : "";
+  return authState.accountName || emailName || authState.phone || authState.userId || getAuthDisplayName(authState);
+}
+
+function getAuthInitial(accountName) {
+  const normalized = String(accountName || "").trim();
+  if (!normalized) return "";
+  const firstWord = normalized.split(/\s+/).find(Boolean) || normalized;
+  return Array.from(firstWord)[0]?.toLocaleUpperCase() || "";
+}
+
+function formatBytes(value, options = {}) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = bytes;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  const precision = Number.isFinite(Number(options.precision)) ? Number(options.precision) : size >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${size.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatRepositoryDuration(value) {
+  if (!Number.isFinite(Number(value)) || Number(value) <= 0) return "";
+  return formatDurationCompact(Number(value) * 1000);
+}
+
+function getRepositorySizeBytes(item) {
+  const value = Number(item?.size_bytes ?? item?.file_size ?? item?.fileSize ?? item?.bytes ?? item?.metadata?.size_bytes);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function getRepositoryDurationSeconds(item) {
+  const content = getRepositoryContentSource(item);
+  const rawValue = [
+    ["seconds", item?.duration_seconds],
+    ["seconds", item?.durationSeconds],
+    ["seconds", item?.duration_s],
+    ["seconds", item?.video_duration_seconds],
+    ["seconds", item?.videoDurationSeconds],
+    ["auto", item?.video_duration],
+    ["auto", item?.videoDuration],
+    ["auto", item?.duration],
+    ["auto", item?.file_duration],
+    ["auto", item?.media_duration],
+    ["milliseconds", item?.duration_ms],
+    ["milliseconds", item?.durationMs],
+    ["milliseconds", item?.video_duration_ms],
+    ["milliseconds", item?.videoDurationMs],
+    ["seconds", item?.metadata?.duration_seconds],
+    ["seconds", item?.metadata?.durationSeconds],
+    ["seconds", item?.metadata?.video_duration_seconds],
+    ["seconds", item?.metadata?.videoDurationSeconds],
+    ["auto", item?.metadata?.video_duration],
+    ["auto", item?.metadata?.videoDuration],
+    ["auto", item?.metadata?.duration],
+    ["milliseconds", item?.metadata?.duration_ms],
+    ["milliseconds", item?.metadata?.durationMs],
+    ["seconds", content?.duration_seconds],
+    ["seconds", content?.durationSeconds],
+    ["seconds", content?.video_duration_seconds],
+    ["seconds", content?.videoDurationSeconds],
+    ["auto", content?.duration],
+    ["auto", content?.video_duration],
+    ["auto", content?.videoDuration],
+    ["milliseconds", content?.duration_ms],
+    ["milliseconds", content?.durationMs],
+    ["seconds", content?.metadata?.duration_seconds],
+    ["auto", content?.metadata?.duration],
+    ["milliseconds", content?.metadata?.duration_ms]
+  ].find(([, candidate]) => Number.isFinite(Number(candidate)) && Number(candidate) > 0);
+
+  if (!rawValue) {
+    return 0;
+  }
+
+  const [unit, rawDuration] = rawValue;
+  const value = Number(rawDuration);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  return unit === "milliseconds" || (unit === "auto" && value > 10000) ? value / 1000 : value;
+}
+
+function getRepositoryUploadTime(item) {
+  return item?.uploaded_at || item?.upload_time || item?.uploadTime || item?.created_at || item?.create_time || item?.timestamp_ms;
+}
+
+function getRepositoryCapturedTime(item) {
+  const fileNameTimestamp = parseRepositoryCapturedTimestampFromName(item);
+  if (fileNameTimestamp) {
+    return fileNameTimestamp;
+  }
+
+  return (
+    item?.captured_at ||
+    item?.capturedAt ||
+    item?.shooting_time ||
+    item?.shootingTime ||
+    item?.shot_at ||
+    item?.shotAt ||
+    item?.recorded_at ||
+    item?.recordedAt ||
+    item?.recording_time ||
+    item?.recordingTime ||
+    item?.start_timestamp_ms ||
+    item?.startTimestampMs ||
+    item?.start_time_ms ||
+    item?.startTimeMs
+  );
+}
+
+function getRepositoryContentSource(item) {
+  if (Array.isArray(item?.content)) {
+    return item.content.find((entry) => entry && typeof entry === "object") || {};
+  }
+
+  return item?.content && typeof item.content === "object" ? item.content : {};
+}
+
+function parseRepositoryCapturedTimestampFromName(item) {
+  const candidates = [
+    item?.file_name,
+    item?.filename,
+    item?.name,
+    item?.media_url,
+    item?.url,
+    item?.path,
+    item?.file_path,
+    item?.source_path,
+    item?.metadata?.file_name,
+    item?.metadata?.name,
+    item?.metadata?.source_path
+  ];
+
+  for (const candidate of candidates) {
+    const timestamp = parseTimestampFromFileName(candidate);
+    if (timestamp) {
+      return timestamp;
+    }
+  }
+
+  return "";
+}
+
+function parseTimestampFromFileName(value) {
+  const name = String(value || "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop();
+  if (!name) return "";
+
+  const dateTimeMatch = name.match(/(20\d{2})[-_.]?([01]\d)[-_.]?([0-3]\d)[^\d]?([0-2]\d)[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)/);
+  if (dateTimeMatch) {
+    return buildLocalTimestamp(dateTimeMatch.slice(1, 7).map(Number));
+  }
+
+  const dateMatch = name.match(/(20\d{2})[-_.]?([01]\d)[-_.]?([0-3]\d)/);
+  if (dateMatch) {
+    return buildLocalTimestamp([...dateMatch.slice(1, 4).map(Number), 0, 0, 0]);
+  }
+
+  return "";
+}
+
+function buildLocalTimestamp([year, month, day, hour, minute, second]) {
+  const date = new Date(year, month - 1, day, hour, minute, second);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute ||
+    date.getSeconds() !== second
+  ) {
+    return "";
+  }
+
+  return date.getTime();
+}
+
+function formatRepositoryDate(value) {
+  if (!value) return "";
+  const timestamp = typeof value === "number" || /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  return formatDateTime(timestamp);
+}
+
+function formatRepositoryStatus(value) {
+  const status = String(value || "UNKNOWN").toUpperCase();
+  const labels = {
+    PARSED: "已解析",
+    PENDING: "等待解析",
+    PROCESSING: "解析中",
+    PREVIEW_READY: "预览就绪",
+    FAILED: "失败",
+    ERROR: "失败",
+    UNKNOWN: "未知"
+  };
+  return labels[status] || status;
 }
 
 function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }) {
@@ -922,7 +3504,7 @@ function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }
   );
 }
 
-function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal }) {
+function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal, onToggleSelection, selected, selectionMode }) {
   const elapsedMs = getElapsedMs(job, now);
   const remainingMs = getEstimatedRemainingMs(job, elapsedMs);
   const durationMs = Math.max(0, Math.round((Number(job.duration) || 0) * 1000));
@@ -930,7 +3512,18 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
   const startTimeMs = normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs);
 
   return (
-    <article className={`queue-item ${job.status}`}>
+    <article className={`queue-item ${job.status}${selectionMode ? " selection-open" : ""}`}>
+      {selectionMode && (
+        <button
+          aria-pressed={selected}
+          className="queue-select-box"
+          onClick={onToggleSelection}
+          title={selected ? "取消选择" : "选择视频"}
+          type="button"
+        >
+          {selected ? <SquareCheck size={17} /> : <Square size={17} />}
+        </button>
+      )}
       <div className="file-icon">
         <Video size={18} />
       </div>
@@ -945,6 +3538,16 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
                 <span className="start-time-label">开始时间</span>
                 <span className="start-time-value">{formatDateTime(startTimeMs)}</span>
               </button>
+              <span className="frame-rate-chip" title="当前帧率">
+                <Gauge size={12} />
+                <span>{job.frameRateLabel || "fps --"}</span>
+              </span>
+              {job.status === "processing" && (job.encoder || job.encodingFps || job.encodingSpeed) && (
+                <span className="encoding-stats-chip" title="实际编码速度">
+                  <Zap size={12} />
+                  <span>{formatEncodingSpeed(job)}</span>
+                </span>
+              )}
             </div>
           </div>
           <span className="status-badge">{STATUS_LABELS[job.status] || job.status}</span>

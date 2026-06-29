@@ -36,14 +36,14 @@ function scoreAsset(asset, platform) {
   if (!asset?.browser_download_url || name.endsWith(".blockmap") || name.endsWith(".yml")) return 0;
 
   if (platform === "darwin") {
-    if (name.includes("dl-editor-mac") && name.endsWith(".dmg")) return 30;
-    if (name.includes("dl-editor-mac") && name.endsWith(".pkg")) return 20;
+    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".dmg")) return 30;
+    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".pkg")) return 20;
     if (name.endsWith(".dmg")) return 10;
     if (name.endsWith(".pkg")) return 5;
   }
 
   if (platform === "win32") {
-    if (name.includes("dl-editor-windows-setup") && name.endsWith(".exe")) return 30;
+    if ((name.includes("dl-studio-windows-setup") || name.includes("dl-editor-windows-setup")) && name.endsWith(".exe")) return 30;
     if (name.includes("windows") && name.endsWith(".exe")) return 20;
     if (name.endsWith(".exe")) return 10;
   }
@@ -77,7 +77,7 @@ function buildUpdateResult({ currentVersion, platform = process.platform, releas
   const base = {
     currentVersion,
     latestVersion,
-    releaseName: release?.name || `DL Editor ${latestVersion}`,
+    releaseName: release?.name || `DL Studio ${latestVersion}`,
     releaseUrl,
     publishedAt: release?.published_at || "",
     assetName: "",
@@ -121,7 +121,7 @@ function requestJson(url) {
       {
         headers: {
           Accept: "application/vnd.github+json",
-          "User-Agent": "DL-Editor-Updater"
+          "User-Agent": "DL-Studio-Updater"
         },
         timeout: 15000
       },

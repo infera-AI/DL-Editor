@@ -1,4 +1,4 @@
-# DL Editor Mac
+# DL Studio Mac
 
 macOS desktop video downsampler built with Electron, React, FFmpeg, FFprobe, and Apple VideoToolbox acceleration.
 
@@ -37,7 +37,7 @@ npm run dist:x64
 - GPU mode prioritizes `h264_videotoolbox`; CPU mode forces `libx264`.
 - Each processing job shows current video time, total video time, estimated remaining time, and elapsed wall time with two-digit subsecond precision.
 - The app shell is locked to the window height; settings and queue panes scroll independently with thin scrollbars.
-- Output files are saved to the selected local output folder, defaulting to the user's Movies directory under `DL Editor Outputs`.
+- Output files are saved to the selected local output folder, defaulting to the user's Movies directory under `DL Studio Outputs`.
 
 ## macOS Notes
 
