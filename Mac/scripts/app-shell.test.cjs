@@ -18,6 +18,13 @@ assert.equal(packageJson.author, "DL Studio");
 assert.equal(packageJson.build.productName, "DL Studio");
 assert.equal(packageLock.name, "dl-studio-mac");
 assert.equal(packageLock.packages[""].name, "dl-studio-mac");
+assert.match(packageJson.devDependencies["@ffprobe-installer/ffprobe"], /^\^2\.1\.2/);
+assert.ok(
+  packageJson.build.extraResources.some(
+    (entry) => entry.from === "node_modules/@ffprobe-installer/darwin-arm64/ffprobe" && entry.to === "bin/ffprobe-arm64"
+  ),
+  "macOS arm64 builds must bundle the real Apple Silicon ffprobe binary"
+);
 assert.match(indexHtml, /<title>DL Studio<\/title>/);
 
 assert.match(main, /const APP_NAME = "DL Studio"/);
@@ -42,6 +49,7 @@ assert.match(main, /function uploadInferaVideo/);
 assert.match(main, /const activeUploadRequests = new Map/);
 assert.match(main, /function normalizeUploadTimestamp/);
 assert.match(main, /function normalizeUploadDuration/);
+assert.match(main, /require\("@ffprobe-installer\/ffprobe"\)\.path/);
 assert.match(main, /Math\.round\(timestamp\)/);
 assert.match(main, /function emitUploadProgress/);
 assert.match(main, /infera:upload-progress/);

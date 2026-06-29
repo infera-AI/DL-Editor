@@ -1,6 +1,6 @@
 {
   "name": "dl-studio-mac",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Desktop batch video downsampler for macOS.",
   "main": "src/main/main.js",
@@ -24,6 +24,7 @@
     "electron": "^34.1.1",
     "electron-builder": "^25.1.8",
     "ffmpeg-static": "^5.2.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
     "ffprobe-static": "^3.1.0",
     "lucide-react": "^0.475.0",
     "react": "^19.0.0",
@@ -52,7 +53,7 @@
         "to": "bin/ffmpeg"
       },
       {
-        "from": "node_modules/ffprobe-static/bin/darwin/arm64/ffprobe",
+        "from": "node_modules/@ffprobe-installer/darwin-arm64/ffprobe",
         "to": "bin/ffprobe-arm64"
       },
       {
@@ -90,5 +91,8 @@
       "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
       "installLocation": "/Applications"
     }
+  },
+  "dependencies": {
+    "@ffprobe-installer/ffprobe": "^2.1.2"
   }
 }

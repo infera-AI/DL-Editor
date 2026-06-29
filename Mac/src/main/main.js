@@ -601,6 +601,10 @@ function getBundledBinary(name) {
     return require("ffmpeg-static");
   }
 
+  if (process.arch === "arm64") {
+    return require("@ffprobe-installer/ffprobe").path;
+  }
+
   return require("ffprobe-static").path;
 }
 

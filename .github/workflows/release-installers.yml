@@ -9,7 +9,7 @@ on:
       tag:
         description: "Release tag to upload installers to"
         required: true
-        default: "v1.0.2"
+        default: "v1.0.3"
 
 permissions:
   contents: write
@@ -52,6 +52,11 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npx electron-builder --mac dmg pkg --arm64 --config.directories.output=release-upload
+      - name: Verify macOS bundled binaries
+        run: |
+          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffmpeg"
+          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffprobe-arm64" | tee /tmp/ffprobe-file.txt
+          grep -q "Mach-O 64-bit executable arm64" /tmp/ffprobe-file.txt
       - name: Upload macOS assets
         env:
           GH_TOKEN: ${{ github.token }}
