@@ -110,6 +110,26 @@ function parseJsonSafely(value) {
   }
 }
 
+function normalizeErrorText(value) {
+  return String(value || "")
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getUploadHttpErrorMessage(statusCode, responseText) {
+  if (statusCode === 413) {
+    return "上传文件超过服务器允许大小（413 Request Entity Too Large）。当前请求被 nginx 拦截，需要服务器调大 client_max_body_size，或提供分片/直传上传接口。";
+  }
+
+  const payload = parseJsonSafely(responseText);
+  const detail = payload?.message || payload?.detail || responseText || `上传失败 (${statusCode})`;
+  const normalizedDetail = typeof detail === "string" ? normalizeErrorText(detail) : JSON.stringify(detail);
+  return normalizedDetail || `上传失败 (${statusCode})`;
+}
+
 function parseRawSseEventBlock(block) {
   let eventName = "message";
   const dataLines = [];
@@ -198,6 +218,11 @@ function normalizeUploadTimestamp(value) {
   return Number.isFinite(timestamp) && timestamp >= 0 ? Math.round(timestamp) : Date.now();
 }
 
+function normalizeUploadDuration(value) {
+  const duration = Number(value);
+  return Number.isFinite(duration) && duration > 0 ? Math.round(duration * 1000) / 1000 : "";
+}
+
 function emitUploadProgress(sender, payload) {
   if (!sender || sender.isDestroyed?.()) {
     return;
@@ -224,7 +249,11 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     const uploadStartedAt = Date.now();
     const uploadRecord = {
       canceled: false,
+      paused: false,
+      pausedAt: null,
+      pausedMs: 0,
       request: null,
+      sendProgress: null,
       stream: null,
       cancel: null
     };
@@ -242,19 +271,21 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     };
 
     const sendProgress = (status, extra = {}) => {
-      const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt) / 1000);
+      const currentPausedMs = uploadRecord.paused && uploadRecord.pausedAt ? Date.now() - uploadRecord.pausedAt : 0;
+      const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt - uploadRecord.pausedMs - currentPausedMs) / 1000);
       emitUploadProgress(sender, {
         bytesUploaded,
         filePath,
         jobId,
         percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
-        speedBytesPerSecond: Math.round(bytesUploaded / elapsedSeconds),
+        speedBytesPerSecond: status === "paused" ? 0 : Math.round(bytesUploaded / elapsedSeconds),
         status,
         totalBytes: stats.size,
         uploadId,
         ...extra
       });
     };
+    uploadRecord.sendProgress = sendProgress;
 
     const request = transport.request(
       target,
@@ -273,9 +304,10 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
         response.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8");
           if (response.statusCode < 200 || response.statusCode >= 300) {
-            const payload = parseJsonSafely(text);
-            const detail = payload?.message || payload?.detail || text || `上传失败 (${response.statusCode})`;
-            settle(reject, new Error(typeof detail === "string" ? detail : JSON.stringify(detail)));
+            const error = new Error(getUploadHttpErrorMessage(response.statusCode, text));
+            settle(reject, error);
+            uploadRecord.stream?.destroy();
+            request.destroy();
             return;
           }
 
@@ -298,6 +330,29 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       sendProgress("canceled", { message: "上传已取消" });
       uploadRecord.stream?.destroy(new Error("上传已取消"));
       request.destroy(new Error("上传已取消"));
+    };
+    uploadRecord.pause = () => {
+      if (uploadRecord.canceled || uploadRecord.paused) {
+        return;
+      }
+
+      uploadRecord.paused = true;
+      uploadRecord.pausedAt = Date.now();
+      uploadRecord.stream?.pause();
+      sendProgress("paused", { message: "上传已暂停", speedBytesPerSecond: 0 });
+    };
+    uploadRecord.resume = () => {
+      if (uploadRecord.canceled || !uploadRecord.paused) {
+        return;
+      }
+
+      uploadRecord.paused = false;
+      if (uploadRecord.pausedAt) {
+        uploadRecord.pausedMs += Date.now() - uploadRecord.pausedAt;
+      }
+      uploadRecord.pausedAt = null;
+      uploadRecord.stream?.resume();
+      sendProgress("uploading", { message: "继续上传" });
     };
 
     if (uploadId) {
@@ -348,11 +403,16 @@ async function uploadInferaVideo(payload = {}, sender) {
   }
 
   const uploadId = String(payload.uploadId || crypto.randomUUID());
+  const fields = {
+    start_timestamp_ms: normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms)
+  };
+  const durationSeconds = normalizeUploadDuration(payload.durationSeconds ?? payload.duration_seconds);
+  if (durationSeconds) {
+    fields.duration_seconds = durationSeconds;
+  }
 
   return uploadMultipart({
-    fields: {
-      start_timestamp_ms: normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms)
-    },
+    fields,
     fileName: payload.fileName || path.basename(filePath),
     filePath,
     jobId: payload.jobId,
@@ -372,6 +432,28 @@ function cancelInferaUpload(uploadId) {
 
   upload.cancel?.();
   return { canceled: true };
+}
+
+function pauseInferaUpload(uploadId) {
+  const id = String(uploadId || "");
+  const upload = activeUploadRequests.get(id);
+  if (!upload) {
+    return { paused: false };
+  }
+
+  upload.pause?.();
+  return { paused: true };
+}
+
+function resumeInferaUpload(uploadId) {
+  const id = String(uploadId || "");
+  const upload = activeUploadRequests.get(id);
+  if (!upload) {
+    return { resumed: false };
+  }
+
+  upload.resume?.();
+  return { resumed: true };
 }
 
 function clampZoomLevel(level) {
@@ -993,6 +1075,7 @@ async function getFileMetadata(filePath) {
     modifiedAt: new Date(modifiedAtMs).toISOString(),
     modifiedAtMs,
     startTimeMs: deriveStartTimeMs({ mediaInfo, modifiedAtMs }),
+    duration: mediaInfo?.duration || 0,
     frameRate,
     frameRateLabel: formatFrameRateLabel(frameRate),
     status: "queued",
@@ -1886,6 +1969,29 @@ ipcMain.handle("updates:check", async () =>
 ipcMain.handle("infera:request", async (_event, payload) => requestInfera(payload));
 ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVideo(payload, event.sender));
 ipcMain.handle("infera:cancel-upload", async (_event, uploadId) => cancelInferaUpload(uploadId));
+ipcMain.handle("infera:pause-upload", async (_event, uploadId) => pauseInferaUpload(uploadId));
+ipcMain.handle("infera:resume-upload", async (_event, uploadId) => resumeInferaUpload(uploadId));
+
+ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
+  const filePath = String(targetPath || "");
+  if (!filePath) {
+    throw new Error("Missing local file path.");
+  }
+
+  let stats;
+  try {
+    stats = await fs.promises.stat(filePath);
+  } catch {
+    return { deleted: false, missing: true, path: filePath };
+  }
+
+  if (!stats.isFile()) {
+    throw new Error("Only local files can be cleared.");
+  }
+
+  await shell.trashItem(filePath);
+  return { deleted: true, path: filePath };
+});
 
 ipcMain.handle("transcode:start-batch", async (_event, payload) => {
   if (queueBusy) {

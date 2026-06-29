@@ -70,7 +70,7 @@ function selectDownloadAsset(release, platform = process.platform) {
 function buildUpdateResult({ currentVersion, platform = process.platform, release }) {
   const latestVersion = getReleaseVersion(release);
   if (!latestVersion) {
-    throw new Error("GitHub release does not include a version.");
+    throw new Error("更新数据缺少版本号。");
   }
 
   const releaseUrl = release?.html_url || `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
@@ -133,7 +133,7 @@ function requestJson(url) {
         });
         response.on("end", () => {
           if (response.statusCode < 200 || response.statusCode >= 300) {
-            const error = new Error(`GitHub returned ${response.statusCode}`);
+            const error = new Error(`更新服务返回 ${response.statusCode}`);
             error.statusCode = response.statusCode;
             reject(error);
             return;
@@ -142,7 +142,7 @@ function requestJson(url) {
           try {
             resolve(JSON.parse(body));
           } catch {
-            reject(new Error("GitHub returned invalid update data."));
+            reject(new Error("更新服务返回了无效数据。"));
           }
         });
       }

@@ -52,9 +52,18 @@ const APP_NAME = "DL Studio";
 const THEME_STORAGE_KEY = "dl-studio-theme";
 const LEGACY_THEME_STORAGE_KEY = "dl-editor-theme";
 const AUTH_STORAGE_KEY = "dl-studio-auth";
+const AUTOMATION_STORAGE_KEY = "dl-studio-editor-automation";
 const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
-const NAV_ITEMS = ["Editor", "Cloud", "Delphi"];
+const RAW_DATA_LIST_PATH = "/memory/raw-data";
+const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine"];
+const ENGINE_PASSWORD = "111111";
+const DEFAULT_AUTOMATION_OPTIONS = {
+  autoUpload: false,
+  autoBackup: false,
+  autoClearLocal: false
+};
 const FPS_PRESETS = [1, 2, 4, 5, 10];
 const RESOLUTION_PRESETS = [
   { label: "1080p", width: 1920, height: 1080 },
@@ -91,7 +100,8 @@ const UPLOAD_STATUS_LABELS = {
   done: "完成",
   error: "失败",
   canceled: "已取消",
-  canceling: "取消中"
+  canceling: "取消中",
+  paused: "已暂停"
 };
 
 const APP_INFO = {
@@ -128,6 +138,9 @@ const dlEditor = window.dlEditor || {
   checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
   uploadInferaVideo: async () => ({}),
   cancelInferaUpload: async () => ({ canceled: false }),
+  pauseInferaUpload: async () => ({ paused: false }),
+  resumeInferaUpload: async () => ({ resumed: false }),
+  deleteLocalFile: async () => ({ deleted: false }),
   openPath: async () => undefined,
   openExternal: async () => undefined,
   revealPath: async () => undefined,
@@ -152,6 +165,15 @@ function readStoredAuth() {
     return stored ? JSON.parse(stored) : null;
   } catch {
     return null;
+  }
+}
+
+function readStoredAutomationOptions() {
+  try {
+    const stored = window.localStorage?.getItem(AUTOMATION_STORAGE_KEY);
+    return { ...DEFAULT_AUTOMATION_OPTIONS, ...(stored ? JSON.parse(stored) : {}) };
+  } catch {
+    return DEFAULT_AUTOMATION_OPTIONS;
   }
 }
 
@@ -233,15 +255,36 @@ async function requestInfera(path, { method = "GET", token, body, signal } = {})
   return unwrapInferaResult(payload);
 }
 
-function normalizeAuthPayload(result) {
+function normalizeAuthPayload(result, fallbackAccountName = "") {
+  const user = result?.user || result?.profile || {};
+
   return {
     token: result?.token || "",
     refreshToken: result?.refreshToken || result?.refresh_token || "",
-    userId: result?.userId || result?.user_id || "",
-    phone: result?.phone || "",
-    email: result?.email || "",
-    nickname: result?.nickname || "",
-    avatar: result?.avatar || "",
+    userId: result?.userId || result?.user_id || user?.userId || user?.user_id || user?.id || "",
+    accountName:
+      result?.accountName ||
+      result?.account_name ||
+      result?.account ||
+      result?.username ||
+      user?.accountName ||
+      user?.account_name ||
+      user?.account ||
+      user?.username ||
+      fallbackAccountName ||
+      "",
+    displayName:
+      result?.displayName ||
+      result?.display_name ||
+      result?.name ||
+      user?.displayName ||
+      user?.display_name ||
+      user?.name ||
+      "",
+    phone: result?.phone || user?.phone || "",
+    email: result?.email || user?.email || "",
+    nickname: result?.nickname || user?.nickname || "",
+    avatar: result?.avatar || user?.avatar || "",
     exist: Boolean(result?.exist),
     password: Boolean(result?.password)
   };
@@ -258,24 +301,42 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
-async function fetchCloudRepository(token) {
-  const result = await requestInfera("/device/files?limit=50&include_page=true", { token });
-  if (Array.isArray(result)) {
-    return {
-      items: result,
-      total: result.length,
-      hasMore: false,
-      nextCursor: null
-    };
-  }
+async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id) {
+  const result = await requestInfera(spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files?limit=50&include_page=true", { token });
+  const items = normalizeCloudItems(result);
 
-  const items = Array.isArray(result?.items) ? result.items : [];
   return {
     items,
     total: Number.isFinite(Number(result?.total)) ? Number(result.total) : items.length,
     hasMore: Boolean(result?.has_more),
     nextCursor: result?.next_cursor || null
   };
+}
+
+function normalizeCloudItems(result) {
+  if (Array.isArray(result)) {
+    return result;
+  }
+
+  const candidates = [result?.items, result?.archives, result?.raw_data, result?.rawData, result?.records, result?.list, result?.data];
+  return candidates.find(Array.isArray) || [];
+}
+
+async function deleteRawDataArchive(token, item) {
+  const rawDataId = getRawDataId(item);
+  if (!rawDataId) {
+    throw new Error("缺少 raw data id，无法删除");
+  }
+
+  return requestInfera(RAW_DATA_LIST_PATH, {
+    method: "DELETE",
+    token,
+    body: {
+      id: rawDataId,
+      raw_data_id: rawDataId,
+      raw_data_ids: [rawDataId]
+    }
+  });
 }
 
 function App() {
@@ -300,14 +361,20 @@ function App() {
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia?.("(prefers-color-scheme: dark)")?.matches ? "dark" : "light";
   });
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [activeNav, setActiveNav] = useState(NAV_ITEMS[0]);
   const [showSplash, setShowSplash] = useState(true);
   const [showLogin, setShowLogin] = useState(false);
+  const [engineUnlocked, setEngineUnlocked] = useState(false);
+  const [enginePassword, setEnginePassword] = useState("");
+  const [engineError, setEngineError] = useState("");
   const [authState, setAuthState] = useState(readStoredAuth);
   const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
+  const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
+  const [automationOptions, setAutomationOptions] = useState(readStoredAutomationOptions);
   const [uploadState, setUploadState] = useState({
     status: "idle",
     visible: false,
@@ -316,9 +383,23 @@ function App() {
     items: [],
     message: ""
   });
+  const [autoUploadNotice, setAutoUploadNotice] = useState({
+    visible: false,
+    message: ""
+  });
   const uploadCancelRequestedRef = useRef(false);
+  const jobsRef = useRef(jobs);
+  const uploadStateRef = useRef(uploadState);
+  const authStateRef = useRef(authState);
+  const automationOptionsRef = useRef(automationOptions);
+  const autoUploadQueueRef = useRef([]);
+  const autoQueuedJobIdsRef = useRef(new Set());
+  const autoUploadRunningRef = useRef(false);
+  const automationDrainTimerRef = useRef(null);
+  const autoLoginPromptedRef = useRef(false);
   const [repositoryState, setRepositoryState] = useState({
     status: "idle",
+    spaceId: cloudSpaceId,
     items: [],
     total: 0,
     hasMore: false,
@@ -336,7 +417,7 @@ function App() {
   const activeEncodingJob = getActiveEncodingJob(jobs);
   const selectedJobs = useMemo(() => jobs.filter((job) => selectedJobIds.has(job.id)), [jobs, selectedJobIds]);
   const allJobsSelected = jobs.length > 0 && selectedJobIds.size === jobs.length;
-  const canBackupSelection = selectedJobs.length > 0 && !isRunning;
+  const canBackupSelection = selectedJobs.length > 0 && !isRunning && !isUploadActive(uploadState);
   const canUploadSelection =
     selectedJobs.length > 0 &&
     selectedJobs.every(isJobUploadable) &&
@@ -374,26 +455,31 @@ function App() {
         );
         setNotice("处理已继续");
       } else if (update.status === "started") {
-        const modeLabel =
+        const modeText =
           update.processingDevice === "cpu"
             ? "CPU"
             : `GPU 极速，视频并发：${update.videoConcurrency || 1}，分段并发：${update.concurrency || 1}`;
-        setNotice(
-          `开始处理 ${update.total} 个视频，模式：${modeLabel}，编码器：${update.encoder}`
-        );
+        setNotice(`开始处理 ${update.total} 个视频，模式：${modeText}，编码器：${update.encoder}`);
       }
     });
 
     const offUsage = dlEditor.onSystemUsageUpdate(setSystemUsage);
+    const offFullscreen = dlEditor.onWindowFullscreenChange(setIsFullscreen);
     const offUpload = dlEditor.onInferaUploadProgress((progress) => {
       setUploadState((current) => applyUploadProgress(current, progress));
     });
+    dlEditor.isWindowFullscreen().then(setIsFullscreen).catch(() => undefined);
 
     return () => {
       offJob();
       offBatch();
       offUsage();
+      offFullscreen();
       offUpload();
+      if (automationDrainTimerRef.current) {
+        window.clearTimeout(automationDrainTimerRef.current);
+        automationDrainTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -408,16 +494,68 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
+    authStateRef.current = authState;
+    if (authState?.token) {
+      autoLoginPromptedRef.current = false;
+      drainAutomationQueue();
+    }
+  }, [authState]);
+
+  useEffect(() => {
+    automationOptionsRef.current = automationOptions;
+    window.localStorage?.setItem(AUTOMATION_STORAGE_KEY, JSON.stringify(automationOptions));
+  }, [automationOptions]);
+
+  useEffect(() => {
+    uploadStateRef.current = uploadState;
+    if (!isUploadActive(uploadState)) {
+      drainAutomationQueue();
+    }
+  }, [uploadState]);
+
+  useEffect(() => {
+    jobsRef.current = jobs;
+
     if (!jobs.length) {
       setSelectionMode(false);
     }
 
+    const knownIds = new Set(jobs.map((job) => job.id));
+    for (const id of autoQueuedJobIdsRef.current) {
+      const job = jobs.find((item) => item.id === id);
+      if (!job || job.status !== "done") {
+        autoQueuedJobIdsRef.current.delete(id);
+      }
+    }
+    autoUploadQueueRef.current = autoUploadQueueRef.current.filter((job) => knownIds.has(job.id));
+
     setSelectedJobIds((current) => {
-      const knownIds = new Set(jobs.map((job) => job.id));
       const next = new Set([...current].filter((id) => knownIds.has(id)));
       return next.size === current.size ? current : next;
     });
   }, [jobs]);
+
+  useEffect(() => {
+    if (!automationOptions.autoUpload && !automationOptions.autoBackup) {
+      return;
+    }
+
+    const readyJobs = jobs.filter((job) => hasPendingAutomationActions(job, automationOptions) && !autoQueuedJobIdsRef.current.has(job.id));
+    if (!readyJobs.length) {
+      return;
+    }
+
+    if (!authState?.token) {
+      if (!autoLoginPromptedRef.current) {
+        autoLoginPromptedRef.current = true;
+        setShowLogin(true);
+        setNotice("自动上传/备份需要先登录");
+      }
+      return;
+    }
+
+    enqueueAutomationJobs(readyJobs);
+  }, [automationOptions.autoUpload, automationOptions.autoBackup, authState?.token, jobs]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setShowSplash(false), 2400);
@@ -432,6 +570,7 @@ function App() {
     if (!authState?.token) {
       setRepositoryState({
         status: "auth",
+        spaceId: cloudSpaceId,
         items: [],
         total: 0,
         hasMore: false,
@@ -441,11 +580,11 @@ function App() {
       return;
     }
 
-    loadCloudRepository(authState);
-  }, [activeNav, authState?.token]);
+    loadCloudRepository(authState, cloudSpaceId);
+  }, [activeNav, authState?.token, cloudSpaceId]);
 
   useEffect(() => {
-    if (!hasProcessingJobs) {
+    if (!hasProcessingJobs && !isUploadActive(uploadState)) {
       return undefined;
     }
 
@@ -454,7 +593,7 @@ function App() {
     }, 80);
 
     return () => window.clearInterval(timer);
-  }, [hasProcessingJobs]);
+  }, [hasProcessingJobs, uploadState.status]);
 
   const selectedResolution = useMemo(() => {
     if (useSourceResolution) {
@@ -544,67 +683,288 @@ function App() {
     });
   }
 
-  function backupSelectedJobs() {
+  async function backupSelectedJobs() {
     if (!canBackupSelection) return;
-    setNotice(`已选择 ${selectedJobs.length} 个视频，备份功能稍后接入`);
+
+    const jobsToBackup = selectedJobs.map(prepareBackupJob);
+
+    try {
+      await uploadJobsToRepository(jobsToBackup, {
+        destination: "DL Rawdata",
+        endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
+        mode: "backup"
+      });
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    }
   }
 
-  async function uploadSelectedJobs() {
-    if (!canUploadSelection) return;
+  function updateAutomationOption(key, value) {
+    setAutomationOptions((current) => ({ ...current, [key]: Boolean(value) }));
+    if (key === "autoBackup" && value) {
+      setNotice("自动备份已开启，处理完成后会备份原视频");
+    }
+  }
 
-    if (!authState?.token) {
-      setShowLogin(true);
-      setNotice("请先登录后上传到 Delphi Repository");
+  function enqueueAutomationJobs(nextJobs) {
+    const freshJobs = nextJobs.filter((job) => {
+      if (!job?.id || autoQueuedJobIdsRef.current.has(job.id)) {
+        return false;
+      }
+
+      autoQueuedJobIdsRef.current.add(job.id);
+      return true;
+    });
+
+    if (!freshJobs.length) {
       return;
     }
 
-    const jobsToUpload = selectedJobs.map((job) => ({ ...job, uploadPath: getJobUploadPath(job) }));
-    const uploadId = `upload-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    autoUploadQueueRef.current.push(...freshJobs);
+    scheduleAutomationDrain();
+  }
+
+  function scheduleAutomationDrain(delay = 0) {
+    if (automationDrainTimerRef.current) {
+      return;
+    }
+
+    automationDrainTimerRef.current = window.setTimeout(() => {
+      automationDrainTimerRef.current = null;
+      drainAutomationQueue();
+    }, delay);
+  }
+
+  function getFreshAutomationJobs(queuedJobs) {
+    const options = automationOptionsRef.current;
+    return queuedJobs
+      .map((queuedJob) => jobsRef.current.find((job) => job.id === queuedJob.id) || queuedJob)
+      .filter((job) => hasPendingAutomationActions(job, options));
+  }
+
+  async function drainAutomationQueue() {
+    if (!autoUploadQueueRef.current.length) {
+      return;
+    }
+
+    if (autoUploadRunningRef.current || isUploadActive(uploadStateRef.current)) {
+      scheduleAutomationDrain(300);
+      return;
+    }
+
+    const auth = authStateRef.current;
+    if (!auth?.token) {
+      if (!autoLoginPromptedRef.current) {
+        autoLoginPromptedRef.current = true;
+        setShowLogin(true);
+        setNotice("自动上传/备份需要先登录");
+      }
+      return;
+    }
+
+    autoUploadRunningRef.current = true;
+    try {
+      while (autoUploadQueueRef.current.length > 0) {
+        if (isUploadActive(uploadStateRef.current)) {
+          break;
+        }
+
+        const queuedJobs = autoUploadQueueRef.current.splice(0, autoUploadQueueRef.current.length);
+        const jobsToProcess = getFreshAutomationJobs(queuedJobs);
+        try {
+          if (jobsToProcess.length > 0) {
+            await runAutomationTransfers(jobsToProcess);
+          }
+        } finally {
+          for (const job of queuedJobs) {
+            autoQueuedJobIdsRef.current.delete(job.id);
+          }
+        }
+      }
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    } finally {
+      autoUploadRunningRef.current = false;
+      if (autoUploadQueueRef.current.length > 0) {
+        scheduleAutomationDrain(isUploadActive(uploadStateRef.current) ? 300 : 0);
+      }
+    }
+  }
+
+  async function runAutomationTransfers(candidateJobs) {
+    const options = automationOptionsRef.current;
+    const uploadJobs = options.autoUpload ? candidateJobs.filter((job) => shouldAutoUploadJob(job)) : [];
+    const backupJobs = options.autoBackup ? candidateJobs.filter((job) => shouldAutoBackupJob(job)).map(prepareBackupJob) : [];
+
+    if (uploadJobs.length > 0) {
+      try {
+        await uploadJobsToRepository(uploadJobs, {
+          autoClearLocal: options.autoClearLocal,
+          clearLocalTarget: "output",
+          destination: "Delphi Repository",
+          endpoint: WEB_VIDEO_UPLOAD_PATH,
+          mode: "auto-upload"
+        });
+      } catch {
+        // Keep the automation worker alive so backup can still run for the same finished jobs.
+      }
+    }
+
+    if (backupJobs.length > 0) {
+      try {
+        await uploadJobsToRepository(backupJobs, {
+          autoClearLocal: options.autoClearLocal,
+          clearLocalTarget: "source",
+          destination: "DL Rawdata",
+          endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
+          mode: "auto-backup"
+        });
+      } catch {
+        // Errors are already reflected in the upload panel and job status.
+      }
+    }
+  }
+
+  async function uploadJobsToRepository(
+    rawJobs,
+    {
+      autoClearLocal = false,
+      clearLocalTarget = "",
+      destination = "Delphi Repository",
+      endpoint = WEB_VIDEO_UPLOAD_PATH,
+      mode = "manual"
+    } = {}
+  ) {
+    const auth = authStateRef.current;
+    const isAutoUpload = mode === "auto" || mode === "auto-upload";
+    const isAutoBackup = mode === "auto-backup";
+    const isAutomatic = isAutoUpload || isAutoBackup;
+    const isBackup = mode === "backup" || isAutoBackup;
+    const actionLabel = isAutoBackup ? "自动备份" : isAutoUpload ? "自动上传" : isBackup ? "备份" : "上传";
+
+    if (!auth?.token) {
+      setShowLogin(true);
+      setNotice(`请先登录后上传到 ${destination}`);
+      throw new Error(`请先登录后上传到 ${destination}`);
+    }
+
+    const jobsToUpload = rawJobs
+      .map((job) => {
+        const uploadPath = job.uploadPath || getJobUploadPath(job);
+        return {
+          ...job,
+          uploadName: getUploadFileName({ ...job, uploadPath }),
+          uploadPath
+        };
+      })
+      .filter((job) => Boolean(job.uploadPath));
+
+    if (!jobsToUpload.length) {
+      setNotice("没有可上传的视频");
+      return { completed: 0 };
+    }
+
+    const uploadKind = isAutoBackup ? "auto-backup" : isAutoUpload ? "auto-upload" : isBackup ? "backup" : "upload";
+    const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     uploadCancelRequestedRef.current = false;
+    if (isAutomatic) {
+      const attemptedAt = new Date().toISOString();
+      setJobs((current) =>
+        current.map((job) =>
+          jobsToUpload.some((item) => item.id === job.id)
+            ? {
+                ...job,
+                ...(isAutoBackup
+                  ? { autoBackupAttemptedAt: attemptedAt, autoBackupStatus: "queued" }
+                  : { autoUploadAttemptedAt: attemptedAt, autoUploadStatus: "queued" }),
+                message: isAutoBackup ? "等待自动备份" : "等待自动上传"
+              }
+            : job
+        )
+      );
+    }
+
     setUploadState({
       status: "uploading",
       visible: true,
       expanded: false,
       uploadId,
+      destination,
+      mode,
       items: createUploadItems(jobsToUpload),
-      message: `准备上传 ${jobsToUpload.length} 个视频`
+      message: `${isAutomatic ? actionLabel : `准备${actionLabel}`} ${jobsToUpload.length} 个视频`
     });
-    setNotice(`正在上传 ${jobsToUpload.length} 个视频到 Delphi Repository`);
+    setNotice(`${isAutomatic ? actionLabel : `正在${actionLabel}`} ${jobsToUpload.length} 个视频到 ${destination}`);
+    if (isAutomatic) {
+      setAutoUploadNotice({
+        visible: true,
+        message: `${actionLabel} ${jobsToUpload.length} 个视频到 ${destination}`
+      });
+    }
 
     let completed = 0;
+    let activeJobId = "";
     try {
       for (const job of jobsToUpload) {
+        activeJobId = job.id;
         if (uploadCancelRequestedRef.current) {
           throw new Error("上传已取消");
         }
 
-        setUploadState((current) => markUploadItem(current, job.id, { message: "正在上传", percent: 0, status: "uploading" }));
-        const result = await dlEditor.uploadInferaVideo({
-          jobId: job.id,
-          path: job.uploadPath,
-          fileName: job.name,
-          startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
-          token: authState.token,
-          uploadId,
-          uploadPath: WEB_VIDEO_UPLOAD_PATH
-        });
-        completed += 1;
         setUploadState((current) =>
           markUploadItem(current, job.id, {
-            bytesUploaded: current.items.find((item) => item.jobId === job.id)?.totalBytes || 0,
-            message: "上传完成",
-            percent: 100,
-            status: "done"
+            elapsedMs: 0,
+            estimatedRemainingMs: null,
+            message: "正在上传",
+            percent: 0,
+            startedAt: Date.now(),
+            status: "uploading"
           })
         );
+        const result = await dlEditor.uploadInferaVideo({
+          durationSeconds: job.duration,
+          jobId: job.id,
+          path: job.uploadPath,
+          fileName: job.uploadName,
+          startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
+          token: auth.token,
+          uploadId,
+          uploadPath: endpoint
+        });
+        const cleared =
+          isAutomatic && autoClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isAutoBackup ? "source" : "output")) : { deleted: false };
+        completed += 1;
+        const uploadedAt = new Date().toISOString();
+        const doneMessage = getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
+        setUploadState((current) => {
+          const now = Date.now();
+          const currentItem = current.items.find((item) => item.jobId === job.id);
+          return markUploadItem(current, job.id, {
+            bytesUploaded: currentItem?.totalBytes || 0,
+            completedAt: now,
+            elapsedMs: getUploadItemElapsedMs(currentItem, now),
+            estimatedRemainingMs: 0,
+            message: doneMessage,
+            percent: 100,
+            status: "done"
+          });
+        });
         setJobs((current) =>
           current.map((item) =>
             item.id === job.id
               ? {
                   ...item,
-                  message: "已上传到 Delphi Repository",
-                  uploadedAt: new Date().toISOString(),
-                  uploadResult: result
+                  ...getTransferSuccessPatch({
+                    clearTarget: clearLocalTarget || (isAutoBackup ? "source" : "output"),
+                    cleared,
+                    isAutoBackup,
+                    isAutoUpload,
+                    isBackup,
+                    result,
+                    timestamp: uploadedAt,
+                    uploadPath: job.uploadPath
+                  }),
+                  message: doneMessage,
                 }
               : item
           )
@@ -615,42 +975,124 @@ function App() {
         ...current,
         status: "ready",
         visible: current.visible,
-        message: `已上传 ${completed} 个视频`
+        message: `${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频`
       }));
-      setNotice(`已上传 ${completed} 个视频到 Delphi Repository`);
+      setNotice(`${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频到 ${destination}`);
+      return { completed };
     } catch (error) {
       const message = error.message || "上传失败";
       const canceled = message.includes("取消");
-      setUploadState((current) => ({
-        ...current,
-        status: canceled ? "canceled" : "error",
-        visible: current.visible,
-        message,
-        items: current.items.map((item) =>
-          item.status === "done"
-            ? item
-            : {
-                ...item,
-                message: item.status === "uploading" || item.status === "processing" ? message : item.message,
-                status: canceled ? "canceled" : item.status === "queued" ? "queued" : "error"
-              }
-        )
-      }));
+      const doneField = isAutoBackup ? "backedUpAt" : "uploadedAt";
+      setUploadState((current) => {
+        const now = Date.now();
+        return {
+          ...current,
+          status: canceled ? "canceled" : "error",
+          visible: current.visible,
+          message,
+          items: current.items.map((item) =>
+            item.status === "done"
+              ? item
+              : {
+                  ...item,
+                  completedAt: item.startedAt ? now : item.completedAt,
+                  elapsedMs: item.startedAt ? getUploadItemElapsedMs(item, now) : item.elapsedMs,
+                  estimatedRemainingMs: null,
+                  message: item.status === "uploading" || item.status === "processing" ? message : item.message,
+                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : "error"
+                }
+          )
+        };
+      });
+      if (isAutomatic) {
+        setJobs((current) =>
+          current.map((job) =>
+            jobsToUpload.some((item) => item.id === job.id) && (!activeJobId || job.id === activeJobId || !job[doneField])
+              ? {
+                  ...job,
+                  ...(isAutoBackup
+                    ? { autoBackupStatus: canceled ? "canceled" : "error" }
+                    : { autoUploadStatus: canceled ? "canceled" : "error" }),
+                  message
+                }
+              : job
+          )
+        );
+      }
       setNotice(message);
+      throw error;
     }
   }
 
-  async function cancelCurrentUpload() {
+  async function clearUploadedLocalFile(job, target) {
+    const isSourceTarget = target === "source";
+    const expectedPath = isSourceTarget ? job.path : job.outputPath;
+    if (!expectedPath || !job.uploadPath || !isSamePath(expectedPath, job.uploadPath)) {
+      return { deleted: false };
+    }
+
+    try {
+      return { ...(await dlEditor.deleteLocalFile(job.uploadPath)), target };
+    } catch (error) {
+      return { deleted: false, error: error.message || "本地文件清除失败", target };
+    }
+  }
+
+  async function uploadSelectedJobs() {
+    if (!canUploadSelection) return;
+
+    try {
+      await uploadJobsToRepository(selectedJobs);
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    }
+  }
+
+  async function toggleCurrentUploadPaused() {
+    if (!isUploadPausable(uploadState) || !uploadState.uploadId) return;
+    const uploadId = uploadState.uploadId;
+    const shouldResume = uploadState.status === "paused";
+    setUploadState((current) => ({
+      ...current,
+      status: shouldResume ? "uploading" : "paused",
+      visible: true,
+      message: shouldResume ? "继续上传" : "上传已暂停",
+      items: current.items.map((item) =>
+        item.status === "uploading" || item.status === "processing" || item.status === "paused"
+          ? {
+              ...item,
+              message: shouldResume ? "继续上传" : "上传已暂停",
+              speedBytesPerSecond: shouldResume ? item.speedBytesPerSecond : 0,
+              status: shouldResume ? "uploading" : "paused"
+            }
+          : item
+      )
+    }));
+
+    try {
+      if (shouldResume) {
+        await dlEditor.resumeInferaUpload(uploadId);
+      } else {
+        await dlEditor.pauseInferaUpload(uploadId);
+      }
+    } catch (error) {
+      setNotice(error.message || (shouldResume ? "继续上传失败" : "暂停上传失败"));
+    }
+  }
+
+  async function cancelCurrentUpload({ hide = false } = {}) {
     if (!isUploadActive(uploadState) || !uploadState.uploadId) return;
     const uploadId = uploadState.uploadId;
     uploadCancelRequestedRef.current = true;
     setUploadState((current) => ({
       ...current,
       status: "canceling",
-      visible: true,
+      visible: !hide,
       message: "正在取消上传",
       items: current.items.map((item) =>
-        item.status === "uploading" || item.status === "processing" ? { ...item, status: "canceling", message: "正在取消" } : item
+        item.status === "uploading" || item.status === "processing" || item.status === "paused"
+          ? { ...item, status: "canceling", message: "正在取消" }
+          : item
       )
     }));
     try {
@@ -660,7 +1102,12 @@ function App() {
     }
   }
 
-  function closeUploadPanel() {
+  async function closeUploadPanel() {
+    if (isUploadActive(uploadState)) {
+      await cancelCurrentUpload({ hide: true });
+      return;
+    }
+
     setUploadState((current) => ({ ...current, visible: false }));
   }
 
@@ -687,7 +1134,23 @@ function App() {
         currentTime: 0,
         elapsedSeconds: 0,
         message: "",
-        outputPath: job.status === "done" ? job.outputPath : ""
+        outputPath: job.status === "done" ? job.outputPath : "",
+        autoClearError: job.status === "done" ? job.autoClearError : undefined,
+        autoClearOriginalError: job.status === "done" ? job.autoClearOriginalError : undefined,
+        autoClearOriginalStatus: job.status === "done" ? job.autoClearOriginalStatus : undefined,
+        autoClearStatus: job.status === "done" ? job.autoClearStatus : undefined,
+        autoClearedAt: job.status === "done" ? job.autoClearedAt : undefined,
+        autoClearedOriginalAt: job.status === "done" ? job.autoClearedOriginalAt : undefined,
+        autoBackupAttemptedAt: job.status === "done" ? job.autoBackupAttemptedAt : undefined,
+        autoBackupStatus: job.status === "done" ? job.autoBackupStatus : undefined,
+        autoUploadAttemptedAt: job.status === "done" ? job.autoUploadAttemptedAt : undefined,
+        autoUploadStatus: job.status === "done" ? job.autoUploadStatus : undefined,
+        backedUpAt: job.status === "done" ? job.backedUpAt : undefined,
+        backupResult: job.status === "done" ? job.backupResult : undefined,
+        deletedOriginalPath: job.status === "done" ? job.deletedOriginalPath : undefined,
+        deletedOutputPath: job.status === "done" ? job.deletedOutputPath : undefined,
+        uploadedAt: job.status === "done" ? job.uploadedAt : undefined,
+        uploadResult: job.status === "done" ? job.uploadResult : undefined
       }))
     );
 
@@ -805,7 +1268,7 @@ function App() {
   }
 
   async function checkForUpdates() {
-    setUpdateState({ status: "checking", message: "正在检查 GitHub 最新版本..." });
+    setUpdateState({ status: "checking", message: "正在检查最新版本..." });
 
     try {
       const result = await dlEditor.checkForUpdates();
@@ -833,6 +1296,19 @@ function App() {
     }
   }
 
+  function changeCloudSpace(nextSpaceId) {
+    setCloudSpaceId(nextSpaceId);
+    setRepositoryState({
+      status: authStateRef.current?.token ? "loading" : "auth",
+      spaceId: nextSpaceId,
+      items: [],
+      total: 0,
+      hasMore: false,
+      nextCursor: null,
+      message: authStateRef.current?.token ? "" : "请先登录后查看 Cloud repository"
+    });
+  }
+
   async function submitLogin() {
     const identifier = loginForm.identifier.trim();
     if (!identifier || !loginForm.password) {
@@ -843,7 +1319,7 @@ function App() {
     setLoginStatus({ status: "checking", message: "正在验证 infera-button-demo 账号..." });
     try {
       const result = await loginToInfera({ identifier, password: loginForm.password });
-      const nextAuth = normalizeAuthPayload(result);
+      const nextAuth = normalizeAuthPayload(result, identifier);
       if (!nextAuth.token) {
         throw new Error("登录响应缺少 token");
       }
@@ -860,7 +1336,7 @@ function App() {
       setShowLogin(false);
 
       if (activeNav === "Cloud") {
-        loadCloudRepository(nextAuth);
+        loadCloudRepository(nextAuth, cloudSpaceId);
       }
     } catch (error) {
       setLoginStatus({
@@ -876,6 +1352,7 @@ function App() {
     setLoginStatus({ status: "idle", message: "" });
     setRepositoryState({
       status: "auth",
+      spaceId: cloudSpaceId,
       items: [],
       total: 0,
       hasMore: false,
@@ -884,11 +1361,12 @@ function App() {
     });
   }
 
-  async function loadCloudRepository(authOverride = authState) {
+  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId) {
     const token = authOverride?.token;
     if (!token) {
       setRepositoryState({
         status: "auth",
+        spaceId: spaceIdOverride,
         items: [],
         total: 0,
         hasMore: false,
@@ -900,35 +1378,91 @@ function App() {
 
     setRepositoryState((current) => ({
       ...current,
+      items: current.spaceId === spaceIdOverride ? current.items : [],
+      spaceId: spaceIdOverride,
       status: "loading",
       message: ""
     }));
 
     try {
-      const repository = await fetchCloudRepository(token);
-      setRepositoryState({
-        status: "ready",
-        items: repository.items,
-        total: repository.total,
-        hasMore: repository.hasMore,
-        nextCursor: repository.nextCursor,
-        message: ""
-      });
+      const repository = await fetchCloudRepository(token, spaceIdOverride);
+      setRepositoryState((current) =>
+        current.spaceId === spaceIdOverride
+          ? {
+              status: "ready",
+              spaceId: spaceIdOverride,
+              items: repository.items,
+              total: repository.total,
+              hasMore: repository.hasMore,
+              nextCursor: repository.nextCursor,
+              message: ""
+            }
+          : current
+      );
+    } catch (error) {
+      setRepositoryState((current) =>
+        current.spaceId === spaceIdOverride
+          ? {
+              ...current,
+              spaceId: spaceIdOverride,
+              status: "error",
+              message: error.message || "无法读取 Cloud repository"
+            }
+          : current
+      );
+    }
+  }
+
+  async function deleteCloudRepositoryItem(item, spaceIdOverride = cloudSpaceId) {
+    if (spaceIdOverride !== "rawdata") {
+      setNotice("Repository 删除稍后接入");
+      return;
+    }
+
+    if (!authState?.token) {
+      setShowLogin(true);
+      setNotice("请先登录后删除 Rawdata");
+      return;
+    }
+
+    const title = getRepositoryTitle(item);
+    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, status: "loading", message: "" }));
+    try {
+      await deleteRawDataArchive(authState.token, item);
+      setNotice(`已删除 ${title}`);
+      await loadCloudRepository(authState, spaceIdOverride);
     } catch (error) {
       setRepositoryState((current) => ({
         ...current,
+        spaceId: spaceIdOverride,
         status: "error",
-        message: error.message || "无法读取 Cloud repository"
+        message: error.message || "删除 Rawdata 失败"
       }));
+      setNotice(error.message || "删除 Rawdata 失败");
     }
+  }
+
+  function unlockEngine() {
+    if (enginePassword === ENGINE_PASSWORD) {
+      setEngineUnlocked(true);
+      setEnginePassword("");
+      setEngineError("");
+      return;
+    }
+
+    setEngineError("密码错误");
   }
 
   return (
     <>
-      <main aria-hidden={showSplash} className={`app-shell platform-${dlEditor.platform || "browser"}`}>
+      <main
+        aria-hidden={showSplash}
+        className={["app-shell", `platform-${dlEditor.platform || "browser"}`, isFullscreen ? "is-fullscreen" : ""].filter(Boolean).join(" ")}
+      >
       <AppChrome
         activeNav={activeNav}
         authState={authState}
+        isFullscreen={isFullscreen}
         onLoginClick={() => setShowLogin(true)}
         onNavChange={setActiveNav}
         onInfoClick={() => setShowAppInfo(true)}
@@ -1079,6 +1613,8 @@ function App() {
 
           <UsageCard activeEncodingJob={activeEncodingJob} device={processingDevice} usage={systemUsage} />
 
+          <AutomationOptions options={automationOptions} onChange={updateAutomationOption} />
+
           <div className="actions">
             <button className="primary-button" disabled={!canStart} onClick={startBatch} type="button">
               <Play size={17} />
@@ -1151,10 +1687,18 @@ function App() {
             </div>
           )}
 
+          {autoUploadNotice.visible && (
+            <AutoUploadNotice
+              message={autoUploadNotice.message}
+              onClose={() => setAutoUploadNotice((current) => ({ ...current, visible: false }))}
+            />
+          )}
+
           {uploadState.visible && (
             <UploadProgressPanel
-              onCancel={cancelCurrentUpload}
+              now={clockNow}
               onClose={closeUploadPanel}
+              onPauseToggle={toggleCurrentUploadPaused}
               onToggleDetails={toggleUploadDetails}
               state={uploadState}
             />
@@ -1189,10 +1733,27 @@ function App() {
       ) : activeNav === "Cloud" ? (
         <CloudRepository
           authState={authState}
+          cloudSpaceId={cloudSpaceId}
+          onDeleteItem={deleteCloudRepositoryItem}
           onLogin={() => setShowLogin(true)}
-          onRefresh={() => loadCloudRepository(authState)}
+          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId)}
+          onSpaceChange={changeCloudSpace}
           repositoryState={repositoryState}
         />
+      ) : activeNav === "Engine" ? (
+        engineUnlocked ? (
+          <PlaceholderPage title="DL Engine" />
+        ) : (
+          <EngineGate
+            error={engineError}
+            onChange={(value) => {
+              setEnginePassword(value);
+              setEngineError("");
+            }}
+            onSubmit={unlockEngine}
+            value={enginePassword}
+          />
+        )
       ) : (
         <PlaceholderPage title={activeNav} />
       )}
@@ -1242,22 +1803,121 @@ function PlaceholderPage({ title }) {
   );
 }
 
-function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
+function EngineGate({ error, onChange, onSubmit, value }) {
+  return (
+    <section className="engine-page">
+      <form
+        className="engine-gate"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <div className="engine-gate-heading">
+          <LockKeyhole size={18} />
+          <div>
+            <strong>DL Engine</strong>
+            <span>Engine</span>
+          </div>
+        </div>
+        <label className="login-field">
+          <span>密码</span>
+          <div className="login-input-wrap">
+            <LockKeyhole size={15} />
+            <input
+              autoComplete="current-password"
+              autoFocus
+              onChange={(event) => onChange(event.target.value)}
+              placeholder="输入密码"
+              type="password"
+              value={value}
+            />
+          </div>
+        </label>
+        {error && <div className="login-status error">{error}</div>}
+        <button className="primary-button" type="submit">
+          进入
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function AutoUploadNotice({ message, onClose }) {
+  return (
+    <div className="auto-upload-notice">
+      <div>
+        <Upload size={16} />
+        <span>{message}</span>
+      </div>
+      <button onClick={onClose} title="关闭卡片" type="button">
+        <X size={15} />
+      </button>
+    </div>
+  );
+}
+
+function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRefresh, onSpaceChange, repositoryState }) {
   const items = repositoryState.items || [];
   const isLoading = repositoryState.status === "loading";
   const [cloudQuery, setCloudQuery] = useState("");
   const [cloudViewMode, setCloudViewMode] = useState("list");
   const [activeCloudFilter, setActiveCloudFilter] = useState("all");
-  const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
   const [isCloudSpaceMenuOpen, setCloudSpaceMenuOpen] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState("");
+  const [repositoryMenuPosition, setRepositoryMenuPosition] = useState(null);
+  const displaySpaceId = repositoryState.spaceId || cloudSpaceId;
+  const isRawDataSpace = displaySpaceId === "rawdata";
+  const visibleFilters = useMemo(() => getCloudFiltersForSpace(displaySpaceId), [displaySpaceId]);
   const stats = useMemo(() => getCloudRepositoryStats(items), [items]);
   const filteredItems = useMemo(
     () => filterCloudRepositoryItems(items, activeCloudFilter, cloudQuery),
     [activeCloudFilter, cloudQuery, items]
   );
-  const activeFilterLabel = CLOUD_FILTERS.find((filter) => filter.id === activeCloudFilter)?.label || CLOUD_FILTERS[0].label;
-  const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === cloudSpaceId) || CLOUD_SPACES[0];
+  const openMenuItem = useMemo(
+    () => filteredItems.find((item) => getRepositoryItemKey(item) === openMenuId) || null,
+    [filteredItems, openMenuId]
+  );
+  const activeFilterLabel = visibleFilters.find((filter) => filter.id === activeCloudFilter)?.label || visibleFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === displaySpaceId) || CLOUD_SPACES[0];
   const storagePercent = Math.min(92, Math.max(4, Math.round((stats.totalBytes / (5 * 1024 * 1024 * 1024)) * 100)));
+
+  function closeRepositoryMenu() {
+    setOpenMenuId("");
+    setRepositoryMenuPosition(null);
+  }
+
+  function toggleRepositoryMenu(item, event) {
+    event.stopPropagation();
+    const itemId = getRepositoryItemKey(item);
+    if (openMenuId === itemId) {
+      closeRepositoryMenu();
+      return;
+    }
+
+    setOpenMenuId(itemId);
+    setRepositoryMenuPosition(getRepositoryActionMenuPosition(event.currentTarget));
+  }
+
+  useEffect(() => {
+    if (!visibleFilters.some((filter) => filter.id === activeCloudFilter)) {
+      setActiveCloudFilter("all");
+    }
+    closeRepositoryMenu();
+  }, [activeCloudFilter, displaySpaceId, visibleFilters]);
+
+  useEffect(() => {
+    if (!openMenuId) {
+      return undefined;
+    }
+
+    window.addEventListener("resize", closeRepositoryMenu);
+    window.addEventListener("scroll", closeRepositoryMenu, true);
+    return () => {
+      window.removeEventListener("resize", closeRepositoryMenu);
+      window.removeEventListener("scroll", closeRepositoryMenu, true);
+    };
+  }, [openMenuId]);
 
   return (
     <section className="cloud-page">
@@ -1283,10 +1943,10 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
                   <div className="cloud-space-menu">
                     {CLOUD_SPACES.map((space) => (
                       <button
-                        className={cloudSpaceId === space.id ? "active" : ""}
+                        className={displaySpaceId === space.id ? "active" : ""}
                         key={space.id}
                         onClick={() => {
-                          setCloudSpaceId(space.id);
+                          onSpaceChange(space.id);
                           setCloudSpaceMenuOpen(false);
                         }}
                         type="button"
@@ -1301,7 +1961,7 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
           </div>
 
           <nav aria-label="Cloud files" className="cloud-nav">
-            {CLOUD_FILTERS.map((filter) => (
+            {visibleFilters.map((filter) => (
               <button
                 className={activeCloudFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
                 key={filter.id}
@@ -1333,7 +1993,7 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
             <div className="cloud-empty">
               <LockKeyhole size={30} />
               <h1>Cloud</h1>
-              <p>登录 infera-button-demo 账号后查看 repository。</p>
+                  <p>登录 infera-button-demo 账号后查看 {isRawDataSpace ? "rawdata" : "repository"}。</p>
               <button className="primary-button" onClick={onLogin} type="button">
                 <UserRound size={16} />
                 <span>登录</span>
@@ -1357,7 +2017,7 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
                     value={cloudQuery}
                   />
                 </label>
-                <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={onRefresh} type="button">
+                <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={() => onRefresh(displaySpaceId)} type="button">
                   <RotateCcw size={16} />
                   <span>{isLoading ? "同步中" : "刷新"}</span>
                 </button>
@@ -1366,7 +2026,11 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
               <div className="cloud-overview">
                 <CloudMetric icon={<FolderOpen size={17} />} label="文件" value={stats.total} />
                 <CloudMetric icon={<Video size={17} />} label="视频" value={stats.video} />
-                <CloudMetric icon={<CheckCircle2 size={17} />} label="已解析" value={stats.parsed} />
+                {isRawDataSpace ? (
+                  <CloudMetric icon={<Timer size={17} />} label="时长" value={formatDurationCompact(Math.round(stats.totalDurationSeconds * 1000)) || "-"} />
+                ) : (
+                  <CloudMetric icon={<CheckCircle2 size={17} />} label="已解析" value={stats.parsed} />
+                )}
                 <CloudMetric icon={<Gauge size={17} />} label="容量" value={formatBytes(stats.totalBytes) || "0 B"} />
               </div>
 
@@ -1409,24 +2073,67 @@ function CloudRepository({ authState, onLogin, onRefresh, repositoryState }) {
                   <div className="cloud-file-grid">
                     <div className="repository-list">
                       {filteredItems.map((item) => (
-                        <RepositoryItem item={item} key={item.asset_id || item.id || item.media_url} />
+                        <RepositoryItem
+                          isRawDataSpace={isRawDataSpace}
+                          item={item}
+                          key={item.asset_id || item.id || item.media_url}
+                          onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
+                        />
                       ))}
                     </div>
                   </div>
                 ) : (
                   <div className="cloud-file-table">
-                    <div className="repository-table-head">
+                    <div className={isRawDataSpace ? "repository-table-head rawdata" : "repository-table-head"}>
                       <span>名称</span>
-                      <span>类型</span>
-                      <span>状态</span>
-                      <span>时间</span>
+                      {isRawDataSpace ? (
+                        <>
+                          <span>状态</span>
+                          <span>上传时间</span>
+                          <span>拍摄时间</span>
+                          <span>视频时长</span>
+                          <span>文件大小</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>类型</span>
+                          <span>状态</span>
+                          <span>时间</span>
+                        </>
+                      )}
                       <span />
                     </div>
                     <div className="repository-list">
                       {filteredItems.map((item) => (
-                        <RepositoryTableRow item={item} key={item.asset_id || item.id || item.media_url} />
+                        <RepositoryTableRow
+                          isRawDataSpace={isRawDataSpace}
+                          item={item}
+                          key={getRepositoryItemKey(item)}
+                          onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
+                        />
                       ))}
                     </div>
+                  </div>
+                )}
+                {openMenuItem && repositoryMenuPosition && (
+                  <div
+                    className="repository-action-menu floating"
+                    style={{
+                      "--menu-left": `${repositoryMenuPosition.left}px`,
+                      "--menu-top": `${repositoryMenuPosition.top}px`
+                    }}
+                  >
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        const item = openMenuItem;
+                        closeRepositoryMenu();
+                        onDeleteItem(item, displaySpaceId);
+                      }}
+                      type="button"
+                    >
+                      删除
+                    </button>
                   </div>
                 )}
               </section>
@@ -1456,13 +2163,13 @@ function CloudMetric({ icon, label, value }) {
   );
 }
 
-function RepositoryItem({ item }) {
-  return <RepositoryGridCard item={item} />;
+function RepositoryItem({ isRawDataSpace, item, onToggleMenu }) {
+  return <RepositoryGridCard isRawDataSpace={isRawDataSpace} item={item} onToggleMenu={onToggleMenu} />;
 }
 
-function RepositoryGridCard({ item }) {
+function RepositoryGridCard({ isRawDataSpace, item, onToggleMenu }) {
   const title = getRepositoryTitle(item);
-  const status = item.parse_status || "UNKNOWN";
+  const status = isRawDataSpace ? getRawDataStorageStatus(item) : item.parse_status || "UNKNOWN";
 
   return (
     <article className="repository-item">
@@ -1473,8 +2180,10 @@ function RepositoryGridCard({ item }) {
           <span>{formatRepositoryDate(item.captured_at || item.timestamp_ms || item.create_time) || "No date"}</span>
         </div>
         <div className="repository-card-foot">
-          <span className={`repository-status ${String(status).toLowerCase()}`}>{formatRepositoryStatus(status)}</span>
-          <button title="更多" type="button">
+          <span className={`repository-status ${isRawDataSpace ? "storage " : ""}${String(status).toLowerCase()}`}>
+            {isRawDataSpace ? formatRawDataStorageStatus(status) : formatRepositoryStatus(status)}
+          </span>
+          <button onClick={onToggleMenu} title="更多" type="button">
             <Ellipsis size={15} />
           </button>
         </div>
@@ -1483,26 +2192,43 @@ function RepositoryGridCard({ item }) {
   );
 }
 
-function RepositoryTableRow({ item }) {
+function RepositoryTableRow({ isRawDataSpace, item, onToggleMenu }) {
   const title = getRepositoryTitle(item);
   const status = item.parse_status || "UNKNOWN";
+  const rawDataStorageStatus = getRawDataStorageStatus(item);
   const type = item.asset_type || item.media_type || item.file_type || "file";
 
   return (
-    <article className="repository-row">
+    <article className={isRawDataSpace ? "repository-row rawdata" : "repository-row"}>
       <div className="repository-name-cell">
         <RepositoryFileIcon item={item} />
         <div>
           <h3 title={title}>{title}</h3>
-          <p>{item.summary_text || item.device_id || item.media_url || "No summary"}</p>
+          {!isRawDataSpace && <p>{item.summary_text || item.device_id || item.media_url || "No summary"}</p>}
         </div>
       </div>
-      <span>{type}</span>
-      <span className={`repository-status ${String(status).toLowerCase()}`}>{formatRepositoryStatus(status)}</span>
-      <span>{formatRepositoryDate(item.captured_at || item.timestamp_ms || item.create_time) || "-"}</span>
-      <button title="更多" type="button">
-        <Ellipsis size={15} />
-      </button>
+      {isRawDataSpace ? (
+        <>
+          <span className={`repository-status storage ${String(rawDataStorageStatus).toLowerCase()}`}>
+            {formatRawDataStorageStatus(rawDataStorageStatus)}
+          </span>
+          <span>{formatRepositoryDate(getRepositoryUploadTime(item)) || "-"}</span>
+          <span>{formatRepositoryDate(getRepositoryCapturedTime(item)) || "-"}</span>
+          <span>{formatRepositoryDuration(getRepositoryDurationSeconds(item)) || "-"}</span>
+          <span>{formatBytes(getRepositorySizeBytes(item)) || "-"}</span>
+        </>
+      ) : (
+        <>
+          <span>{type}</span>
+          <span className={`repository-status ${String(status).toLowerCase()}`}>{formatRepositoryStatus(status)}</span>
+          <span>{formatRepositoryDate(item.captured_at || item.timestamp_ms || item.create_time) || "-"}</span>
+        </>
+      )}
+      <div className="repository-actions">
+        <button onClick={onToggleMenu} title="更多" type="button">
+          <Ellipsis size={15} />
+        </button>
+      </div>
     </article>
   );
 }
@@ -1535,6 +2261,8 @@ function SplashScreen() {
 
 function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout, onSubmit }) {
   const isChecking = loginStatus.status === "checking";
+  const displayName = getAuthDisplayName(authState);
+  const accountName = getAuthAccountName(authState);
 
   return (
     <div
@@ -1551,12 +2279,15 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
           <UserRound size={18} />
           <div>
             <strong>登录</strong>
-            <span>{APP_NAME}</span>
+            <span>{displayName || APP_NAME}</span>
           </div>
         </div>
         {authState?.token && (
           <div className="login-account">
-            <span>{getAuthDisplayName(authState)}</span>
+            <div className="login-account-identity">
+              <strong>{displayName}</strong>
+              {accountName && accountName !== displayName && <span>{accountName}</span>}
+            </div>
             <button onClick={onLogout} type="button">
               退出
             </button>
@@ -1625,6 +2356,7 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
 function AppChrome({
   activeNav,
   authState,
+  isFullscreen,
   onInfoClick,
   onLoginClick,
   onNavChange,
@@ -1633,6 +2365,8 @@ function AppChrome({
 }) {
   const navRef = useRef(null);
   const navLabelRefs = useRef([]);
+  const displayName = getAuthDisplayName(authState);
+  const accountName = getAuthAccountName(authState);
   const [navUnderlineStyle, setNavUnderlineStyle] = useState({
     "--nav-underline-left": "0px",
     "--nav-underline-width": "0px"
@@ -1656,13 +2390,13 @@ function AppChrome({
     updateNavUnderline();
     window.addEventListener("resize", updateNavUnderline);
     return () => window.removeEventListener("resize", updateNavUnderline);
-  }, [activeNav]);
+  }, [activeNav, isFullscreen]);
 
   return (
     <section className="app-chrome">
       <div className="chrome-left">
-        <button className="profile-button" onClick={onLoginClick} title={getAuthDisplayName(authState) || "登录"} type="button">
-          {authState?.avatar ? <img alt="" src={resolveInferaUrl(authState.avatar)} /> : <UserRound size={16} />}
+        <button className="profile-button" onClick={onLoginClick} title={displayName || "登录"} type="button">
+          {authState?.token ? <span className="profile-initial">{getAuthInitial(accountName)}</span> : <UserRound size={16} />}
         </button>
         <nav aria-label="Primary" className="top-nav" ref={navRef}>
           {NAV_ITEMS.map((item, index) => (
@@ -1735,7 +2469,7 @@ function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onCl
           <strong title={outputDirectory}>{outputDirectory || "-"}</strong>
         </div>
         <div className={`update-status ${updateState?.status || "idle"}`}>
-          <span>{updateState?.message || "从 GitHub Releases 检查最新安装包"}</span>
+          <span>{updateState?.message || "检查最新安装包"}</span>
         </div>
         <div className="dialog-actions app-info-actions">
           <button className="ghost-button" disabled={isCheckingUpdate} onClick={onCheckUpdates} type="button">
@@ -1771,7 +2505,7 @@ function getUpdateMessage(result) {
   }
 
   if (result?.status === "no_release") {
-    return "GitHub 还没有发布版本，请先在 Releases 上传安装包";
+    return "当前还没有可用发布版本，请稍后再试";
   }
 
   return "无法读取更新状态";
@@ -1780,6 +2514,10 @@ function getUpdateMessage(result) {
 function DeviceStatus({ capabilities, device, encoder, usage }) {
   const cpuUsage = usage?.cpu?.usage;
   const gpuUsage = usage?.gpu?.total;
+  const gpuUsageText =
+    usage?.gpu?.status === "restricted" && !Number.isFinite(Number(gpuUsage))
+      ? "利用率受 macOS 限制"
+      : `当前使用率 ${percentLabel(gpuUsage)}`;
 
   if (device === "cpu") {
     return (
@@ -1804,7 +2542,7 @@ function DeviceStatus({ capabilities, device, encoder, usage }) {
         <strong>{encoder}</strong>
         <span>
           {encoder !== "libx264" && encoder !== "检测中"
-            ? `${capabilities?.gpuNames?.join(", ") || "GPU 已检测"} · 当前使用率 ${percentLabel(gpuUsage)}`
+            ? `${capabilities?.gpuNames?.join(", ") || "GPU 已检测"} · ${gpuUsageText}`
             : "未发现硬件编码器，任务会自动回退 CPU"}
         </span>
       </div>
@@ -1817,6 +2555,14 @@ function UsageCard({ activeEncodingJob, device, usage }) {
   const data = isCpu ? usage?.cpu : usage?.gpu;
   const total = isCpu ? data?.usage : data?.total;
   const hasActiveHardwareEncoding = !isCpu && activeEncodingJob?.hardwareEncoding;
+  const isGpuRestricted = !isCpu && data?.status === "restricted";
+  const statusLabel = Number.isFinite(Number(data?.total))
+    ? "可读取"
+    : data?.status === "sampling"
+      ? "采样中"
+      : data?.status === "restricted"
+        ? "macOS 受限"
+        : "不可用";
 
   return (
     <div className="usage-card">
@@ -1824,7 +2570,15 @@ function UsageCard({ activeEncodingJob, device, usage }) {
         <Activity size={18} />
         <div>
           <strong>{isCpu ? "CPU 使用情况" : "GPU 使用情况"}</strong>
-          <span>{isCpu ? "系统总负载" : hasActiveHardwareEncoding ? "硬件编码中" : "总利用率与编码引擎"}</span>
+          <span>
+            {isCpu
+              ? "系统总负载"
+              : hasActiveHardwareEncoding
+                ? "VideoToolbox 硬件编码中"
+                : isGpuRestricted
+                  ? "硬件编码运行状态"
+                  : "总利用率与编码引擎"}
+          </span>
         </div>
         <b>{hasActiveHardwareEncoding ? "编码中" : percentLabel(total)}</b>
       </div>
@@ -1847,7 +2601,7 @@ function UsageCard({ activeEncodingJob, device, usage }) {
           <span>{hasActiveHardwareEncoding ? "编码器" : "Compute"}</span>
           <strong>{hasActiveHardwareEncoding ? activeEncodingJob.encoder : percentLabel(data?.compute)}</strong>
           <span>状态</span>
-          <strong>{hasActiveHardwareEncoding ? "硬件编码" : Number.isFinite(Number(data?.total)) ? "可读取" : data?.status === "sampling" ? "采样中" : "不可用"}</strong>
+          <strong>{hasActiveHardwareEncoding ? "硬件编码" : statusLabel}</strong>
         </div>
       )}
     </div>
@@ -1864,12 +2618,48 @@ function Metric({ icon, label, value }) {
   );
 }
 
-function UploadProgressPanel({ onCancel, onClose, onToggleDetails, state }) {
+function AutomationOptions({ onChange, options }) {
+  const rows = [
+    { icon: <Upload size={15} />, id: "autoUpload", label: "自动上传", title: "处理完成后上传降帧视频" },
+    { icon: <Archive size={15} />, id: "autoBackup", label: "自动备份", title: "处理完成后备份原视频" },
+    { icon: <HardDrive size={15} />, id: "autoClearLocal", label: "自动清除本地文件", title: "上传后清除降帧文件，备份后清除原视频" }
+  ];
+
+  return (
+    <div className="automation-options">
+      {rows.map((row) => (
+        <label className="automation-option" key={row.id} title={row.title}>
+          <input
+            checked={Boolean(options[row.id])}
+            onChange={(event) => onChange(row.id, event.target.checked)}
+            type="checkbox"
+          />
+          <span className="automation-check" />
+          {row.icon}
+          <span>{row.label}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function UploadProgressPanel({ now, onClose, onPauseToggle, onToggleDetails, state }) {
   const total = state.items.length;
   const completed = state.items.filter((item) => item.status === "done").length;
   const active = isUploadActive(state);
+  const paused = state.status === "paused";
+  const canPause = isUploadPausable(state);
   const overallPercent = getUploadOverallPercent(state);
   const statusLabel = UPLOAD_STATUS_LABELS[state.status] || (state.status === "ready" ? "完成" : "上传");
+  const destination = state.destination || "Delphi Repository";
+  const title =
+    state.mode === "auto-backup"
+      ? `自动备份到 ${destination}`
+      : state.mode === "auto" || state.mode === "auto-upload"
+        ? `自动上传到 ${destination}`
+        : state.mode === "backup"
+          ? `${destination} 备份`
+          : `${destination} 上传`;
 
   return (
     <section className={`upload-panel ${state.status}`}>
@@ -1879,7 +2669,7 @@ function UploadProgressPanel({ onCancel, onClose, onToggleDetails, state }) {
         </div>
         <div className="upload-panel-body">
           <div className="upload-title-row">
-            <strong>Delphi Repository 上传</strong>
+            <strong>{title}</strong>
             <span>
               {completed}/{total || 0} · {Math.round(overallPercent)}% · {formatUploadSpeed(getUploadCurrentSpeed(state))}
             </span>
@@ -1890,10 +2680,10 @@ function UploadProgressPanel({ onCancel, onClose, onToggleDetails, state }) {
           <p>{state.message || statusLabel}</p>
         </div>
         <div className="upload-actions">
-          <button disabled={!active} onClick={onCancel} title="取消上传" type="button">
-            <CircleStop size={15} />
+          <button disabled={!canPause} onClick={onPauseToggle} title={paused ? "继续上传" : "暂停上传"} type="button">
+            {paused ? <Play size={15} /> : <Pause size={15} />}
           </button>
-          <button onClick={onClose} title="关闭卡片" type="button">
+          <button onClick={onClose} title={active ? "关闭并取消上传" : "关闭卡片"} type="button">
             <X size={15} />
           </button>
           <button
@@ -1924,6 +2714,14 @@ function UploadProgressPanel({ onCancel, onClose, onToggleDetails, state }) {
                   {formatUploadBytes(item)} · {formatUploadSpeed(item.speedBytesPerSecond)}
                 </span>
               </div>
+              <div className="upload-detail-time">
+                <span>
+                  耗时 <DurationValue value={getUploadItemElapsedMs(item, now)} />
+                </span>
+                <span>
+                  预计剩余 <DurationValue value={getUploadItemRemainingMs(item, now)} />
+                </span>
+              </div>
             </div>
           ))}
         </div>
@@ -1946,8 +2744,75 @@ function createUploadItems(jobs) {
   }));
 }
 
+function getUploadDoneMessage(clearResult, operation = "upload") {
+  if (clearResult?.deleted) {
+    return clearResult.target === "source" ? "备份完成，本地原视频已清除" : "上传完成，本地降帧文件已清除";
+  }
+
+  if (clearResult?.error) {
+    return `${operation === "backup" ? "备份" : "上传"}完成，本地文件清除失败：${clearResult.error}`;
+  }
+
+  return operation === "backup" ? "备份完成" : "上传完成";
+}
+
+function getTransferSuccessPatch({ clearTarget, cleared, isAutoBackup, isAutoUpload, isBackup, result, timestamp, uploadPath }) {
+  const patch = isBackup
+    ? {
+        backedUpAt: timestamp,
+        backupResult: result
+      }
+    : {
+        uploadedAt: timestamp,
+        uploadResult: result
+      };
+
+  if (isAutoUpload) {
+    patch.autoUploadStatus = "done";
+  }
+  if (isAutoBackup) {
+    patch.autoBackupStatus = "done";
+  }
+
+  if (cleared?.error) {
+    if (clearTarget === "source") {
+      patch.autoClearOriginalError = cleared.error;
+      patch.autoClearOriginalStatus = "error";
+    } else {
+      patch.autoClearError = cleared.error;
+      patch.autoClearStatus = "error";
+    }
+    return patch;
+  }
+
+  if (!cleared?.deleted) {
+    return patch;
+  }
+
+  if (clearTarget === "source") {
+    return {
+      ...patch,
+      autoClearOriginalStatus: "done",
+      autoClearedOriginalAt: timestamp,
+      deletedOriginalPath: uploadPath
+    };
+  }
+
+  return {
+    ...patch,
+    autoClearStatus: "done",
+    autoClearedAt: timestamp,
+    deletedOutputPath: uploadPath,
+    outputPath: ""
+  };
+}
+
 function isUploadActive(state) {
-  return state?.status === "uploading" || state?.status === "canceling";
+  return state?.status === "uploading" || state?.status === "paused" || state?.status === "canceling";
+}
+
+function isUploadPausable(state) {
+  return state?.status === "uploading" || state?.status === "paused";
 }
 
 function markUploadItem(state, jobId, patch) {
@@ -1964,30 +2829,59 @@ function applyUploadProgress(state, progress) {
 
   const status = progress.status || "uploading";
   const message = progress.message || (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
+  const now = Date.now();
   const nextItems = state.items.map((item) => {
     const matches = progress.jobId ? item.jobId === progress.jobId : item.path === progress.filePath;
     if (!matches) {
       return item;
     }
 
+    const startedAt = item.startedAt || now;
+    const bytesUploaded = Number(progress.bytesUploaded) || item.bytesUploaded;
+    const totalBytes = Number(progress.totalBytes) || item.totalBytes;
+    const speedBytesPerSecond = Number(progress.speedBytesPerSecond) || 0;
+    const elapsedMs = status === "paused" ? getUploadItemElapsedMs(item, now) : Math.max(getUploadItemElapsedMs(item, now), now - startedAt);
+
     return {
       ...item,
-      bytesUploaded: Number(progress.bytesUploaded) || item.bytesUploaded,
+      bytesUploaded,
+      elapsedMs,
+      estimatedRemainingMs: getUploadEstimatedRemainingMs({
+        bytesUploaded,
+        elapsedMs,
+        percent: progress.percent,
+        speedBytesPerSecond,
+        status,
+        totalBytes
+      }),
       message,
       percent: clampPercent(progress.percent),
-      speedBytesPerSecond: Number(progress.speedBytesPerSecond) || 0,
+      speedBytesPerSecond,
+      startedAt,
       status,
-      totalBytes: Number(progress.totalBytes) || item.totalBytes
+      totalBytes
     };
   });
 
   return {
     ...state,
     message,
-    status: status === "canceled" ? "canceling" : state.status,
+    status: getNextUploadPanelStatus(state.status, status),
     visible: state.visible,
     items: nextItems
   };
+}
+
+function getNextUploadPanelStatus(currentStatus, progressStatus) {
+  if (progressStatus === "canceled") {
+    return "canceling";
+  }
+
+  if (progressStatus === "paused" || progressStatus === "uploading") {
+    return progressStatus;
+  }
+
+  return currentStatus;
 }
 
 function getUploadOverallPercent(state) {
@@ -2000,14 +2894,85 @@ function getUploadOverallPercent(state) {
 }
 
 function formatUploadBytes(item) {
-  const uploaded = formatBytes(item.bytesUploaded) || "0 B";
-  const total = formatBytes(item.totalBytes);
+  const uploaded = formatBytes(item.bytesUploaded, { precision: 2 }) || "0.00 B";
+  const total = formatBytes(item.totalBytes, { precision: 2 });
   return total ? `${uploaded} / ${total}` : uploaded;
 }
 
+function getUploadItemElapsedMs(item, now = Date.now()) {
+  if (!item) {
+    return 0;
+  }
+
+  if (item.status === "queued" || !Number.isFinite(Number(item.startedAt))) {
+    return Number(item.elapsedMs) || 0;
+  }
+
+  if (item.status === "done" || item.status === "error" || item.status === "canceled") {
+    return Number(item.elapsedMs) || Math.max(0, Number(item.completedAt || now) - Number(item.startedAt));
+  }
+
+  if (item.status === "paused") {
+    return Number(item.elapsedMs) || Math.max(0, now - Number(item.startedAt));
+  }
+
+  return Math.max(Number(item.elapsedMs) || 0, now - Number(item.startedAt));
+}
+
+function getUploadEstimatedRemainingMs({ bytesUploaded, elapsedMs, percent, speedBytesPerSecond, status, totalBytes }) {
+  if (status === "done") {
+    return 0;
+  }
+
+  const uploaded = Number(bytesUploaded);
+  const total = Number(totalBytes);
+  const speed = Number(speedBytesPerSecond);
+
+  if (Number.isFinite(uploaded) && Number.isFinite(total) && total > uploaded && speed > 0) {
+    return Math.max(0, Math.round(((total - uploaded) / speed) * 1000));
+  }
+
+  if (status === "processing" && Number.isFinite(uploaded) && Number.isFinite(total) && total > 0 && uploaded >= total) {
+    return null;
+  }
+
+  const progress = Number(percent);
+  if (Number.isFinite(progress) && progress > 0 && progress < 100 && Number.isFinite(Number(elapsedMs))) {
+    return Math.max(0, Math.round(Number(elapsedMs) * ((100 - progress) / progress)));
+  }
+
+  return null;
+}
+
+function getUploadItemRemainingMs(item, now = Date.now()) {
+  if (!item) {
+    return null;
+  }
+
+  if (item.status === "done") {
+    return 0;
+  }
+
+  const liveElapsedMs = getUploadItemElapsedMs(item, now);
+  return getUploadEstimatedRemainingMs({
+    bytesUploaded: item.bytesUploaded,
+    elapsedMs: liveElapsedMs,
+    percent: item.percent,
+    speedBytesPerSecond: item.speedBytesPerSecond,
+    status: item.status,
+    totalBytes: item.totalBytes
+  });
+}
+
 function getUploadCurrentSpeed(state) {
+  if (state.status === "paused") {
+    return 0;
+  }
+
   const activeItem =
-    state.items.find((item) => item.status === "uploading" || item.status === "processing" || item.status === "canceling") ||
+    state.items.find(
+      (item) => item.status === "uploading" || item.status === "processing" || item.status === "paused" || item.status === "canceling"
+    ) ||
     [...state.items].reverse().find((item) => item.speedBytesPerSecond > 0);
   return activeItem?.speedBytesPerSecond || 0;
 }
@@ -2061,14 +3026,138 @@ function isJobUploadable(job) {
   return Boolean(getJobUploadPath(job));
 }
 
+function shouldAutoUploadJob(job) {
+  return job?.status === "done" && Boolean(job.outputPath) && !job.uploadedAt && !job.autoUploadAttemptedAt;
+}
+
+function shouldAutoBackupJob(job) {
+  return job?.status === "done" && Boolean(job.path) && !job.backedUpAt && !job.autoBackupAttemptedAt && !job.deletedOriginalPath;
+}
+
+function hasPendingAutomationActions(job, options) {
+  return Boolean((options?.autoUpload && shouldAutoUploadJob(job)) || (options?.autoBackup && shouldAutoBackupJob(job)));
+}
+
+function prepareBackupJob(job) {
+  return {
+    ...job,
+    uploadPath: job.path,
+    uploadName: getProcessedStyleFileName(job)
+  };
+}
+
+function getUploadFileName(job) {
+  if (job?.uploadName) {
+    return job.uploadName;
+  }
+
+  const fileName = String(job.uploadPath || getJobUploadPath(job) || "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop();
+  return fileName || job.name || "video.mp4";
+}
+
+function getProcessedStyleFileName(job) {
+  const timestamp = Number(job?.startTimeMs ?? job?.modifiedAtMs);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return getUploadFileName({ ...job, uploadPath: job?.path });
+  }
+
+  return `${formatTimestampFileName(timestamp)}.mp4`;
+}
+
+function formatTimestampFileName(timestamp) {
+  const date = new Date(normalizeTimestamp(timestamp));
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds())
+  ].join("_");
+}
+
+function isSamePath(left, right) {
+  return String(left || "") === String(right || "");
+}
+
+function getCloudFiltersForSpace(spaceId) {
+  if (spaceId === "rawdata") {
+    return CLOUD_FILTERS.filter((filter) => filter.id !== "parsed" && filter.id !== "processing");
+  }
+
+  return CLOUD_FILTERS;
+}
+
+function getRepositoryItemKey(item) {
+  return String(getRawDataId(item) || item.asset_id || item.id || item.media_url || item.file_name || item.name || "repository-item");
+}
+
+function getRepositoryActionMenuPosition(anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const margin = 8;
+  const menuWidth = 96;
+  const menuHeight = 40;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || menuWidth + margin * 2;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || menuHeight + margin * 2;
+  const left = Math.min(viewportWidth - menuWidth - margin, Math.max(margin, rect.right - menuWidth));
+  const belowTop = rect.bottom + 5;
+  const top =
+    belowTop + menuHeight > viewportHeight - margin
+      ? Math.max(margin, rect.top - menuHeight - 5)
+      : belowTop;
+
+  return { left, top };
+}
+
+function getRawDataId(item) {
+  return item?.raw_data_id || item?.rawDataId || item?.archive_id || item?.archiveId || item?.id || "";
+}
+
+function getRawDataStorageStatus(item) {
+  const rawStatus =
+    item?.storage_status ??
+    item?.storageStatus ??
+    item?.save_status ??
+    item?.saveStatus ??
+    item?.persist_status ??
+    item?.persistStatus ??
+    item?.upload_status ??
+    item?.uploadStatus ??
+    item?.archive_status ??
+    item?.archiveStatus ??
+    item?.status ??
+    item?.state;
+  const status = String(rawStatus || "").trim().toUpperCase();
+  return status || (getRawDataId(item) ? "SAVED" : "UNKNOWN");
+}
+
+function formatRawDataStorageStatus(status) {
+  const normalized = String(status || "").toUpperCase();
+  if (["SAVED", "STORED", "COMPLETED", "COMPLETE", "DONE", "READY", "SUCCESS"].includes(normalized)) {
+    return "已保存";
+  }
+  if (["SAVING", "STORING", "UPLOADING", "PENDING", "PROCESSING", "IN_PROGRESS"].includes(normalized)) {
+    return "保存中";
+  }
+  if (["FAILED", "ERROR", "CANCELED", "CANCELLED"].includes(normalized)) {
+    return "保存失败";
+  }
+  return normalized || "未知";
+}
+
 function getRepositoryTitle(item) {
   return item.file_name || item.name || `Asset ${item.asset_id || item.id || "-"}`;
 }
 
 function getRepositoryType(item) {
   const type = String(item.asset_type || item.media_type || item.file_type || "").toLowerCase();
+  const name = String(item.file_name || item.name || item.media_url || "").toLowerCase();
   if (type.includes("audio") || type === "vad") return "audio";
   if (type.includes("video") || type === "stream" || type === "composed_frames") return "video";
+  if (/\.(mp4|mov|mkv|avi|webm|m4v|wmv)(?:$|\?)/.test(name) || getRawDataId(item)) return "video";
   return "file";
 }
 
@@ -2087,7 +3176,8 @@ function getCloudRepositoryStats(items) {
   return safeItems.reduce(
     (stats, item) => {
       const type = getRepositoryType(item);
-      const sizeBytes = Number(item.size_bytes || item.file_size || item.bytes);
+      const sizeBytes = getRepositorySizeBytes(item);
+      const durationSeconds = getRepositoryDurationSeconds(item);
 
       return {
         total: stats.total + 1,
@@ -2095,10 +3185,11 @@ function getCloudRepositoryStats(items) {
         audio: stats.audio + (type === "audio" ? 1 : 0),
         parsed: stats.parsed + (isRepositoryParsed(item) ? 1 : 0),
         processing: stats.processing + (isRepositoryProcessing(item) ? 1 : 0),
-        totalBytes: stats.totalBytes + (Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0)
+        totalBytes: stats.totalBytes + (Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0),
+        totalDurationSeconds: stats.totalDurationSeconds + (Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 0)
       };
     },
-    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, totalBytes: 0 }
+    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, totalBytes: 0, totalDurationSeconds: 0 }
   );
 }
 
@@ -2134,17 +3225,32 @@ function filterCloudRepositoryItems(items, filterId, query) {
       item.asset_type,
       item.media_type,
       item.parse_status,
-      item.summary_text
+      getRawDataStorageStatus(item),
+      item.summary_text,
+      getRawDataId(item)
     ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery));
   });
 }
 
 function getAuthDisplayName(authState) {
   if (!authState?.token) return "";
-  return authState.nickname || authState.email || authState.phone || (authState.userId ? `User ${authState.userId}` : "已登录");
+  return authState.displayName || authState.nickname || authState.email || authState.phone || (authState.userId ? `User ${authState.userId}` : "已登录");
 }
 
-function formatBytes(value) {
+function getAuthAccountName(authState) {
+  if (!authState?.token) return "";
+  const emailName = authState.email ? String(authState.email).split("@")[0] : "";
+  return authState.accountName || emailName || authState.phone || authState.userId || getAuthDisplayName(authState);
+}
+
+function getAuthInitial(accountName) {
+  const normalized = String(accountName || "").trim();
+  if (!normalized) return "";
+  const firstWord = normalized.split(/\s+/).find(Boolean) || normalized;
+  return Array.from(firstWord)[0]?.toLocaleUpperCase() || "";
+}
+
+function formatBytes(value, options = {}) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes <= 0) return "";
   const units = ["B", "KB", "MB", "GB"];
@@ -2156,13 +3262,168 @@ function formatBytes(value) {
     unitIndex += 1;
   }
 
-  const precision = size >= 10 || unitIndex === 0 ? 0 : 1;
+  const precision = Number.isFinite(Number(options.precision)) ? Number(options.precision) : size >= 10 || unitIndex === 0 ? 0 : 1;
   return `${size.toFixed(precision)} ${units[unitIndex]}`;
 }
 
 function formatRepositoryDuration(value) {
   if (!Number.isFinite(Number(value)) || Number(value) <= 0) return "";
-  return formatDurationCompact(Number(value));
+  return formatDurationCompact(Number(value) * 1000);
+}
+
+function getRepositorySizeBytes(item) {
+  const value = Number(item?.size_bytes ?? item?.file_size ?? item?.fileSize ?? item?.bytes ?? item?.metadata?.size_bytes);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function getRepositoryDurationSeconds(item) {
+  const content = getRepositoryContentSource(item);
+  const rawValue = [
+    ["seconds", item?.duration_seconds],
+    ["seconds", item?.durationSeconds],
+    ["seconds", item?.duration_s],
+    ["seconds", item?.video_duration_seconds],
+    ["seconds", item?.videoDurationSeconds],
+    ["auto", item?.video_duration],
+    ["auto", item?.videoDuration],
+    ["auto", item?.duration],
+    ["auto", item?.file_duration],
+    ["auto", item?.media_duration],
+    ["milliseconds", item?.duration_ms],
+    ["milliseconds", item?.durationMs],
+    ["milliseconds", item?.video_duration_ms],
+    ["milliseconds", item?.videoDurationMs],
+    ["seconds", item?.metadata?.duration_seconds],
+    ["seconds", item?.metadata?.durationSeconds],
+    ["seconds", item?.metadata?.video_duration_seconds],
+    ["seconds", item?.metadata?.videoDurationSeconds],
+    ["auto", item?.metadata?.video_duration],
+    ["auto", item?.metadata?.videoDuration],
+    ["auto", item?.metadata?.duration],
+    ["milliseconds", item?.metadata?.duration_ms],
+    ["milliseconds", item?.metadata?.durationMs],
+    ["seconds", content?.duration_seconds],
+    ["seconds", content?.durationSeconds],
+    ["seconds", content?.video_duration_seconds],
+    ["seconds", content?.videoDurationSeconds],
+    ["auto", content?.duration],
+    ["auto", content?.video_duration],
+    ["auto", content?.videoDuration],
+    ["milliseconds", content?.duration_ms],
+    ["milliseconds", content?.durationMs],
+    ["seconds", content?.metadata?.duration_seconds],
+    ["auto", content?.metadata?.duration],
+    ["milliseconds", content?.metadata?.duration_ms]
+  ].find(([, candidate]) => Number.isFinite(Number(candidate)) && Number(candidate) > 0);
+
+  if (!rawValue) {
+    return 0;
+  }
+
+  const [unit, rawDuration] = rawValue;
+  const value = Number(rawDuration);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  return unit === "milliseconds" || (unit === "auto" && value > 10000) ? value / 1000 : value;
+}
+
+function getRepositoryUploadTime(item) {
+  return item?.uploaded_at || item?.upload_time || item?.uploadTime || item?.created_at || item?.create_time || item?.timestamp_ms;
+}
+
+function getRepositoryCapturedTime(item) {
+  const fileNameTimestamp = parseRepositoryCapturedTimestampFromName(item);
+  if (fileNameTimestamp) {
+    return fileNameTimestamp;
+  }
+
+  return (
+    item?.captured_at ||
+    item?.capturedAt ||
+    item?.shooting_time ||
+    item?.shootingTime ||
+    item?.shot_at ||
+    item?.shotAt ||
+    item?.recorded_at ||
+    item?.recordedAt ||
+    item?.recording_time ||
+    item?.recordingTime ||
+    item?.start_timestamp_ms ||
+    item?.startTimestampMs ||
+    item?.start_time_ms ||
+    item?.startTimeMs
+  );
+}
+
+function getRepositoryContentSource(item) {
+  if (Array.isArray(item?.content)) {
+    return item.content.find((entry) => entry && typeof entry === "object") || {};
+  }
+
+  return item?.content && typeof item.content === "object" ? item.content : {};
+}
+
+function parseRepositoryCapturedTimestampFromName(item) {
+  const candidates = [
+    item?.file_name,
+    item?.filename,
+    item?.name,
+    item?.media_url,
+    item?.url,
+    item?.path,
+    item?.file_path,
+    item?.source_path,
+    item?.metadata?.file_name,
+    item?.metadata?.name,
+    item?.metadata?.source_path
+  ];
+
+  for (const candidate of candidates) {
+    const timestamp = parseTimestampFromFileName(candidate);
+    if (timestamp) {
+      return timestamp;
+    }
+  }
+
+  return "";
+}
+
+function parseTimestampFromFileName(value) {
+  const name = String(value || "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop();
+  if (!name) return "";
+
+  const dateTimeMatch = name.match(/(20\d{2})[-_.]?([01]\d)[-_.]?([0-3]\d)[^\d]?([0-2]\d)[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)/);
+  if (dateTimeMatch) {
+    return buildLocalTimestamp(dateTimeMatch.slice(1, 7).map(Number));
+  }
+
+  const dateMatch = name.match(/(20\d{2})[-_.]?([01]\d)[-_.]?([0-3]\d)/);
+  if (dateMatch) {
+    return buildLocalTimestamp([...dateMatch.slice(1, 4).map(Number), 0, 0, 0]);
+  }
+
+  return "";
+}
+
+function buildLocalTimestamp([year, month, day, hour, minute, second]) {
+  const date = new Date(year, month - 1, day, hour, minute, second);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day ||
+    date.getHours() !== hour ||
+    date.getMinutes() !== minute ||
+    date.getSeconds() !== second
+  ) {
+    return "";
+  }
+
+  return date.getTime();
 }
 
 function formatRepositoryDate(value) {

@@ -269,7 +269,10 @@ button {
   --chrome-tool-button-width: 32px;
   --system-window-controls-width: 0px;
   display: flex;
+  width: 100%;
+  max-width: 100%;
   height: 100vh;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   flex-direction: column;
@@ -282,6 +285,10 @@ button {
   --chrome-left-inset: 86px;
 }
 
+.app-shell.platform-darwin.is-fullscreen {
+  --chrome-left-inset: 14px;
+}
+
 .app-shell.platform-win32 {
   --chrome-tool-button-width: 46px;
   --system-window-controls-width: 138px;
@@ -292,6 +299,9 @@ button {
   flex: 0 0 auto;
   align-items: center;
   box-sizing: border-box;
+  width: calc(100% + 28px);
+  max-width: calc(100% + 28px);
+  min-width: 0;
   height: 42px;
   gap: 10px;
   justify-content: space-between;
@@ -304,6 +314,7 @@ button {
 .chrome-left {
   display: inline-flex;
   flex: 0 0 auto;
+  min-width: 0;
   align-items: center;
   gap: 8px;
   height: 100%;
@@ -312,6 +323,7 @@ button {
 
 .drag-region {
   flex: 1;
+  min-width: 12px;
   height: 100%;
 }
 
@@ -376,12 +388,17 @@ button {
   height: 14px;
 }
 
-.profile-button img {
-  display: block;
+.profile-initial {
+  display: inline-grid;
   width: 100%;
   height: 100%;
+  place-items: center;
   border-radius: inherit;
-  object-fit: cover;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1;
+  text-transform: uppercase;
 }
 
 .profile-button:hover {
@@ -393,6 +410,7 @@ button {
 .top-nav {
   position: relative;
   display: inline-flex;
+  min-width: 0;
   align-items: center;
   gap: 18px;
   height: 30px;
@@ -519,6 +537,47 @@ h2 {
   color: var(--text);
   font-size: 46px;
   font-weight: 760;
+}
+
+.engine-page {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+}
+
+.engine-gate {
+  display: grid;
+  width: min(360px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 15px;
+}
+
+.engine-gate-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.engine-gate-heading strong,
+.engine-gate-heading span {
+  display: block;
+}
+
+.engine-gate-heading strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.engine-gate-heading span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .cloud-page {
@@ -896,15 +955,36 @@ h2 {
   color: var(--success);
 }
 
+.repository-status.storage.saved,
+.repository-status.storage.stored,
+.repository-status.storage.completed,
+.repository-status.storage.complete,
+.repository-status.storage.done,
+.repository-status.storage.ready,
+.repository-status.storage.success {
+  background: rgba(23, 114, 69, 0.1);
+  color: var(--success);
+}
+
 .repository-status.pending,
 .repository-status.preview_ready,
-.repository-status.processing {
+.repository-status.processing,
+.repository-status.storage.saving,
+.repository-status.storage.storing,
+.repository-status.storage.uploading,
+.repository-status.storage.pending,
+.repository-status.storage.processing,
+.repository-status.storage.in_progress {
   background: rgba(154, 103, 0, 0.1);
   color: var(--warning);
 }
 
 .repository-status.failed,
-.repository-status.error {
+.repository-status.error,
+.repository-status.storage.failed,
+.repository-status.storage.error,
+.repository-status.storage.canceled,
+.repository-status.storage.cancelled {
   background: rgba(180, 35, 24, 0.08);
   color: var(--danger);
 }
@@ -982,6 +1062,11 @@ h2 {
   gap: 10px;
 }
 
+.repository-table-head.rawdata,
+.repository-row.rawdata {
+  grid-template-columns: minmax(180px, 1fr) minmax(64px, 0.26fr) minmax(108px, 0.42fr) minmax(108px, 0.42fr) minmax(74px, 0.3fr) minmax(76px, 0.32fr) 34px;
+}
+
 .repository-table-head {
   border-bottom: 1px solid var(--line);
   padding: 0 12px;
@@ -1033,6 +1118,48 @@ h2 {
 .repository-card-foot button:hover {
   background: var(--surface-soft);
   color: var(--text);
+}
+
+.repository-actions {
+  position: relative;
+  display: grid;
+  justify-items: end;
+}
+
+.repository-action-menu {
+  position: absolute;
+  z-index: 8;
+  top: 30px;
+  right: 0;
+  display: grid;
+  min-width: 86px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+
+.repository-action-menu.floating {
+  position: fixed;
+  z-index: 1000;
+  top: var(--menu-top);
+  right: auto;
+  left: var(--menu-left);
+}
+
+.repository-action-menu button {
+  width: 100%;
+  height: 28px;
+  justify-content: start;
+  padding: 0 8px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.repository-action-menu button.danger {
+  color: var(--danger);
 }
 
 .repository-name-cell {
@@ -1433,10 +1560,92 @@ h2 {
   font-weight: 750;
 }
 
+.automation-options {
+  display: grid;
+  margin-top: auto;
+  gap: 6px;
+}
+
+.automation-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  border-radius: 7px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+  padding: 0 6px;
+  transition:
+    background 150ms ease,
+    color 150ms ease;
+}
+
+.automation-option:hover {
+  background: var(--surface-subtle);
+  color: var(--text);
+}
+
+.automation-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.automation-option svg {
+  color: var(--muted);
+}
+
+.automation-option span:last-child {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-check {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease;
+}
+
+.automation-check::after {
+  width: 7px;
+  height: 4px;
+  border-bottom: 2px solid var(--button-text);
+  border-left: 2px solid var(--button-text);
+  content: "";
+  opacity: 0;
+  transform: rotate(-45deg) translateY(-1px);
+}
+
+.automation-option input:checked + .automation-check {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.automation-option input:checked + .automation-check::after {
+  opacity: 1;
+}
+
+.automation-option input:checked ~ svg,
+.automation-option input:checked ~ span:last-child {
+  color: var(--accent-strong);
+}
+
 .actions {
   display: grid;
   grid-template-columns: 1.12fr 0.94fr 0.94fr;
-  margin-top: auto;
   gap: 6px;
 }
 
@@ -1595,6 +1804,50 @@ button:disabled {
   padding: 9px 10px;
 }
 
+.auto-upload-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(15, 118, 110, 0.18);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  padding: 9px 10px;
+}
+
+.auto-upload-notice > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.auto-upload-notice span {
+  overflow: hidden;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-upload-notice button {
+  display: grid;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.auto-upload-notice button:hover {
+  background: rgba(15, 118, 110, 0.1);
+}
+
 .upload-panel {
   display: grid;
   gap: 9px;
@@ -1630,7 +1883,8 @@ button:disabled {
 
 .upload-title-row,
 .upload-detail-top,
-.upload-detail-meta {
+.upload-detail-meta,
+.upload-detail-time {
   display: flex;
   min-width: 0;
   align-items: center;
@@ -1652,9 +1906,14 @@ button:disabled {
 
 .upload-title-row span,
 .upload-panel-body p,
-.upload-detail-meta {
+.upload-detail-meta,
+.upload-detail-time {
   color: var(--muted);
   font-size: 12px;
+}
+
+.upload-detail-time span {
+  min-width: 0;
 }
 
 .upload-panel-body p {
@@ -2106,11 +2365,29 @@ button:disabled {
   font-weight: 700;
 }
 
-.login-account span {
+.login-account-identity {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.login-account-identity strong,
+.login-account-identity span {
   overflow: hidden;
   min-width: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.login-account-identity strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.login-account-identity span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .login-account button {
