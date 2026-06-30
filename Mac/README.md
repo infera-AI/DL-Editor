@@ -42,7 +42,9 @@ npm run dist:x64
 ## macOS Notes
 
 - Build the installer on macOS so `ffmpeg-static` downloads the correct Darwin binary for the target architecture.
-- Apple Silicon Macs should use `npm run dist:arm64`.
-- Intel Macs should use `npm run dist:x64`.
+- Apple Silicon Macs should use `npm run dist:arm64`; Apple Silicon starts at macOS 11 Big Sur.
+- Intel Macs should use `npm run dist:x64`; this build targets macOS 10.15 Catalina and newer.
+- macOS 10.14 and older are not supported by the current Electron stack.
+- Release builds publish both `arm64` and `x64` Mac installers, and the updater picks the matching architecture.
 - Unsigned builds may show a Gatekeeper warning. A production build should be signed and notarized with an Apple Developer ID.
 - macOS does not expose reliable GPU utilization to ordinary desktop apps without privileged tools such as `powermetrics`; the app still shows GPU identity, encoder status, and CPU utilization live.

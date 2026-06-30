@@ -34,11 +34,23 @@ jobs:
               --repo "${{ github.repository }}"
 
   mac:
-    name: macOS arm64 installers
-    runs-on: macos-14
+    name: macOS ${{ matrix.arch }} installers
+    runs-on: macos-latest
     needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            ffprobe: ffprobe-arm64
+            file_match: "Mach-O 64-bit executable arm64"
+          - arch: x64
+            ffprobe: ffprobe-x64
+            file_match: "Mach-O 64-bit executable x86_64"
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      DL_STUDIO_MAC_ARCH: ${{ matrix.arch }}
+      npm_config_arch: ${{ matrix.arch }}
     defaults:
       run:
         working-directory: Mac
@@ -51,21 +63,24 @@ jobs:
           cache-dependency-path: Mac/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --mac dmg pkg --arm64 --config.directories.output=release-upload
+      - run: npx electron-builder --config electron-builder.config.cjs --mac dmg pkg --${{ matrix.arch }} --config.directories.output=release-upload
       - name: Verify macOS bundled binaries
         run: |
-          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffmpeg"
-          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffprobe-arm64" | tee /tmp/ffprobe-file.txt
-          grep -q "Mach-O 64-bit executable arm64" /tmp/ffprobe-file.txt
+          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/MacOS/DL Studio" | tee /tmp/app-file.txt
+          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/ffmpeg" | tee /tmp/ffmpeg-file.txt
+          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/${{ matrix.ffprobe }}" | tee /tmp/ffprobe-file.txt
+          grep -q "${{ matrix.file_match }}" /tmp/app-file.txt
+          grep -q "${{ matrix.file_match }}" /tmp/ffmpeg-file.txt
+          grep -q "${{ matrix.file_match }}" /tmp/ffprobe-file.txt
       - name: Upload macOS assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node -p "require('./package.json').version")"
           gh release upload "$RELEASE_TAG" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.dmg" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.pkg" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.dmg.blockmap" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.dmg" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.pkg" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.dmg.blockmap" \
             --clobber \
             --repo "${{ github.repository }}"
 

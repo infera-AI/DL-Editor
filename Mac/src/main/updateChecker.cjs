@@ -31,15 +31,48 @@ function getReleaseVersion(release) {
   return normalizeVersion(release?.tag_name || release?.name);
 }
 
-function scoreAsset(asset, platform) {
+function normalizeArch(value) {
+  const arch = String(value || "").toLowerCase();
+  if (arch === "x64" || arch === "x86_64" || arch === "amd64") return "x64";
+  if (arch === "arm64" || arch === "aarch64") return "arm64";
+  return arch;
+}
+
+function hasArchToken(name, arch) {
+  if (arch === "arm64") return /(^|[^a-z0-9])arm64([^a-z0-9]|$)/.test(name);
+  if (arch === "x64") return /(^|[^a-z0-9])(x64|x86_64|amd64)([^a-z0-9]|$)/.test(name);
+  return false;
+}
+
+function getDarwinArchScore(name, arch) {
+  const targetArch = normalizeArch(arch);
+  if (targetArch !== "arm64" && targetArch !== "x64") return 0;
+
+  const hasArm64 = hasArchToken(name, "arm64");
+  const hasX64 = hasArchToken(name, "x64");
+  if (targetArch === "arm64") {
+    if (hasArm64) return 15;
+    if (hasX64) return -1;
+  }
+  if (targetArch === "x64") {
+    if (hasX64) return 15;
+    if (hasArm64) return -1;
+  }
+
+  return hasArm64 || hasX64 ? -1 : 1;
+}
+
+function scoreAsset(asset, platform, arch = process.arch) {
   const name = String(asset?.name || "").toLowerCase();
   if (!asset?.browser_download_url || name.endsWith(".blockmap") || name.endsWith(".yml")) return 0;
 
   if (platform === "darwin") {
-    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".dmg")) return 30;
-    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".pkg")) return 20;
-    if (name.endsWith(".dmg")) return 10;
-    if (name.endsWith(".pkg")) return 5;
+    const archScore = getDarwinArchScore(name, arch);
+    if (archScore < 0) return 0;
+    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".dmg")) return 30 + archScore;
+    if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".pkg")) return 20 + archScore;
+    if (name.endsWith(".dmg")) return 10 + archScore;
+    if (name.endsWith(".pkg")) return 5 + archScore;
   }
 
   if (platform === "win32") {
@@ -51,13 +84,13 @@ function scoreAsset(asset, platform) {
   return 0;
 }
 
-function selectDownloadAsset(release, platform = process.platform) {
+function selectDownloadAsset(release, platform = process.platform, arch = process.arch) {
   const assets = Array.isArray(release?.assets) ? release.assets : [];
   let selected = null;
   let selectedScore = 0;
 
   for (const asset of assets) {
-    const assetScore = scoreAsset(asset, platform);
+    const assetScore = scoreAsset(asset, platform, arch);
     if (assetScore > selectedScore) {
       selected = asset;
       selectedScore = assetScore;
@@ -67,7 +100,7 @@ function selectDownloadAsset(release, platform = process.platform) {
   return selected;
 }
 
-function buildUpdateResult({ currentVersion, platform = process.platform, release }) {
+function buildUpdateResult({ currentVersion, platform = process.platform, arch = process.arch, release }) {
   const latestVersion = getReleaseVersion(release);
   if (!latestVersion) {
     throw new Error("更新数据缺少版本号。");
@@ -88,7 +121,7 @@ function buildUpdateResult({ currentVersion, platform = process.platform, releas
     return { ...base, status: "latest" };
   }
 
-  const asset = selectDownloadAsset(release, platform);
+  const asset = selectDownloadAsset(release, platform, arch);
   if (!asset) {
     return { ...base, status: "no_asset" };
   }
@@ -155,7 +188,12 @@ function requestJson(url) {
   });
 }
 
-async function checkForUpdate({ currentVersion, platform = process.platform, apiUrl = LATEST_RELEASE_API_URL } = {}) {
+async function checkForUpdate({
+  currentVersion,
+  platform = process.platform,
+  arch = process.arch,
+  apiUrl = LATEST_RELEASE_API_URL
+} = {}) {
   let release;
   try {
     release = await requestJson(apiUrl);
@@ -166,7 +204,7 @@ async function checkForUpdate({ currentVersion, platform = process.platform, api
     throw error;
   }
 
-  return buildUpdateResult({ currentVersion, platform, release });
+  return buildUpdateResult({ currentVersion, platform, arch, release });
 }
 
 module.exports = {

@@ -1291,12 +1291,46 @@ h2 {
   font-weight: 650;
 }
 
+.repository-empty {
+  flex-direction: column;
+  padding: 12px;
+}
+
 .repository-alert {
   justify-content: flex-start;
   border-color: rgba(180, 35, 24, 0.22);
   background: rgba(180, 35, 24, 0.06);
   color: var(--danger);
   padding: 0 12px;
+}
+
+.repository-load-more {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 58px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.cloud-file-table .repository-load-more {
+  margin: 0 12px;
+  border-top: 1px solid var(--line);
+}
+
+.cloud-file-grid .repository-load-more {
+  padding: 2px 0 6px;
+}
+
+.repository-empty .repository-load-more {
+  min-height: 0;
+}
+
+.repository-load-more .secondary-button {
+  min-width: 142px;
 }
 
 .control-panel,

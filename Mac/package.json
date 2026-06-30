@@ -10,10 +10,10 @@
   "scripts": {
     "dev": "concurrently \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "vite build",
-    "dist": "npm run build && electron-builder --mac dmg pkg",
-    "dist:arm64": "npm run build && electron-builder --mac dmg pkg --arm64",
-    "dist:x64": "npm run build && electron-builder --mac dmg pkg --x64",
-    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --config electron-builder.config.cjs --mac dmg pkg",
+    "dist:arm64": "npm run build && cross-env DL_STUDIO_MAC_ARCH=arm64 electron-builder --config electron-builder.config.cjs --mac dmg pkg --arm64",
+    "dist:x64": "npm run build && cross-env DL_STUDIO_MAC_ARCH=x64 electron-builder --config electron-builder.config.cjs --mac dmg pkg --x64",
+    "pack": "npm run build && electron-builder --config electron-builder.config.cjs --dir",
     "smoke": "node scripts/smoke.cjs",
     "test:app-shell": "node scripts/app-shell.test.cjs"
   },
@@ -21,76 +21,15 @@
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
-    "electron": "^34.1.1",
+    "electron": "^32.3.3",
     "electron-builder": "^25.1.8",
     "ffmpeg-static": "^5.2.0",
-    "@ffprobe-installer/ffprobe": "^2.1.2",
     "ffprobe-static": "^3.1.0",
     "lucide-react": "^0.475.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "vite": "^6.1.0",
     "wait-on": "^8.0.2"
-  },
-  "build": {
-    "appId": "com.dlstudio.mac",
-    "productName": "DL Studio",
-    "directories": {
-      "output": "release",
-      "buildResources": "build"
-    },
-    "files": [
-      "dist/**/*",
-      "src/main/**/*",
-      "build/icon.svg",
-      "build/icon.png",
-      "build/icon.ico",
-      "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "node_modules/ffmpeg-static/ffmpeg",
-        "to": "bin/ffmpeg"
-      },
-      {
-        "from": "node_modules/@ffprobe-installer/darwin-arm64/ffprobe",
-        "to": "bin/ffprobe-arm64"
-      },
-      {
-        "from": "node_modules/ffprobe-static/bin/darwin/x64/ffprobe",
-        "to": "bin/ffprobe-x64"
-      }
-    ],
-    "mac": {
-      "icon": "build/icon.png",
-      "target": [
-        "dmg",
-        "pkg"
-      ],
-      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
-      "category": "public.app-category.video",
-      "hardenedRuntime": false,
-      "gatekeeperAssess": false
-    },
-    "dmg": {
-      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
-      "contents": [
-        {
-          "x": 130,
-          "y": 220
-        },
-        {
-          "x": 410,
-          "y": 220,
-          "type": "link",
-          "path": "/Applications"
-        }
-      ]
-    },
-    "pkg": {
-      "artifactName": "DL-Studio-Mac-${version}-${arch}.${ext}",
-      "installLocation": "/Applications"
-    }
   },
   "dependencies": {
     "@ffprobe-installer/ffprobe": "^2.1.2"

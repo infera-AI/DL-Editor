@@ -6,6 +6,7 @@ const http = require("http");
 const https = require("https");
 const os = require("os");
 const path = require("path");
+const { getDecoderArgs } = require("./decoderArgs.cjs");
 const { getMuxOriginalAudioArgs, getOutputStreamArgs } = require("./ffmpegArgs.cjs");
 const { deriveStartTimeMs } = require("./mediaStartTime.cjs");
 const { checkForUpdate } = require("./updateChecker.cjs");
@@ -1201,7 +1202,6 @@ function getEncoderArgs(encoder, logicalCores) {
 
 function buildFfmpegArgs({ inputPath, outputPath, options, encoder, logicalCores, mediaInfo }) {
   const useGpuPath = options.processingDevice === "gpu" && encoder !== "libx264";
-  const decoderArgs = useGpuPath ? ["-hwaccel", "auto"] : [];
   const seekArgs = Number.isFinite(options.segmentStart) && options.segmentStart > 0 ? ["-ss", options.segmentStart.toFixed(3)] : [];
   const durationArgs =
     Number.isFinite(options.segmentDuration) && options.segmentDuration > 0 ? ["-t", options.segmentDuration.toFixed(3)] : [];
@@ -1209,6 +1209,7 @@ function buildFfmpegArgs({ inputPath, outputPath, options, encoder, logicalCores
     ? Number(options.filterThreads)
     : Math.max(1, Math.min(logicalCores || 1, 8));
   const videoFilters = buildVideoFilters(options, mediaInfo);
+  const decoderArgs = getDecoderArgs({ useGpuPath, videoFilters });
   const filterArgs = videoFilters ? ["-vf", videoFilters] : [];
   const fastStartArgs = options.fastStart === false ? [] : ["-movflags", "+faststart"];
 

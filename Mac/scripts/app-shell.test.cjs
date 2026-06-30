@@ -7,6 +7,7 @@ const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 
 const packageJson = require(path.join(root, "package.json"));
 const packageLock = require(path.join(root, "package-lock.json"));
+const builderConfig = read("electron-builder.config.cjs");
 const indexHtml = read("index.html");
 const main = read("src/main/main.js");
 const preload = read("src/main/preload.js");
@@ -15,16 +16,22 @@ const styles = read("src/renderer/styles.css");
 
 assert.equal(packageJson.name, "dl-studio-mac");
 assert.equal(packageJson.author, "DL Studio");
-assert.equal(packageJson.build.productName, "DL Studio");
 assert.equal(packageLock.name, "dl-studio-mac");
 assert.equal(packageLock.packages[""].name, "dl-studio-mac");
-assert.match(packageJson.devDependencies["@ffprobe-installer/ffprobe"], /^\^2\.1\.2/);
-assert.ok(
-  packageJson.build.extraResources.some(
-    (entry) => entry.from === "node_modules/@ffprobe-installer/darwin-arm64/ffprobe" && entry.to === "bin/ffprobe-arm64"
-  ),
-  "macOS arm64 builds must bundle the real Apple Silicon ffprobe binary"
-);
+assert.match(packageJson.dependencies["@ffprobe-installer/ffprobe"], /^\^2\.1\.2/);
+assert.match(packageJson.devDependencies.electron, /^\^32\./);
+assert.ok(!Object.prototype.hasOwnProperty.call(packageJson, "build"), "electron-builder config must live in electron-builder.config.cjs");
+assert.match(builderConfig, /appId: "com\.dlstudio\.mac"/);
+assert.match(builderConfig, /productName: "DL Studio"/);
+assert.match(builderConfig, /DL_STUDIO_MAC_ARCH/);
+assert.match(builderConfig, /npm_config_arch/);
+assert.match(builderConfig, /process\.arch/);
+assert.match(builderConfig, /node_modules\/ffmpeg-static\/ffmpeg/);
+assert.match(builderConfig, /node_modules\/@ffprobe-installer\/darwin-arm64\/ffprobe/);
+assert.match(builderConfig, /bin\/ffprobe-arm64/);
+assert.match(builderConfig, /node_modules\/ffprobe-static\/bin\/darwin\/x64\/ffprobe/);
+assert.match(builderConfig, /bin\/ffprobe-x64/);
+assert.match(builderConfig, /artifactName: "DL-Studio-Mac-\$\{version\}-\$\{arch\}\.\$\{ext\}"/);
 assert.match(indexHtml, /<title>DL Studio<\/title>/);
 
 assert.match(main, /const APP_NAME = "DL Studio"/);
@@ -169,7 +176,15 @@ assert.match(app, /activeNav === "Editor"/);
 assert.match(app, /activeNav === "Cloud"/);
 assert.match(app, /CloudRepository/);
 assert.match(app, /loadCloudRepository/);
-assert.match(app, /\/device\/files\?limit=50&include_page=true/);
+assert.match(app, /const CLOUD_REPOSITORY_PAGE_SIZE = 50/);
+assert.match(app, /function getCloudRepositoryPath/);
+assert.match(app, /params\.set\("cursor", cursor\)/);
+assert.match(app, /params\.set\("offset", String\(Number\(offset\)\)\)/);
+assert.match(app, /status: append \? "loading-more" : "loading"/);
+assert.match(app, /mergeCloudRepositoryItems/);
+assert.match(app, /getRepositoryStableItemKey/);
+assert.match(app, /IntersectionObserver/);
+assert.match(app, /Load more files/);
 assert.match(app, /const RAW_DATA_LIST_PATH = "\/memory\/raw-data"/);
 assert.match(app, /const RAW_DATA_VIDEO_UPLOAD_PATH = "\/memory\/raw-data\/videos"/);
 assert.match(app, /deleteRawDataArchive/);
@@ -341,6 +356,7 @@ assert.match(styles, /\.upload-progress-fill/);
 assert.match(styles, /\.upload-detail-list/);
 assert.match(styles, /\.upload-detail-time/);
 assert.match(styles, /\.repository-list/);
+assert.match(styles, /\.repository-load-more/);
 assert.match(styles, /\.repository-item/);
 assert.match(styles, /\.repository-row/);
 assert.match(styles, /\.repository-row\.rawdata/);

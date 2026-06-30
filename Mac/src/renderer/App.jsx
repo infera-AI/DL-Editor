@@ -89,6 +89,7 @@ const CLOUD_FILTERS = [
   { id: "processing", label: "处理中" }
 ];
 const CLOUD_VIEW_MODES = ["list", "grid"];
+const CLOUD_REPOSITORY_PAGE_SIZE = 50;
 const CLOUD_SPACES = [
   { id: "repository", label: "DL Repository" },
   { id: "rawdata", label: "DL Rawdata" }
@@ -301,16 +302,75 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
-async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id) {
-  const result = await requestInfera(spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files?limit=50&include_page=true", { token });
+function getCloudRepositoryPath(spaceId, { cursor = null, limit = CLOUD_REPOSITORY_PAGE_SIZE, offset = 0 } = {}) {
+  if (spaceId === "rawdata") {
+    return RAW_DATA_LIST_PATH;
+  }
+
+  const params = new URLSearchParams({
+    include_page: "true",
+    limit: String(limit)
+  });
+  if (cursor) {
+    params.set("cursor", cursor);
+  } else if (Number.isFinite(Number(offset)) && Number(offset) > 0) {
+    params.set("offset", String(Number(offset)));
+  }
+
+  return `/device/files?${params.toString()}`;
+}
+
+function getCloudRepositoryPageInfo(result) {
+  return result?.page || result?.pagination || result?.meta || {};
+}
+
+function getCloudRepositoryTotal(result, items) {
+  const pageInfo = getCloudRepositoryPageInfo(result);
+  const total = Number(result?.total ?? result?.count ?? pageInfo?.total ?? pageInfo?.count);
+  return Number.isFinite(total) ? total : items.length;
+}
+
+function getCloudRepositoryNextCursor(result) {
+  const pageInfo = getCloudRepositoryPageInfo(result);
+  return result?.next_cursor || result?.nextCursor || pageInfo?.next_cursor || pageInfo?.nextCursor || null;
+}
+
+function getCloudRepositoryHasMore(result) {
+  const pageInfo = getCloudRepositoryPageInfo(result);
+  return Boolean(result?.has_more || result?.hasMore || pageInfo?.has_more || pageInfo?.hasMore);
+}
+
+async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id, options = {}) {
+  const result = await requestInfera(getCloudRepositoryPath(spaceId, options), { token });
   const items = normalizeCloudItems(result);
+  const offset = Number.isFinite(Number(options.offset)) ? Number(options.offset) : 0;
+  const total = getCloudRepositoryTotal(result, items);
+  const nextCursor = getCloudRepositoryNextCursor(result);
+  const nextOffset = offset + items.length;
 
   return {
     items,
-    total: Number.isFinite(Number(result?.total)) ? Number(result.total) : items.length,
-    hasMore: Boolean(result?.has_more),
-    nextCursor: result?.next_cursor || null
+    total,
+    hasMore: getCloudRepositoryHasMore(result) || Boolean(nextCursor) || nextOffset < total,
+    nextCursor,
+    nextOffset
   };
+}
+
+function mergeCloudRepositoryItems(currentItems, nextItems) {
+  const merged = [...currentItems];
+  const seen = new Set(currentItems.map(getRepositoryStableItemKey).filter(Boolean));
+  nextItems.forEach((item) => {
+    const key = getRepositoryStableItemKey(item);
+    if (key && seen.has(key)) {
+      return;
+    }
+    if (key) {
+      seen.add(key);
+    }
+    merged.push(item);
+  });
+  return merged;
 }
 
 function normalizeCloudItems(result) {
@@ -404,6 +464,7 @@ function App() {
     total: 0,
     hasMore: false,
     nextCursor: null,
+    nextOffset: 0,
     message: ""
   });
   const [startTimeEditor, setStartTimeEditor] = useState(null);
@@ -1305,6 +1366,7 @@ function App() {
       total: 0,
       hasMore: false,
       nextCursor: null,
+      nextOffset: 0,
       message: authStateRef.current?.token ? "" : "请先登录后查看 Cloud repository"
     });
   }
@@ -1357,11 +1419,12 @@ function App() {
       total: 0,
       hasMore: false,
       nextCursor: null,
+      nextOffset: 0,
       message: "请先登录后查看 Cloud repository"
     });
   }
 
-  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId) {
+  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId, options = {}) {
     const token = authOverride?.token;
     if (!token) {
       setRepositoryState({
@@ -1371,8 +1434,18 @@ function App() {
         total: 0,
         hasMore: false,
         nextCursor: null,
+        nextOffset: 0,
         message: "请先登录后查看 Cloud repository"
       });
+      return;
+    }
+
+    const append = Boolean(options.append);
+    const isSameSpace = repositoryState.spaceId === spaceIdOverride;
+    const currentItems = isSameSpace ? repositoryState.items || [] : [];
+    const currentNextCursor = isSameSpace ? repositoryState.nextCursor : null;
+    const currentNextOffset = isSameSpace ? repositoryState.nextOffset || currentItems.length : 0;
+    if (append && (!isSameSpace || repositoryState.status === "loading" || repositoryState.status === "loading-more" || !repositoryState.hasMore)) {
       return;
     }
 
@@ -1380,23 +1453,32 @@ function App() {
       ...current,
       items: current.spaceId === spaceIdOverride ? current.items : [],
       spaceId: spaceIdOverride,
-      status: "loading",
+      status: append ? "loading-more" : "loading",
       message: ""
     }));
 
     try {
-      const repository = await fetchCloudRepository(token, spaceIdOverride);
+      const repository = await fetchCloudRepository(token, spaceIdOverride, {
+        cursor: append ? currentNextCursor : null,
+        limit: CLOUD_REPOSITORY_PAGE_SIZE,
+        offset: append && !currentNextCursor ? currentNextOffset : 0
+      });
       setRepositoryState((current) =>
         current.spaceId === spaceIdOverride
-          ? {
-              status: "ready",
-              spaceId: spaceIdOverride,
-              items: repository.items,
-              total: repository.total,
-              hasMore: repository.hasMore,
-              nextCursor: repository.nextCursor,
-              message: ""
-            }
+          ? (() => {
+              const mergedItems = append ? mergeCloudRepositoryItems(current.items || [], repository.items) : repository.items;
+              const hasNewItems = mergedItems.length > (current.items || []).length;
+              return {
+                status: "ready",
+                spaceId: spaceIdOverride,
+                items: mergedItems,
+                total: Math.max(repository.total, mergedItems.length),
+                hasMore: Boolean(repository.hasMore && (!append || hasNewItems || repository.nextCursor)),
+                nextCursor: repository.nextCursor,
+                nextOffset: repository.nextOffset || mergedItems.length,
+                message: ""
+              };
+            })()
           : current
       );
     } catch (error) {
@@ -1735,6 +1817,7 @@ function App() {
           authState={authState}
           cloudSpaceId={cloudSpaceId}
           onDeleteItem={deleteCloudRepositoryItem}
+          onLoadMore={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId, { append: true })}
           onLogin={() => setShowLogin(true)}
           onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId)}
           onSpaceChange={changeCloudSpace}
@@ -1857,15 +1940,17 @@ function AutoUploadNotice({ message, onClose }) {
   );
 }
 
-function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRefresh, onSpaceChange, repositoryState }) {
+function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, onLogin, onRefresh, onSpaceChange, repositoryState }) {
   const items = repositoryState.items || [];
   const isLoading = repositoryState.status === "loading";
+  const isLoadingMore = repositoryState.status === "loading-more";
   const [cloudQuery, setCloudQuery] = useState("");
   const [cloudViewMode, setCloudViewMode] = useState("list");
   const [activeCloudFilter, setActiveCloudFilter] = useState("all");
   const [isCloudSpaceMenuOpen, setCloudSpaceMenuOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState("");
   const [repositoryMenuPosition, setRepositoryMenuPosition] = useState(null);
+  const loadMoreRef = useRef(null);
   const displaySpaceId = repositoryState.spaceId || cloudSpaceId;
   const isRawDataSpace = displaySpaceId === "rawdata";
   const visibleFilters = useMemo(() => getCloudFiltersForSpace(displaySpaceId), [displaySpaceId]);
@@ -1881,6 +1966,8 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
   const activeFilterLabel = visibleFilters.find((filter) => filter.id === activeCloudFilter)?.label || visibleFilters[0]?.label || CLOUD_FILTERS[0].label;
   const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === displaySpaceId) || CLOUD_SPACES[0];
   const storagePercent = Math.min(92, Math.max(4, Math.round((stats.totalBytes / (5 * 1024 * 1024 * 1024)) * 100)));
+  const canLoadMoreRepository = Boolean(authState?.token && repositoryState.hasMore && !isLoading && !isLoadingMore && typeof onLoadMore === "function");
+  const showLoadMoreRepository = Boolean(authState?.token && (repositoryState.hasMore || isLoadingMore));
 
   function closeRepositoryMenu() {
     setOpenMenuId("");
@@ -1918,6 +2005,24 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
       window.removeEventListener("scroll", closeRepositoryMenu, true);
     };
   }, [openMenuId]);
+
+  useEffect(() => {
+    const sentinel = loadMoreRef.current;
+    if (!sentinel || !canLoadMoreRepository || typeof IntersectionObserver === "undefined") {
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          onLoadMore(displaySpaceId);
+        }
+      },
+      { root: null, rootMargin: "220px 0px", threshold: 0.01 }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [canLoadMoreRepository, displaySpaceId, filteredItems.length, onLoadMore]);
 
   return (
     <section className="cloud-page">
@@ -2017,7 +2122,7 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
                     value={cloudQuery}
                   />
                 </label>
-                <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={() => onRefresh(displaySpaceId)} type="button">
+                <button className="secondary-button cloud-refresh" disabled={isLoading || isLoadingMore} onClick={() => onRefresh(displaySpaceId)} type="button">
                   <RotateCcw size={16} />
                   <span>{isLoading ? "同步中" : "刷新"}</span>
                 </button>
@@ -2068,7 +2173,19 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
                 {isLoading && items.length === 0 ? (
                   <div className="repository-empty">正在读取 repository...</div>
                 ) : filteredItems.length === 0 ? (
-                  <div className="repository-empty">没有匹配的文件</div>
+                  <div className="repository-empty">
+                    <span>没有匹配的文件</span>
+                    {showLoadMoreRepository && (
+                      <RepositoryLoadMore
+                        canLoadMore={canLoadMoreRepository}
+                        isLoadingMore={isLoadingMore}
+                        loadedCount={items.length}
+                        onLoadMore={() => onLoadMore(displaySpaceId)}
+                        sentinelRef={loadMoreRef}
+                        total={repositoryState.total || items.length}
+                      />
+                    )}
+                  </div>
                 ) : cloudViewMode === "grid" ? (
                   <div className="cloud-file-grid">
                     <div className="repository-list">
@@ -2080,6 +2197,16 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
                           onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
                         />
                       ))}
+                      {showLoadMoreRepository && (
+                        <RepositoryLoadMore
+                          canLoadMore={canLoadMoreRepository}
+                          isLoadingMore={isLoadingMore}
+                          loadedCount={items.length}
+                          onLoadMore={() => onLoadMore(displaySpaceId)}
+                          sentinelRef={loadMoreRef}
+                          total={repositoryState.total || items.length}
+                        />
+                      )}
                     </div>
                   </div>
                 ) : (
@@ -2112,6 +2239,16 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
                           onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
                         />
                       ))}
+                      {showLoadMoreRepository && (
+                        <RepositoryLoadMore
+                          canLoadMore={canLoadMoreRepository}
+                          isLoadingMore={isLoadingMore}
+                          loadedCount={items.length}
+                          onLoadMore={() => onLoadMore(displaySpaceId)}
+                          sentinelRef={loadMoreRef}
+                          total={repositoryState.total || items.length}
+                        />
+                      )}
                     </div>
                   </div>
                 )}
@@ -2159,6 +2296,19 @@ function CloudMetric({ icon, label, value }) {
       {icon}
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function RepositoryLoadMore({ canLoadMore, isLoadingMore, loadedCount, onLoadMore, sentinelRef, total }) {
+  const loadedLabel = total > loadedCount ? `${loadedCount} / ${total}` : `${loadedCount}`;
+  return (
+    <div className="repository-load-more" ref={sentinelRef}>
+      <button className="secondary-button" disabled={!canLoadMore || isLoadingMore} onClick={onLoadMore} type="button">
+        <Download size={15} />
+        <span>{isLoadingMore ? "Loading..." : "Load more files"}</span>
+      </button>
+      <span>{loadedLabel}</span>
     </div>
   );
 }
@@ -3093,6 +3243,10 @@ function getCloudFiltersForSpace(spaceId) {
 
 function getRepositoryItemKey(item) {
   return String(getRawDataId(item) || item.asset_id || item.id || item.media_url || item.file_name || item.name || "repository-item");
+}
+
+function getRepositoryStableItemKey(item) {
+  return String(getRawDataId(item) || item?.asset_id || item?.id || item?.media_url || item?.file_name || item?.name || "");
 }
 
 function getRepositoryActionMenuPosition(anchor) {
