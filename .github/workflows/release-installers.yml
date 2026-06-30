@@ -68,6 +68,14 @@ jobs:
             "release-upload/DL-Studio-Mac-${version}-arm64.dmg.blockmap" \
             --clobber \
             --repo "${{ github.repository }}"
+      - name: Upload macOS installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-installers
+          path: |
+            Mac/release-upload/DL-Studio-Mac-*-arm64.dmg
+            Mac/release-upload/DL-Studio-Mac-*-arm64.pkg
+          if-no-files-found: error
 
   windows:
     name: Windows x64 installer
@@ -97,6 +105,12 @@ jobs:
             "release/DL-Studio-Windows-Setup-$version.exe.blockmap" `
             --clobber `
             --repo "${{ github.repository }}"
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: Windows/release/DL-Studio-Windows-Setup-*.exe
+          if-no-files-found: error
 
   publish:
     name: Publish release
@@ -107,6 +121,191 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Upload installers and manifests to OSS
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          ALIYUN_OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}
+          ALIYUN_OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}
+          OSS_ENDPOINT: ${{ vars.CLIENT_RELEASE_OSS_ENDPOINT || 'https://infmemo.oss-cn-beijing.aliyuncs.com' }}
+          OSS_BUCKET: ${{ vars.CLIENT_RELEASE_OSS_BUCKET || 'infmemo' }}
+          OSS_IS_CNAME: ${{ vars.CLIENT_RELEASE_OSS_IS_CNAME || 'true' }}
+          OSS_PREFIX: ${{ vars.CLIENT_RELEASE_OSS_PREFIX || 'infmemo' }}
+          CLIENT_UPDATE_OSS_PREFIX: ${{ vars.CLIENT_UPDATE_OSS_PREFIX || 'client-releases' }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install oss2
+          python - <<'PY'
+          import hashlib
+          import json
+          import mimetypes
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import oss2
+
+          release_tag = os.environ["RELEASE_TAG"].strip()
+          if not release_tag.lower().startswith("v"):
+              release_tag = f"v{release_tag}"
+          version = release_tag[1:]
+          oss_prefix = os.environ.get("OSS_PREFIX", "infmemo").strip().strip("/")
+          release_prefix = os.environ.get("CLIENT_UPDATE_OSS_PREFIX", "client-releases").strip().strip("/")
+          bucket_name = os.environ["OSS_BUCKET"].strip()
+          endpoint = os.environ["OSS_ENDPOINT"].strip()
+          is_cname = os.environ.get("OSS_IS_CNAME", "true").strip().lower() == "true"
+          access_key_id = (os.environ.get("OSS_ACCESS_KEY_ID") or os.environ.get("ALIYUN_OSS_ACCESS_KEY_ID") or "").strip()
+          access_key_secret = (os.environ.get("OSS_ACCESS_KEY_SECRET") or os.environ.get("ALIYUN_OSS_ACCESS_KEY_SECRET") or "").strip()
+          if not access_key_id or not access_key_secret:
+              raise RuntimeError("OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET or ALIYUN_OSS_ACCESS_KEY_ID/ALIYUN_OSS_ACCESS_KEY_SECRET are required")
+
+          root = Path("release-assets")
+          files = sorted(path for path in root.rglob("*") if path.is_file())
+          allowed_suffixes = {".exe", ".dmg", ".pkg"}
+          release_root = "/".join(part for part in (oss_prefix, release_prefix, release_tag) if part)
+          auth = oss2.Auth(access_key_id, access_key_secret)
+          bucket = oss2.Bucket(auth, endpoint, bucket_name, is_cname=is_cname)
+
+          def normalize_version(value):
+              text = str(value or "").strip()
+              if text.lower().startswith("v"):
+                  text = text[1:]
+              return text.split("-", 1)[0]
+
+          def version_parts(value):
+              parts = []
+              for raw in normalize_version(value).split("."):
+                  digits = ""
+                  for char in raw:
+                      if not char.isdigit():
+                          break
+                      digits += char
+                  parts.append(int(digits) if digits else 0)
+              return parts
+
+          def compare_versions(left, right):
+              left_parts = version_parts(left)
+              right_parts = version_parts(right)
+              length = max(len(left_parts), len(right_parts), 3)
+              for index in range(length):
+                  left_value = left_parts[index] if index < len(left_parts) else 0
+                  right_value = right_parts[index] if index < len(right_parts) else 0
+                  if left_value > right_value:
+                      return 1
+                  if left_value < right_value:
+                      return -1
+              return 0
+
+          def hash_file(path):
+              digest = hashlib.sha256()
+              size = 0
+              with path.open("rb") as source:
+                  while True:
+                      chunk = source.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      digest.update(chunk)
+                      size += len(chunk)
+              return digest.hexdigest(), size
+
+          def content_type_for(name):
+              lower = name.lower()
+              if lower.endswith(".exe"):
+                  return "application/vnd.microsoft.portable-executable"
+              if lower.endswith(".dmg"):
+                  return "application/x-apple-diskimage"
+              if lower.endswith(".pkg"):
+                  return "application/octet-stream"
+              return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+          def platform_for(name):
+              lower = name.lower()
+              if lower.endswith(".exe") or "windows" in lower:
+                  return "win32", "x64", "windows"
+              if lower.endswith((".dmg", ".pkg")) or "mac" in lower:
+                  return "darwin", "arm64", "mac"
+              return "", "", "unknown"
+
+          assets = []
+          for path in files:
+              name = path.name
+              suffix = path.suffix.lower()
+              lower = name.lower()
+              if suffix not in allowed_suffixes or lower.endswith((".blockmap", ".yml", ".yaml")):
+                  continue
+              platform, arch, platform_dir = platform_for(name)
+              if not platform:
+                  raise RuntimeError(f"Unsupported release asset name: {name}")
+              sha256, size_bytes = hash_file(path)
+              object_key = f"{release_root}/{platform_dir}/{name}"
+              content_type = content_type_for(name)
+              bucket.put_object_from_file(object_key, str(path), headers={"Content-Type": content_type})
+              assets.append(
+                  {
+                      "platform": platform,
+                      "arch": arch,
+                      "assetName": name,
+                      "objectKey": object_key,
+                      "sha256": sha256,
+                      "sizeBytes": size_bytes,
+                      "contentType": content_type,
+                  }
+              )
+              print(f"Uploaded {name} -> oss://{bucket_name}/{object_key} ({platform}/{arch}, {size_bytes} bytes)")
+
+          if not assets:
+              raise RuntimeError("No installer assets were found for OSS publishing")
+          assets.sort(key=lambda item: (item["platform"], item["arch"], item["assetName"]))
+
+          published_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+          manifest = {
+              "version": release_tag,
+              "tagName": release_tag,
+              "releaseName": f"DL Studio {version}",
+              "releaseUrl": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{release_tag}",
+              "publishedAt": published_at,
+              "assets": assets,
+          }
+          manifest_bytes = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+          version_manifest_key = f"{release_root}/manifest.json"
+          latest_manifest_key = "/".join(part for part in (oss_prefix, release_prefix, "latest.json") if part)
+          bucket.put_object(version_manifest_key, manifest_bytes, headers={"Content-Type": "application/json; charset=utf-8"})
+
+          update_latest = True
+          try:
+              current_latest = json.loads(bucket.get_object(latest_manifest_key).read().decode("utf-8"))
+              current_tag = current_latest.get("tagName") or current_latest.get("version")
+              update_latest = compare_versions(release_tag, current_tag) >= 0
+          except Exception as exc:
+              if getattr(exc, "status", None) not in (404, None):
+                  print(f"Unable to read existing latest manifest, will overwrite: {exc}")
+
+          if update_latest:
+              bucket.put_object(latest_manifest_key, manifest_bytes, headers={"Content-Type": "application/json; charset=utf-8"})
+              print(f"Updated latest manifest: oss://{bucket_name}/{latest_manifest_key}")
+          else:
+              print(f"Kept existing latest manifest because {release_tag} is older")
+
+          Path("client-release-manifest.json").write_bytes(manifest_bytes)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"### Client release OSS publish\n\n")
+              summary.write(f"- Tag: `{release_tag}`\n")
+              summary.write(f"- Version manifest: `oss://{bucket_name}/{version_manifest_key}`\n")
+              summary.write(f"- Latest manifest updated: `{str(update_latest).lower()}`\n")
+              for asset in assets:
+                  summary.write(f"- `{asset['platform']}/{asset['arch']}` `{asset['assetName']}` `{asset['sizeBytes']}` bytes\n")
+          PY
+      - name: Upload generated manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-release-manifest
+          path: client-release-manifest.json
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
