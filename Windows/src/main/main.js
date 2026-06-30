@@ -71,6 +71,17 @@ function resolveInferaUrl(value) {
   return new URL(normalizedPath, `${normalizedBase}/`).toString();
 }
 
+function isAllowedUpdateUrl(value) {
+  const url = String(value || "");
+  const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
+  const clientReleaseBase = `${normalizedBase}/client/releases`;
+  return (
+    url === clientReleaseBase ||
+    url.startsWith(`${clientReleaseBase}/`) ||
+    /^https:\/\/github\.com\/infera-AI\/DL-Editor\/releases(?:\/|$)/.test(url)
+  );
+}
+
 async function requestInfera(payload = {}) {
   const method = String(payload.method || "GET").toUpperCase();
   const headers = { Accept: "application/json" };
@@ -2086,7 +2097,7 @@ ipcMain.handle("shell:open-path", async (_event, targetPath) => {
 
 ipcMain.handle("shell:open-external", async (_event, targetUrl) => {
   const url = String(targetUrl || "");
-  if (!/^https:\/\/github\.com\/infera-AI\/DL-Editor\/releases(?:\/|$)/.test(url)) {
+  if (!isAllowedUpdateUrl(url)) {
     throw new Error("Unsupported update URL.");
   }
 

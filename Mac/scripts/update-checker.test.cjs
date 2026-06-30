@@ -73,6 +73,6 @@ assert.equal(current.downloadUrl, "");
 const noRelease = buildNoReleaseResult({ currentVersion: "1.0.0" });
 assert.equal(noRelease.status, "no_release");
 assert.equal(noRelease.currentVersion, "1.0.0");
-assert.equal(noRelease.releaseUrl, "https://github.com/infera-AI/DL-Editor/releases");
+assert.equal(noRelease.releaseUrl, "https://api.infera.cn/api/infera/client/releases/latest");
 
 console.log("Update checker tests passed.");

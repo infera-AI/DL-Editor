@@ -1,9 +1,9 @@
 const https = require("https");
 
-const GITHUB_OWNER = "infera-AI";
-const GITHUB_REPO = "DL-Editor";
-const LATEST_RELEASE_API_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
-const RELEASES_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases`;
+const INFERA_API_BASE_URL = process.env.INFERA_API_BASE_URL || process.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
+const CLIENT_RELEASES_URL = `${INFERA_API_BASE_URL.replace(/\/+$/, "")}/client/releases`;
+const LATEST_RELEASE_API_URL = `${CLIENT_RELEASES_URL}/latest`;
+const RELEASES_URL = `${CLIENT_RELEASES_URL}/latest`;
 
 function normalizeVersion(value) {
   return String(value || "")
@@ -106,7 +106,7 @@ function buildUpdateResult({ currentVersion, platform = process.platform, arch =
     throw new Error("更新数据缺少版本号。");
   }
 
-  const releaseUrl = release?.html_url || `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+  const releaseUrl = release?.html_url || RELEASES_URL;
   const base = {
     currentVersion,
     latestVersion,
