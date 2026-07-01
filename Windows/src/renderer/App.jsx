@@ -726,8 +726,38 @@ function App() {
       return;
     }
 
+    markQueuedAutomationJobs(freshJobs);
     autoUploadQueueRef.current.push(...freshJobs);
     scheduleAutomationDrain();
+  }
+
+  function markQueuedAutomationJobs(nextJobs) {
+    const queuedJobIds = new Set(nextJobs.map((job) => job?.id).filter(Boolean));
+    if (!queuedJobIds.size) {
+      return;
+    }
+
+    const options = automationOptionsRef.current;
+    setJobs((current) =>
+      current.map((job) => {
+        if (!queuedJobIds.has(job.id)) {
+          return job;
+        }
+
+        const uploadQueued = Boolean(options.autoUpload && shouldAutoUploadJob(job));
+        const backupQueued = Boolean(options.autoBackup && shouldAutoBackupJob(job));
+        if (!uploadQueued && !backupQueued) {
+          return job;
+        }
+
+        return {
+          ...job,
+          ...(uploadQueued ? { autoUploadStatus: "queued" } : {}),
+          ...(backupQueued ? { autoBackupStatus: "queued" } : {}),
+          message: getAutomationQueueMessage({ backupQueued, uploadQueued })
+        };
+      })
+    );
   }
 
   function scheduleAutomationDrain(delay = 0) {
@@ -928,7 +958,10 @@ function App() {
                 ...(isAutoBackup
                   ? { autoBackupAttemptedAt: attemptedAt, autoBackupStatus: "queued" }
                   : { autoUploadAttemptedAt: attemptedAt, autoUploadStatus: "queued" }),
-                message: isAutoBackup ? "等待自动备份" : "等待自动上传"
+                message: getAutomationQueueMessage({
+                  backupQueued: isAutoBackup,
+                  uploadQueued: isAutoUpload
+                })
               }
             : job
         )
@@ -978,6 +1011,19 @@ function App() {
             status: "uploading"
           })
         );
+        if (isAutomatic) {
+          setJobs((current) =>
+            current.map((item) =>
+              item.id === job.id
+                ? {
+                    ...item,
+                    ...(isAutoBackup ? { autoBackupStatus: "uploading" } : { autoUploadStatus: "uploading" }),
+                    message: getAutomationActiveMessage({ isAutoBackup, isAutoUpload })
+                  }
+                : item
+            )
+          );
+        }
         const result = await dlEditor.uploadInferaVideo({
           durationSeconds: job.duration,
           durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
@@ -3211,6 +3257,29 @@ function hasPendingAutomationActions(job, options) {
   return Boolean((options?.autoUpload && shouldAutoUploadJob(job)) || (options?.autoBackup && shouldAutoBackupJob(job)));
 }
 
+function getAutomationQueueMessage({ backupQueued, uploadQueued }) {
+  if (uploadQueued && backupQueued) {
+    return "等待自动上传/备份";
+  }
+  if (uploadQueued) {
+    return "等待自动上传";
+  }
+  if (backupQueued) {
+    return "等待自动备份";
+  }
+  return "";
+}
+
+function getAutomationActiveMessage({ isAutoBackup, isAutoUpload }) {
+  if (isAutoBackup) {
+    return "正在自动备份";
+  }
+  if (isAutoUpload) {
+    return "正在自动上传";
+  }
+  return "正在上传";
+}
+
 function prepareBackupJob(job) {
   return {
     ...job,
@@ -3809,6 +3878,9 @@ function normalizeJobTransferStatus(kind, status) {
 }
 
 function formatJobTransferStatusLabel(kind, status) {
+  if (status === "uploading" || status === "processing") {
+    return kind === "backup" ? "备份中" : "上传中";
+  }
   const action = kind === "backup" ? "备份" : "上传";
   if (status === "done") return `${action}完成`;
   if (status === "queued") return `${action}排队`;

@@ -2201,6 +2201,12 @@ button:disabled {
   color: var(--success);
 }
 
+.transfer-status-chip.uploading,
+.transfer-status-chip.processing {
+  background: #d8f0ee;
+  color: var(--accent-strong);
+}
+
 .transfer-status-chip.upload_error,
 .transfer-status-chip.backup_error,
 .transfer-status-chip.error {
