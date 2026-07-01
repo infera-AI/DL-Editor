@@ -2198,9 +2198,36 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
   const startedAt = Date.now();
 
   try {
-    const segmented = options.enableSegmentation
-      ? await transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo)
-      : false;
+    let segmented = false;
+    if (options.enableSegmentation) {
+      try {
+        segmented = await transcodeSegmentedJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo);
+      } catch (error) {
+        if (cancelRequested || encoder === "libx264" || options.processingDevice === "cpu") {
+          throw error;
+        }
+
+        if (fs.existsSync(outputPath)) {
+          fs.rmSync(outputPath, { force: true });
+        }
+
+        emitJobUpdate({
+          id: job.id,
+          status: "processing",
+          progress: 0,
+          duration,
+          outputPath,
+          startedAt,
+          ...buildTimingPayload(startedAt, duration, 0),
+          estimatedRemainingMs: null,
+          ...getEncodingPayload(encoder),
+          message: `GPU segmented unavailable, retrying ${encoder}`
+        });
+
+        await runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo);
+        segmented = true;
+      }
+    }
 
     if (!segmented) {
       await runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo);
