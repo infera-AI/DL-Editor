@@ -281,6 +281,34 @@ function emitUploadProgress(sender, payload) {
   sender.send("infera:upload-progress", payload);
 }
 
+function createTransferSpeedMeter(initialBytes = 0) {
+  let lastBytes = Math.max(0, Number(initialBytes) || 0);
+  let lastAt = Date.now();
+  let speedBytesPerSecond = 0;
+
+  return {
+    reset(bytes = lastBytes) {
+      lastBytes = Math.max(0, Number(bytes) || 0);
+      lastAt = Date.now();
+      speedBytesPerSecond = 0;
+    },
+    sample(bytes) {
+      const currentBytes = Math.max(0, Number(bytes) || 0);
+      const now = Date.now();
+      const elapsedMs = now - lastAt;
+      const deltaBytes = currentBytes - lastBytes;
+
+      if (elapsedMs >= 250 || deltaBytes <= 0) {
+        speedBytesPerSecond = elapsedMs > 0 && deltaBytes > 0 ? Math.round(deltaBytes / (elapsedMs / 1000)) : 0;
+        lastBytes = currentBytes;
+        lastAt = now;
+      }
+
+      return speedBytesPerSecond;
+    }
+  };
+}
+
 function isRawDataVideoUploadPath(value) {
   try {
     const target = new URL(resolveInferaUrl(value || RAW_DATA_VIDEO_UPLOAD_PATH));
@@ -448,6 +476,23 @@ function wakeUploadPauseWaiters(uploadRecord) {
   }
 }
 
+function pauseUploadStreamIfNeeded(uploadRecord, stream) {
+  if (!uploadRecord?.paused || !stream) {
+    return;
+  }
+
+  stream.pause();
+  waitUntilUploadCanSend(uploadRecord)
+    .then(() => {
+      if (!uploadRecord.canceled) {
+        stream.resume();
+      }
+    })
+    .catch((error) => {
+      stream.destroy(error);
+    });
+}
+
 function hashFileSha256({ filePath, uploadRecord }) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash("sha256");
@@ -459,6 +504,7 @@ function hashFileSha256({ filePath, uploadRecord }) {
         return;
       }
       hash.update(chunk);
+      pauseUploadStreamIfNeeded(uploadRecord, stream);
     });
     stream.on("error", (error) => {
       uploadRecord.stream = null;
@@ -490,12 +536,13 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     const transport = target.protocol === "https:" ? https : http;
     let settled = false;
     let bytesUploaded = 0;
-    const uploadStartedAt = Date.now();
+    const speedMeter = createTransferSpeedMeter();
     const uploadRecord = {
       canceled: false,
       paused: false,
       pausedAt: null,
       pausedMs: 0,
+      pauseWaiters: [],
       request: null,
       sendProgress: null,
       stream: null,
@@ -515,18 +562,43 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     };
 
     const sendProgress = (status, extra = {}) => {
-      const currentPausedMs = uploadRecord.paused && uploadRecord.pausedAt ? Date.now() - uploadRecord.pausedAt : 0;
-      const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt - uploadRecord.pausedMs - currentPausedMs) / 1000);
+      const {
+        bytesUploaded: extraBytesUploaded,
+        message: extraMessage,
+        percent: extraPercent,
+        speedBytesPerSecond: extraSpeedBytesPerSecond,
+        ...rest
+      } = extra;
+      const progressStatus = uploadRecord.paused && status === "uploading" ? "paused" : status;
+      const progressBytes = Math.max(0, Number(extraBytesUploaded ?? bytesUploaded) || 0);
+      const explicitSpeed = Number(extraSpeedBytesPerSecond);
+      const speedBytesPerSecond =
+        progressStatus === "uploading"
+          ? Number.isFinite(explicitSpeed) && explicitSpeed > 0
+            ? Math.round(explicitSpeed)
+            : speedMeter.sample(progressBytes)
+          : 0;
+
+      if (progressStatus !== "uploading") {
+        speedMeter.reset(progressBytes);
+      }
+
       emitUploadProgress(sender, {
-        bytesUploaded,
+        ...rest,
+        bytesUploaded: progressBytes,
         filePath,
         jobId,
-        percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
-        speedBytesPerSecond: status === "paused" ? 0 : Math.round(bytesUploaded / elapsedSeconds),
-        status,
+        message: progressStatus === "paused" ? "上传已暂停" : extraMessage,
+        percent:
+          Number.isFinite(Number(extraPercent)) && Number(extraPercent) >= 0
+            ? Math.min(100, Math.round(Number(extraPercent)))
+            : stats.size > 0
+              ? Math.min(100, Math.round((progressBytes / stats.size) * 100))
+              : 100,
+        speedBytesPerSecond,
+        status: progressStatus,
         totalBytes: stats.size,
-        uploadId,
-        ...extra
+        uploadId
       });
     };
     uploadRecord.sendProgress = sendProgress;
@@ -574,6 +646,7 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       sendProgress("canceled", { message: "上传已取消" });
       uploadRecord.stream?.destroy(new Error("上传已取消"));
       request.destroy(new Error("上传已取消"));
+      wakeUploadPauseWaiters(uploadRecord);
     };
     uploadRecord.pause = () => {
       if (uploadRecord.canceled || uploadRecord.paused) {
@@ -596,7 +669,8 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       }
       uploadRecord.pausedAt = null;
       uploadRecord.stream?.resume();
-      sendProgress("uploading", { message: "继续上传" });
+      wakeUploadPauseWaiters(uploadRecord);
+      sendProgress("uploading", { message: "正在上传" });
     };
 
     if (uploadId) {
@@ -617,6 +691,7 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       .on("data", (chunk) => {
         bytesUploaded += chunk.length;
         sendProgress("uploading");
+        pauseUploadStreamIfNeeded(uploadRecord, uploadRecord.stream);
       })
       .on("error", (error) => {
         request.destroy(error);
@@ -686,8 +761,9 @@ function uploadResumableVideoPart({ filePath, jobId, partNumber, sender, token, 
       uploadRecord.bytesUploaded = uploadedBeforePart + bytesSent;
       uploadRecord.sendProgress?.("uploading", {
         bytesUploaded: uploadRecord.bytesUploaded,
-        message: partNumber > 1 ? "继续上传" : "正在上传"
+        message: "正在上传"
       });
+      pauseUploadStreamIfNeeded(uploadRecord, stream);
     });
     stream.on("error", (error) => {
       request.destroy(error);
@@ -718,7 +794,7 @@ function abortResumableUploadSession(uploadRecord) {
 async function uploadResumableVideo({ config, fields, filePath, fileName, jobId, sender, token, uploadId }) {
   const stats = fs.statSync(filePath);
   const sessionKey = getRawDataUploadSessionKey({ fileName, filePath, kind: config.kind, stats });
-  const uploadStartedAt = Date.now();
+  const speedMeter = createTransferSpeedMeter();
   const uploadRecord = {
     abortUrl: null,
     bytesUploaded: 0,
@@ -737,19 +813,43 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     uploadToken: null
   };
   const sendProgress = (status, extra = {}) => {
-    const currentPausedMs = uploadRecord.paused && uploadRecord.pausedAt ? Date.now() - uploadRecord.pausedAt : 0;
-    const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt - uploadRecord.pausedMs - currentPausedMs) / 1000);
-    const bytesUploaded = Number(extra.bytesUploaded ?? uploadRecord.bytesUploaded) || 0;
+    const {
+      bytesUploaded: extraBytesUploaded,
+      message: extraMessage,
+      percent: extraPercent,
+      speedBytesPerSecond: extraSpeedBytesPerSecond,
+      ...rest
+    } = extra;
+    const progressStatus = uploadRecord.paused && status === "uploading" ? "paused" : status;
+    const bytesUploaded = Math.max(0, Number(extraBytesUploaded ?? uploadRecord.bytesUploaded) || 0);
+    const explicitSpeed = Number(extraSpeedBytesPerSecond);
+    const speedBytesPerSecond =
+      progressStatus === "uploading"
+        ? Number.isFinite(explicitSpeed) && explicitSpeed > 0
+          ? Math.round(explicitSpeed)
+          : speedMeter.sample(bytesUploaded)
+        : 0;
+
+    if (progressStatus !== "uploading") {
+      speedMeter.reset(bytesUploaded);
+    }
+
     emitUploadProgress(sender, {
+      ...rest,
       bytesUploaded,
       filePath,
       jobId,
-      percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
-      speedBytesPerSecond: status === "paused" ? 0 : Math.round(bytesUploaded / elapsedSeconds),
-      status,
+      message: progressStatus === "paused" ? "上传已暂停" : extraMessage,
+      percent:
+        Number.isFinite(Number(extraPercent)) && Number(extraPercent) >= 0
+          ? Math.min(100, Math.round(Number(extraPercent)))
+          : stats.size > 0
+            ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100))
+            : 100,
+      speedBytesPerSecond,
+      status: progressStatus,
       totalBytes: stats.size,
-      uploadId,
-      ...extra
+      uploadId
     });
   };
   uploadRecord.sendProgress = sendProgress;
@@ -784,7 +884,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     uploadRecord.pausedAt = null;
     uploadRecord.stream?.resume();
     wakeUploadPauseWaiters(uploadRecord);
-    sendProgress("uploading", { message: "继续上传" });
+    sendProgress("uploading", { message: "正在上传" });
   };
   activeUploadRequests.set(uploadId, uploadRecord);
 
@@ -796,9 +896,11 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     }
     sendProgress("uploading", { bytesUploaded: 0, message: "正在校验文件" });
     const sha256 = await hashFileSha256({ filePath, uploadRecord });
+    await waitUntilUploadCanSend(uploadRecord);
     if (config.deduplicatePath) {
       uploadRecord.phase = "checking";
       sendProgress("uploading", { bytesUploaded: 0, message: "正在检查重复文件" });
+      await waitUntilUploadCanSend(uploadRecord);
       const duplicate = await requestUploadJson({
         body: { sha256, sizeBytes: stats.size },
         token,
@@ -828,6 +930,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       sendProgress("uploading", { bytesUploaded: 0, message: "正在准备分片上传" });
     }
 
+    await waitUntilUploadCanSend(uploadRecord);
     let session = sessions[sessionKey]?.uploadToken
       ? await requestUploadJson({
           body: { uploadToken: sessions[sessionKey].uploadToken },
@@ -853,6 +956,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       } else {
         initBody.startTimestampMs = fields.start_timestamp_ms;
       }
+      await waitUntilUploadCanSend(uploadRecord);
       session = await requestUploadJson({
         body: initBody,
         token,
@@ -876,7 +980,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     let uploadedBytes = Number(session.uploadedBytes) || 0;
     uploadRecord.phase = "uploading";
     uploadRecord.bytesUploaded = uploadedBytes;
-    sendProgress("uploading", { bytesUploaded: uploadedBytes, message: uploadedBytes > 0 ? "继续上传" : "正在上传" });
+    sendProgress("uploading", { bytesUploaded: uploadedBytes, message: "正在上传" });
 
     while (uploadedBytes < stats.size) {
       if (uploadRecord.canceled) {
@@ -890,6 +994,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       const end = Math.min(stats.size - 1, start + partSize - 1);
       let lastError = null;
       for (let attempt = 1; attempt <= RESUMABLE_UPLOAD_RETRY_ATTEMPTS; attempt += 1) {
+        await waitUntilUploadCanSend(uploadRecord);
         try {
           session = await uploadResumableVideoPart({
             end,
@@ -935,6 +1040,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       });
     }
 
+    await waitUntilUploadCanSend(uploadRecord);
     sendProgress("processing", { bytesUploaded: stats.size, percent: 100, message: "文件已发送，等待服务器处理" });
     uploadRecord.phase = "completing";
     const result = await requestUploadJson({
@@ -1873,22 +1979,37 @@ function parseEncodingProgressLine(line) {
     return null;
   }
 
+  if (key === "frame") {
+    return { encodedFrames: roundEncodingMetric(value, 0) };
+  }
+
   if (key === "fps") {
-    return { encodingFps: roundEncodingMetric(value) };
+    return { reportedEncodingFps: roundEncodingMetric(value) };
   }
 
   if (key === "speed") {
-    return { encodingSpeed: roundEncodingMetric(String(value).replace(/x$/i, ""), 2) };
+    return { reportedEncodingSpeed: roundEncodingMetric(String(value).replace(/x$/i, ""), 2) };
   }
 
   return null;
 }
 
 function getEncodingPayload(encoder, stats = {}) {
+  const encodingFps = Number.isFinite(Number(stats.encodingFps))
+    ? Number(stats.encodingFps)
+    : Number.isFinite(Number(stats.reportedEncodingFps))
+      ? Number(stats.reportedEncodingFps)
+      : null;
+  const encodingSpeed = Number.isFinite(Number(stats.encodingSpeed))
+    ? Number(stats.encodingSpeed)
+    : Number.isFinite(Number(stats.reportedEncodingSpeed))
+      ? Number(stats.reportedEncodingSpeed)
+      : null;
+
   return {
     encoder,
-    encodingFps: Number.isFinite(Number(stats.encodingFps)) ? Number(stats.encodingFps) : null,
-    encodingSpeed: Number.isFinite(Number(stats.encodingSpeed)) ? Number(stats.encodingSpeed) : null,
+    encodingFps,
+    encodingSpeed,
     hardwareEncoding: encoder !== "libx264"
   };
 }
@@ -1910,6 +2031,31 @@ function buildTimingPayload(startedAt, duration, currentTime) {
     elapsedSeconds: Math.round((elapsedMs / 1000) * 10) / 10,
     pausedMs,
     estimatedRemainingMs
+  };
+}
+
+function getEncodingStatsFromProgress({ currentTime, encodedFrames, outputFps, startedAt }) {
+  const elapsedMs = Math.max(0, Date.now() - startedAt - getPausedMsSince(startedAt));
+  const elapsedSeconds = elapsedMs / 1000;
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    return {};
+  }
+
+  const targetFps = Number(outputFps);
+  const processedSeconds = Math.max(0, Number(currentTime) || 0);
+  const processedFrames =
+    Number.isFinite(Number(encodedFrames)) && Number(encodedFrames) > 0
+      ? Number(encodedFrames)
+      : Number.isFinite(targetFps) && targetFps > 0
+        ? processedSeconds * targetFps
+        : null;
+
+  return {
+    encodingFps:
+      Number.isFinite(Number(processedFrames)) && Number(processedFrames) > 0
+        ? roundEncodingMetric(Number(processedFrames) / elapsedSeconds)
+        : null,
+    encodingSpeed: processedSeconds > 0 ? roundEncodingMetric(processedSeconds / elapsedSeconds, 2) : null
   };
 }
 
@@ -2002,6 +2148,12 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
         const progressInfo = parseProgressLine(line, duration);
         if (progressInfo !== null) {
           const timing = buildTimingPayload(startedAt, duration, progressInfo.currentTime);
+          const currentEncodingStats = getEncodingStatsFromProgress({
+            currentTime: progressInfo.currentTime,
+            encodedFrames: encodingStats.encodedFrames,
+            outputFps: options.fps,
+            startedAt
+          });
 
           emitJobUpdate({
             id: job.id,
@@ -2012,7 +2164,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
             ...timing,
             startedAt,
             outputPath,
-            ...getEncodingPayload(encoder, encodingStats),
+            ...getEncodingPayload(encoder, { ...encodingStats, ...currentEncodingStats }),
             message: getActiveJobMessage(`Using ${encoder}`)
           });
         }
@@ -2276,14 +2428,12 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
   let nextIndex = 0;
   let completedSegments = 0;
 
-  function getAggregateEncodingStats() {
-    const stats = [...encodingStatsBySegment.values()].filter(Boolean);
-    const encodingFps = stats.reduce((sum, item) => sum + (Number(item.encodingFps) || 0), 0);
-    const encodingSpeed = stats.reduce((sum, item) => sum + (Number(item.encodingSpeed) || 0), 0);
-    return {
-      encodingFps: roundEncodingMetric(encodingFps),
-      encodingSpeed: roundEncodingMetric(encodingSpeed, 2)
-    };
+  function getAggregateEncodingStats(currentTime) {
+    return getEncodingStatsFromProgress({
+      currentTime,
+      outputFps: options.fps,
+      startedAt
+    });
   }
 
   function emitAggregate(message) {
@@ -2302,7 +2452,7 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
       ...timing,
       startedAt,
       outputPath,
-      ...getEncodingPayload(encoder, getAggregateEncodingStats()),
+      ...getEncodingPayload(encoder, getAggregateEncodingStats(currentTime)),
       message: getActiveJobMessage(message)
     });
   }

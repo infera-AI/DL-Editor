@@ -109,7 +109,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-06-23",
+  updatedAt: "2026-07-01",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -392,6 +392,8 @@ function App() {
     message: ""
   });
   const uploadCancelRequestedRef = useRef(false);
+  const uploadPauseRequestedRef = useRef(false);
+  const uploadPauseWaitersRef = useRef([]);
   const jobsRef = useRef(jobs);
   const uploadStateRef = useRef(uploadState);
   const authStateRef = useRef(authState);
@@ -858,6 +860,19 @@ function App() {
     setNotice(snapshot.message);
   }
 
+  function wakeUploadPauseWaiters() {
+    const waiters = uploadPauseWaitersRef.current.splice(0);
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  async function waitWhileUploadPaused() {
+    while (uploadPauseRequestedRef.current && !uploadCancelRequestedRef.current) {
+      await new Promise((resolve) => uploadPauseWaitersRef.current.push(resolve));
+    }
+  }
+
   async function uploadJobsToRepository(
     rawJobs,
     {
@@ -901,6 +916,8 @@ function App() {
     const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const retryOptions = { autoClearLocal, clearLocalTarget, destination, endpoint, mode };
     uploadCancelRequestedRef.current = false;
+    uploadPauseRequestedRef.current = false;
+    wakeUploadPauseWaiters();
     if (isAutomatic) {
       const attemptedAt = new Date().toISOString();
       setJobs((current) =>
@@ -946,6 +963,10 @@ function App() {
         if (uploadCancelRequestedRef.current) {
           throw new Error("上传已取消");
         }
+        await waitWhileUploadPaused();
+        if (uploadCancelRequestedRef.current) {
+          throw new Error("上传已取消");
+        }
 
         setUploadState((current) =>
           markUploadItem(current, job.id, {
@@ -983,6 +1004,7 @@ function App() {
             estimatedRemainingMs: 0,
             message: doneMessage,
             percent: 100,
+            speedBytesPerSecond: 0,
             status: "done"
           });
         });
@@ -1043,6 +1065,7 @@ function App() {
                   elapsedMs: item.startedAt ? getUploadItemElapsedMs(item, now) : item.elapsedMs,
                   estimatedRemainingMs: null,
                   message: item.status === "uploading" || item.status === "processing" ? message : item.message,
+                  speedBytesPerSecond: 0,
                   status: canceled ? "canceled" : item.status === "queued" ? "queued" : transferErrorStatus
                 }
           )
@@ -1117,17 +1140,21 @@ function App() {
     if (!isUploadPausable(uploadState) || !uploadState.uploadId) return;
     const uploadId = uploadState.uploadId;
     const shouldResume = uploadState.status === "paused";
+    uploadPauseRequestedRef.current = !shouldResume;
+    if (shouldResume) {
+      wakeUploadPauseWaiters();
+    }
     setUploadState((current) => ({
       ...current,
       status: shouldResume ? "uploading" : "paused",
       visible: true,
-      message: shouldResume ? "继续上传" : "上传已暂停",
+      message: shouldResume ? "正在上传" : "上传已暂停",
       items: current.items.map((item) =>
         item.status === "uploading" || item.status === "processing" || item.status === "paused"
           ? {
               ...item,
-              message: shouldResume ? "继续上传" : "上传已暂停",
-              speedBytesPerSecond: shouldResume ? item.speedBytesPerSecond : 0,
+              message: shouldResume ? "正在上传" : "上传已暂停",
+              speedBytesPerSecond: 0,
               status: shouldResume ? "uploading" : "paused"
             }
           : item
@@ -1141,6 +1168,25 @@ function App() {
         await dlEditor.pauseInferaUpload(uploadId);
       }
     } catch (error) {
+      uploadPauseRequestedRef.current = shouldResume;
+      if (!uploadPauseRequestedRef.current) {
+        wakeUploadPauseWaiters();
+      }
+      setUploadState((current) => ({
+        ...current,
+        status: shouldResume ? "paused" : "uploading",
+        message: shouldResume ? "上传已暂停" : "正在上传",
+        items: current.items.map((item) =>
+          item.status === "uploading" || item.status === "paused"
+            ? {
+                ...item,
+                message: shouldResume ? "上传已暂停" : "正在上传",
+                speedBytesPerSecond: 0,
+                status: shouldResume ? "paused" : "uploading"
+              }
+            : item
+        )
+      }));
       setNotice(error.message || (shouldResume ? "继续上传失败" : "暂停上传失败"));
     }
   }
@@ -1149,6 +1195,8 @@ function App() {
     if (!isUploadActive(uploadState) || !uploadState.uploadId) return;
     const uploadId = uploadState.uploadId;
     uploadCancelRequestedRef.current = true;
+    uploadPauseRequestedRef.current = false;
+    wakeUploadPauseWaiters();
     setUploadState((current) => ({
       ...current,
       status: "canceling",
@@ -1156,7 +1204,7 @@ function App() {
       message: "正在取消上传",
       items: current.items.map((item) =>
         item.status === "uploading" || item.status === "processing" || item.status === "paused"
-          ? { ...item, status: "canceling", message: "正在取消" }
+          ? { ...item, status: "canceling", message: "正在取消", speedBytesPerSecond: 0 }
           : item
       )
     }));
@@ -2930,8 +2978,11 @@ function applyUploadProgress(state, progress) {
     return state;
   }
 
-  const status = progress.status || "uploading";
-  const message = progress.message || (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
+  const incomingStatus = progress.status || "uploading";
+  const status = state.status === "paused" && incomingStatus === "uploading" ? "paused" : incomingStatus;
+  const message =
+    normalizeUploadProgressMessage(progress.message, status) ||
+    (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
   const now = Date.now();
   const nextItems = state.items.map((item) => {
     const matches = progress.jobId ? item.jobId === progress.jobId : item.path === progress.filePath;
@@ -2942,7 +2993,7 @@ function applyUploadProgress(state, progress) {
     const startedAt = item.startedAt || now;
     const bytesUploaded = Number(progress.bytesUploaded) || item.bytesUploaded;
     const totalBytes = Number(progress.totalBytes) || item.totalBytes;
-    const speedBytesPerSecond = Number(progress.speedBytesPerSecond) || 0;
+    const speedBytesPerSecond = status === "uploading" ? Number(progress.speedBytesPerSecond) || 0 : 0;
     const elapsedMs = status === "paused" ? getUploadItemElapsedMs(item, now) : Math.max(getUploadItemElapsedMs(item, now), now - startedAt);
 
     return {
@@ -2980,11 +3031,27 @@ function getNextUploadPanelStatus(currentStatus, progressStatus) {
     return "canceling";
   }
 
+  if (currentStatus === "paused" && progressStatus === "uploading") {
+    return "paused";
+  }
+
   if (progressStatus === "paused" || progressStatus === "uploading") {
     return progressStatus;
   }
 
   return currentStatus;
+}
+
+function normalizeUploadProgressMessage(message, status) {
+  if (status === "paused") {
+    return "上传已暂停";
+  }
+
+  if (status === "uploading" && message === "继续上传") {
+    return "正在上传";
+  }
+
+  return message;
 }
 
 function getUploadOverallPercent(state) {
@@ -3075,11 +3142,7 @@ function getUploadCurrentSpeed(state) {
     return 0;
   }
 
-  const activeItem =
-    state.items.find(
-      (item) => item.status === "uploading" || item.status === "processing" || item.status === "paused" || item.status === "canceling"
-    ) ||
-    [...state.items].reverse().find((item) => item.speedBytesPerSecond > 0);
+  const activeItem = state.items.find((item) => item.status === "uploading" && item.speedBytesPerSecond > 0);
   return activeItem?.speedBytesPerSecond || 0;
 }
 
@@ -3648,7 +3711,7 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
                 <span className="start-time-label">开始时间</span>
                 <span className="start-time-value">{formatDateTime(startTimeMs)}</span>
               </button>
-              <span className="frame-rate-chip" title="当前帧率">
+              <span className="frame-rate-chip" title="源视频帧率">
                 <Gauge size={12} />
                 <span>{job.frameRateLabel || "fps --"}</span>
               </span>
