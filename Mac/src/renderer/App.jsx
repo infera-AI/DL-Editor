@@ -54,10 +54,11 @@ const LEGACY_THEME_STORAGE_KEY = "dl-editor-theme";
 const AUTH_STORAGE_KEY = "dl-studio-auth";
 const AUTOMATION_STORAGE_KEY = "dl-studio-editor-automation";
 const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
+const DL_ENGINE_API_BASE_URL = import.meta.env.VITE_DL_ENGINE_API_BASE_URL || "http://127.0.0.1:8787";
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
 const RAW_DATA_LIST_PATH = "/memory/raw-data";
 const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
-const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine"];
+const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine", "Research"];
 const ENGINE_PASSWORD = "111111";
 const DEFAULT_AUTOMATION_OPTIONS = {
   autoUpload: false,
@@ -94,6 +95,8 @@ const CLOUD_SPACES = [
   { id: "repository", label: "DL Repository" },
   { id: "rawdata", label: "DL Rawdata" }
 ];
+const RESEARCH_PARSE_STATUSES = ["PARSED", "FALLBACK_PARSED", "PARTIAL_PARSED"];
+const RESEARCH_PAGE_SIZE = 200;
 const UPLOAD_STATUS_LABELS = {
   queued: "等待上传",
   uploading: "上传中",
@@ -137,6 +140,10 @@ const dlEditor = window.dlEditor || {
   resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
   checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
+  getEngineMediaProxyUrl: async () => "",
+  streamEngineQa: async () => ({ ok: false }),
+  cancelEngineQaStream: async () => ({ cancelled: false }),
+  onEngineQaStreamEvent: () => () => undefined,
   uploadInferaVideo: async () => ({}),
   cancelInferaUpload: async () => ({ canceled: false }),
   pauseInferaUpload: async () => ({ paused: false }),
@@ -221,6 +228,21 @@ function resolveInferaUrl(value) {
   }
 }
 
+function resolveInferaAdminUrl(value) {
+  if (!value) return "";
+  const rawPath = String(value);
+  if (/^https?:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+
+  try {
+    const apiUrl = new URL(INFERA_API_BASE_URL);
+    return new URL(rawPath.replace(/^\/+/, ""), `${apiUrl.origin}/`).toString();
+  } catch {
+    return rawPath;
+  }
+}
+
 async function requestInfera(path, { method = "GET", token, body, signal } = {}) {
   if (typeof dlEditor.requestInfera === "function") {
     return unwrapInferaResult(await dlEditor.requestInfera({ path, method, token, body }));
@@ -254,6 +276,191 @@ async function requestInfera(path, { method = "GET", token, body, signal } = {})
   }
 
   return unwrapInferaResult(payload);
+}
+
+function resolveEngineUrl(value) {
+  if (!value) return "";
+  const rawPath = String(value);
+  if (/^https?:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+
+  const normalizedBase = DL_ENGINE_API_BASE_URL.replace(/\/+$/, "");
+  const normalizedPath = rawPath.replace(/^\/+/, "");
+  try {
+    return new URL(normalizedPath, `${normalizedBase}/`).toString();
+  } catch {
+    return rawPath;
+  }
+}
+
+async function requestEngine(path, { method = "GET", body, signal } = {}) {
+  if (typeof dlEditor.requestEngine === "function") {
+    return dlEditor.requestEngine({ path, method, body });
+  }
+
+  const headers = { Accept: "application/json" };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const response = await fetch(resolveEngineUrl(path), {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal
+  });
+
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const detail = payload?.message || payload?.detail || payload?.title || text || `DL Engine 请求失败 (${response.status})`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+
+  return payload;
+}
+
+function createEngineQaStreamId() {
+  return `qa-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function streamEngineQa(body, onEvent) {
+  if (
+    typeof dlEditor.streamEngineQa === "function" &&
+    typeof dlEditor.onEngineQaStreamEvent === "function"
+  ) {
+    const streamId = createEngineQaStreamId();
+    const unsubscribe = dlEditor.onEngineQaStreamEvent(streamId, onEvent);
+    try {
+      await dlEditor.streamEngineQa({ streamId, body });
+    } finally {
+      unsubscribe?.();
+    }
+    return;
+  }
+
+  const response = await requestEngine("/v1/qa", {
+    method: "POST",
+    body: { ...body, response_mode: "json" }
+  });
+  onEvent({
+    event: "answer_start",
+    data: {
+      index_watermark: response?.index_watermark,
+      plan: response?.plan,
+      query_id: response?.query_id
+    }
+  });
+  onEvent({ event: "search.plan", data: response?.plan || null });
+  onEvent({ event: "citations", data: response?.citations || [] });
+  onEvent({ event: "evidence_reasoning", data: response?.evidence_reasoning || [] });
+  onEvent({ event: "retrieval_results", data: response?.retrieval_results || [] });
+  onEvent({
+    event: "done",
+    data: {
+      answer: response?.answer || "",
+      confidence: response?.confidence,
+      evidence_reasoning: response?.evidence_reasoning || [],
+      retrieval_results: response?.retrieval_results || [],
+      refined: response?.refined || false
+    }
+  });
+}
+
+function mergeEngineQaResponse(currentResponse, patch) {
+  return { ...(currentResponse || {}), ...patch };
+}
+
+async function requestResearchAdmin(path, { method = "GET", body, form, responseType = "json" } = {}) {
+  if (typeof dlEditor.requestInfera === "function") {
+    return dlEditor.requestInfera({
+      admin: true,
+      body,
+      form,
+      method,
+      path,
+      redirect: responseType === "text" ? "manual" : undefined,
+      responseType
+    });
+  }
+
+  const headers = { Accept: responseType === "download" ? "application/json, application/zip" : "application/json" };
+  const options = {
+    credentials: "include",
+    method,
+    headers
+  };
+  if (form !== undefined) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    options.body = new URLSearchParams(form).toString();
+  } else if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(resolveInferaAdminUrl(path), options);
+  if (responseType === "text") {
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(text || `请求失败 (${response.status})`);
+    }
+    return { status: response.status, text };
+  }
+
+  if (responseType === "download") {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const payload = await response.json();
+      if (!response.ok) {
+        const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return payload;
+    }
+    const blob = await response.blob();
+    if (!response.ok) {
+      throw new Error(`请求失败 (${response.status})`);
+    }
+    return {
+      blob,
+      content_type: contentType || "application/zip",
+      delivery: "direct",
+      filename: getResearchDownloadFilename(response.headers.get("content-disposition")),
+      size_bytes: blob.size
+    };
+  }
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return payload;
+}
+
+function getResearchDownloadFilename(disposition, fallback = "research-videos.zip") {
+  const text = String(disposition || "");
+  const utf8Match = text.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  return text.match(/filename="?([^";]+)"?/i)?.[1] || fallback;
 }
 
 function normalizeAuthPayload(result, fallbackAccountName = "") {
@@ -428,6 +635,9 @@ function App() {
   const [engineUnlocked, setEngineUnlocked] = useState(false);
   const [enginePassword, setEnginePassword] = useState("");
   const [engineError, setEngineError] = useState("");
+  const [researchUnlocked, setResearchUnlocked] = useState(false);
+  const [researchPassword, setResearchPassword] = useState("");
+  const [researchError, setResearchError] = useState("");
   const [authState, setAuthState] = useState(readStoredAuth);
   const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
@@ -624,7 +834,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (activeNav !== "Cloud") {
+    const shouldLoadCloudRepository = activeNav === "Cloud";
+    if (!shouldLoadCloudRepository) {
       return;
     }
 
@@ -1535,6 +1746,23 @@ function App() {
     setEngineError("密码错误");
   }
 
+  function lockEngine() {
+    setEngineUnlocked(false);
+    setEnginePassword("");
+    setEngineError("");
+  }
+
+  function unlockResearch() {
+    if (researchPassword === ENGINE_PASSWORD) {
+      setResearchUnlocked(true);
+      setResearchPassword("");
+      setResearchError("");
+      return;
+    }
+
+    setResearchError("密码错误");
+  }
+
   return (
     <>
       <main
@@ -1825,7 +2053,7 @@ function App() {
         />
       ) : activeNav === "Engine" ? (
         engineUnlocked ? (
-          <PlaceholderPage title="DL Engine" />
+          <EngineWorkspace onLock={lockEngine} />
         ) : (
           <EngineGate
             error={engineError}
@@ -1835,6 +2063,22 @@ function App() {
             }}
             onSubmit={unlockEngine}
             value={enginePassword}
+          />
+        )
+      ) : activeNav === "Research" ? (
+        researchUnlocked ? (
+          <ResearchExportWorkspace />
+        ) : (
+          <EngineGate
+            error={researchError}
+            label="Research"
+            onChange={(value) => {
+              setResearchPassword(value);
+              setResearchError("");
+            }}
+            onSubmit={unlockResearch}
+            title="DL Research"
+            value={researchPassword}
           />
         )
       ) : (
@@ -1886,7 +2130,7 @@ function PlaceholderPage({ title }) {
   );
 }
 
-function EngineGate({ error, onChange, onSubmit, value }) {
+function EngineGate({ error, label = "Engine", onChange, onSubmit, title = "DL Engine", value }) {
   return (
     <section className="engine-page">
       <form
@@ -1899,8 +2143,8 @@ function EngineGate({ error, onChange, onSubmit, value }) {
         <div className="engine-gate-heading">
           <LockKeyhole size={18} />
           <div>
-            <strong>DL Engine</strong>
-            <span>Engine</span>
+            <strong>{title}</strong>
+            <span>{label}</span>
           </div>
         </div>
         <label className="login-field">
@@ -1923,6 +2167,1401 @@ function EngineGate({ error, onChange, onSubmit, value }) {
         </button>
       </form>
     </section>
+  );
+}
+
+function getEngineErrorMessage(error) {
+  const message = String(error?.message || error || "").trim();
+  if (/fetch failed|ECONNREFUSED|Failed to fetch|NetworkError|Load failed/i.test(message)) {
+    return "DL Engine API 未连接";
+  }
+  return message || "DL Engine 请求失败";
+}
+
+function getEngineStatusLabel(status) {
+  if (status === "online") return "Online";
+  if (status === "checking") return "Checking";
+  if (status === "offline") return "Offline";
+  return "Engine";
+}
+
+function getEngineStatusDetail(engineStatus) {
+  if (engineStatus.status === "online") {
+    const health = engineStatus.health || {};
+    return [health.pipeline_version, health.storage, health.vespa_search].filter(Boolean).join(" · ") || "Ready";
+  }
+  return engineStatus.message || "Waiting";
+}
+
+function formatEngineTimeRange(range) {
+  if (!range?.start) {
+    return "";
+  }
+
+  const options = {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "2-digit"
+  };
+  const start = new Date(range.start).toLocaleString("zh-CN", options);
+  const end = range.end ? new Date(range.end).toLocaleString("zh-CN", options) : "";
+  return end ? `${start} - ${end}` : start;
+}
+
+function getEngineSourceLabel(type) {
+  const labels = {
+    event: "记忆事件",
+    memory_event: "记忆事件",
+    span: "证据片段",
+    evidence_span: "证据片段",
+    summary: "记忆摘要",
+    memory_summary: "记忆摘要",
+    timeseries: "时序信号",
+    signal_episode: "信号片段"
+  };
+  return labels[type] || type || "证据";
+}
+
+function getEngineConfidenceLabel(value) {
+  const labels = {
+    high: "高置信度",
+    medium: "中等置信度",
+    low: "低置信度",
+    not_found: "未找到"
+  };
+  return labels[value] || value || "未知";
+}
+
+function getEngineEvidenceCountLabel(count) {
+  return `${Number(count || 0)} 条证据`;
+}
+
+function getEngineSearchSupport(response, index) {
+  return response?.debug?.result_support?.[index]?.support || "";
+}
+
+function getEnginePlanSummary(plan) {
+  if (!plan) {
+    return "";
+  }
+
+  const compiled = plan.aggregation?.compiled_query;
+  const intent = compiled?.intent || plan.intent || "";
+  const sources = (plan.sources || []).map(getEngineSourceLabel).filter(Boolean).slice(0, 4);
+  const passes = (compiled?.retrieval_passes || []).map((item) => item.name).filter(Boolean).slice(0, 4);
+  return [intent, sources.join(" / "), passes.join(" / ")].filter(Boolean).join(" · ");
+}
+
+function getEngineEntryStatusLabel(entry) {
+  if (entry.status === "loading") return "Running";
+  if (entry.status === "error") return "Error";
+  if (entry.kind === "query") return getEngineConfidenceLabel(entry.response?.confidence);
+  return `${entry.response?.results?.length || 0} hits`;
+}
+
+function getEngineRawRefFromReferences(references) {
+  for (const reference of references || []) {
+    const rawRef = (reference?.raw_refs || []).find((item) => item?.asset_id);
+    if (rawRef) {
+      return rawRef;
+    }
+  }
+  return null;
+}
+
+function getEngineMediaSeconds(value) {
+  const milliseconds = Number(value);
+  return Number.isFinite(milliseconds) && milliseconds > 0 ? milliseconds / 1000 : 0;
+}
+
+function formatEngineMediaOffset(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    return "0s";
+  }
+  return formatDurationCompact(milliseconds) || `${Math.round(milliseconds / 1000)}s`;
+}
+
+function getEngineMediaSegmentLabel(rawRef) {
+  if (!rawRef?.asset_id) {
+    return "";
+  }
+  const start = formatEngineMediaOffset(rawRef.start_offset_ms);
+  const endValue = Number(rawRef.end_offset_ms);
+  const startValue = Number(rawRef.start_offset_ms);
+  if (!Number.isFinite(endValue) || endValue <= startValue) {
+    return `${start} 开始`;
+  }
+  return `${start} - ${formatEngineMediaOffset(endValue)}`;
+}
+
+function buildEngineMediaUrl(rawRef, mediaProxyUrl) {
+  if (!rawRef?.asset_id || !mediaProxyUrl) {
+    return "";
+  }
+
+  const normalizedBase = String(mediaProxyUrl).replace(/\/+$/, "");
+  const start = getEngineMediaSeconds(rawRef.start_offset_ms);
+  const end = getEngineMediaSeconds(rawRef.end_offset_ms);
+  const mediaUrl = `${normalizedBase}/engine-media/assets/${encodeURIComponent(rawRef.asset_id)}/media?expires_seconds=600`;
+  if (end > start) {
+    return `${mediaUrl}#t=${start.toFixed(3)},${end.toFixed(3)}`;
+  }
+  if (start > 0) {
+    return `${mediaUrl}#t=${start.toFixed(3)}`;
+  }
+  return mediaUrl;
+}
+
+function EngineMediaPreview({ mediaProxyUrl, rawRef }) {
+  const [playbackFailed, setPlaybackFailed] = useState(false);
+  const [mediaState, setMediaState] = useState({ status: "idle", kind: "video" });
+  const src = rawRef?.asset_id ? buildEngineMediaUrl(rawRef, mediaProxyUrl) : "";
+
+  useEffect(() => {
+    setPlaybackFailed(false);
+    if (!src) {
+      setMediaState({ status: "idle", kind: "video" });
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    const mediaProbeUrl = src.split("#")[0];
+    setMediaState({ status: "loading", kind: "video" });
+
+    fetch(mediaProbeUrl, { method: "HEAD", signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`media unavailable (${response.status})`);
+        }
+        const contentType = response.headers.get("content-type") || "";
+        setMediaState({
+          status: "ready",
+          kind: contentType.startsWith("audio/") ? "audio" : "video"
+        });
+      })
+      .catch((error) => {
+        if (error?.name !== "AbortError") {
+          setMediaState({ status: "error", kind: "video" });
+        }
+      });
+
+    return () => controller.abort();
+  }, [src]);
+
+  if (!rawRef?.asset_id) {
+    return null;
+  }
+
+  return (
+    <div className="engine-media-preview">
+      <div className="engine-media-caption">
+        {mediaState.kind === "audio" ? <FileAudio size={14} /> : <Video size={14} />}
+        <span>{getEngineMediaSegmentLabel(rawRef)}</span>
+      </div>
+      {!src ? (
+        <div className="engine-media-placeholder">视频代理未就绪</div>
+      ) : mediaState.status === "loading" ? (
+        <div className="engine-media-placeholder">正在读取媒体</div>
+      ) : mediaState.status === "error" || playbackFailed ? (
+        <div className="engine-media-placeholder">媒体源暂不可用</div>
+      ) : mediaState.kind === "audio" ? (
+        <div className="engine-audio-frame">
+          <audio controls onError={() => setPlaybackFailed(true)} preload="metadata" src={src} />
+        </div>
+      ) : (
+        <div className="engine-video-frame">
+          <video controls onError={() => setPlaybackFailed(true)} preload="metadata" src={src} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EngineWorkspace({ onLock }) {
+  const [activeEngineTab, setActiveEngineTab] = useState("search");
+  const [engineView, setEngineView] = useState("workspace");
+  const [engineUseVespa, setEngineUseVespa] = useState(false);
+  const [engineInput, setEngineInput] = useState("");
+  const [searchEvents, setSearchEvents] = useState([]);
+  const [queryEvents, setQueryEvents] = useState([]);
+  const [engineStatus, setEngineStatus] = useState({ status: "checking", message: "", health: null });
+  const [engineMediaProxyUrl, setEngineMediaProxyUrl] = useState("");
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function checkHealth() {
+      try {
+        const health = await requestEngine("/healthz");
+        if (isCurrent) {
+          setEngineStatus({ status: "online", message: "", health });
+        }
+      } catch (error) {
+        if (isCurrent) {
+          setEngineStatus({ status: "offline", message: getEngineErrorMessage(error), health: null });
+        }
+      }
+    }
+
+    checkHealth();
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    async function loadMediaProxyUrl() {
+      try {
+        const proxyUrl = typeof dlEditor.getEngineMediaProxyUrl === "function" ? await dlEditor.getEngineMediaProxyUrl() : "";
+        if (isCurrent) {
+          setEngineMediaProxyUrl(proxyUrl || "");
+        }
+      } catch {
+        if (isCurrent) {
+          setEngineMediaProxyUrl("");
+        }
+      }
+    }
+
+    loadMediaProxyUrl();
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
+
+  async function refreshEngineHealth() {
+    setEngineView("workspace");
+    setEngineInput("");
+    setSearchEvents([]);
+    setQueryEvents([]);
+    setEngineStatus((current) => ({ ...current, status: "checking", message: "" }));
+    try {
+      const health = await requestEngine("/healthz");
+      setEngineStatus({ status: "online", message: "", health });
+    } catch (error) {
+      setEngineStatus({ status: "offline", message: getEngineErrorMessage(error), health: null });
+    }
+  }
+
+  function updateEngineEntry(kind, id, patch) {
+    const updater = (current) =>
+      current.map((entry) => {
+        if (entry.id !== id) {
+          return entry;
+        }
+        const nextPatch = typeof patch === "function" ? patch(entry) : patch;
+        return { ...entry, ...nextPatch };
+      });
+    if (kind === "search") {
+      setSearchEvents(updater);
+    } else {
+      setQueryEvents(updater);
+    }
+  }
+
+  function handleEngineQaStreamEvent(entryId, startedAt, message) {
+    const eventName = message?.event || "message";
+    const data = message?.data || {};
+
+    if (eventName === "answer_start") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, {
+          index_watermark: data.index_watermark,
+          plan: data.plan,
+          query_id: data.query_id
+        }),
+        status: "streaming",
+        streamStage: "evidence"
+      }));
+      return;
+    }
+
+    if (eventName === "search.plan") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, { plan: data }),
+        status: "streaming",
+        streamStage: "evidence"
+      }));
+      return;
+    }
+
+    if (eventName === "answer_delta") {
+      const text = String(data.text || "");
+      updateEngineEntry("query", entryId, (entry) => {
+        const previousAnswer = entry.response?.answer || "";
+        return {
+          response: mergeEngineQaResponse(entry.response, {
+            answer: data.replace ? text : `${previousAnswer}${text}`,
+            answer_source: data.source || entry.response?.answer_source
+          }),
+          status: "streaming",
+          streamStage: data.source === "llm" ? "llm" : "grounded"
+        };
+      });
+      return;
+    }
+
+    if (eventName === "citations") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, {
+          citations: Array.isArray(data) ? data : []
+        }),
+        status: "streaming",
+        streamStage: "evidence"
+      }));
+      return;
+    }
+
+    if (eventName === "evidence_reasoning") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, {
+          evidence_reasoning: Array.isArray(data) ? data : []
+        }),
+        status: "streaming",
+        streamStage: "reasoning"
+      }));
+      return;
+    }
+
+    if (eventName === "retrieval_results") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, {
+          retrieval_results: Array.isArray(data) ? data : []
+        }),
+        status: "streaming",
+        streamStage: "retrieval"
+      }));
+      return;
+    }
+
+    if (eventName === "refinement_error") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        response: mergeEngineQaResponse(entry.response, {
+          refinement_error: data.message || "LLM refinement unavailable"
+        }),
+        status: "streaming",
+        streamStage: "llm_error"
+      }));
+      return;
+    }
+
+    if (eventName === "done") {
+      updateEngineEntry("query", entryId, (entry) => ({
+        elapsedMs: data.latency_ms || Math.max(1, Math.round(performance.now() - startedAt)),
+        response: mergeEngineQaResponse(entry.response, {
+          answer: data.answer || entry.response?.answer || "",
+          confidence: data.confidence || entry.response?.confidence,
+          evidence_reasoning: data.evidence_reasoning || entry.response?.evidence_reasoning || [],
+          refined: Boolean(data.refined),
+          retrieval_results: data.retrieval_results || entry.response?.retrieval_results || []
+        }),
+        status: "done",
+        streamStage: data.refined ? "done_refined" : "done_grounded"
+      }));
+      return;
+    }
+
+    if (eventName === "stream_error") {
+      updateEngineEntry("query", entryId, {
+        elapsedMs: Math.max(1, Math.round(performance.now() - startedAt)),
+        error: data.message || "DL Engine QA stream failed.",
+        status: "error"
+      });
+    }
+  }
+
+  async function commitEnginePrompt(prompt) {
+    const value = String(prompt || "").trim();
+    if (!value) {
+      return;
+    }
+
+    const kind = activeEngineTab;
+    const startedAt = performance.now();
+    const entry = {
+      id: `${Date.now()}-${kind}`,
+      kind,
+      prompt: value,
+      status: "loading",
+      version: engineUseVespa ? "Vespa" : "Local",
+      versionMode: engineUseVespa ? "Vespa hybrid" : "Local multi-index",
+      scopeTitle: "DL Engine Memory",
+      time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+    };
+
+    if (kind === "search") {
+      setSearchEvents((current) => [entry, ...current].slice(0, 8));
+    } else {
+      setQueryEvents((current) => [...current, entry].slice(-8));
+    }
+
+    try {
+      if (kind === "search") {
+        const response = await requestEngine("/v1/search", {
+          method: "POST",
+          body: {
+            query: value,
+            hits: 8,
+            include_debug: true,
+            use_vespa: engineUseVespa,
+            request_id: entry.id
+          }
+        });
+
+        updateEngineEntry(kind, entry.id, {
+          elapsedMs: Math.max(1, Math.round(performance.now() - startedAt)),
+          response,
+          status: "done"
+        });
+      } else {
+        await streamEngineQa(
+          {
+            query: value,
+            response_mode: "sse",
+            include_plan: true,
+            max_answer_tokens: 1024
+          },
+          (message) => handleEngineQaStreamEvent(entry.id, startedAt, message)
+        );
+      }
+      setEngineStatus((current) => ({ status: "online", message: "", health: current.health || { status: "ok" } }));
+    } catch (error) {
+      const message = getEngineErrorMessage(error);
+      updateEngineEntry(kind, entry.id, {
+        elapsedMs: Math.max(1, Math.round(performance.now() - startedAt)),
+        error: message,
+        status: "error"
+      });
+      setEngineStatus({ status: "offline", message, health: null });
+    }
+  }
+
+  function submitEnginePrompt(event) {
+    event.preventDefault();
+    setEngineView("workspace");
+    commitEnginePrompt(engineInput);
+    setEngineInput("");
+  }
+
+  function runEngineTest() {
+    setEngineView("test");
+  }
+
+  function clearEngineWorkspace() {
+    setEngineView("workspace");
+    setEngineInput("");
+    setSearchEvents([]);
+    setQueryEvents([]);
+    refreshEngineHealth();
+  }
+
+  return (
+    <section className="engine-workspace">
+      <header className="engine-main-toolbar">
+        <div className="engine-toolbar-title">
+          <strong>DL Engine</strong>
+          <span>{getEngineStatusDetail(engineStatus)}</span>
+        </div>
+        <div aria-label="Engine mode" className="engine-tabs" role="tablist">
+          {["search", "query"].map((tab) => (
+            <button
+              aria-selected={activeEngineTab === tab}
+              className={activeEngineTab === tab ? "active" : ""}
+              key={tab}
+              onClick={() => {
+                setActiveEngineTab(tab);
+                setEngineView("workspace");
+              }}
+              role="tab"
+              type="button"
+            >
+              {tab === "search" ? <Search size={15} /> : <Sparkles size={15} />}
+              <span>{tab === "search" ? "Search" : "Query"}</span>
+            </button>
+          ))}
+        </div>
+        <div className="engine-toolbar-actions">
+          <label className="engine-vespa-toggle">
+            <input checked={engineUseVespa} onChange={(event) => setEngineUseVespa(event.target.checked)} type="checkbox" />
+            <span>Vespa</span>
+          </label>
+          <button className="engine-icon-button" onClick={clearEngineWorkspace} title="刷新" type="button">
+            <RotateCcw size={16} />
+          </button>
+          <button className="engine-icon-button" onClick={runEngineTest} title="测试" type="button">
+            <Activity size={17} />
+          </button>
+          <button className="engine-icon-button danger" onClick={onLock} title="锁定" type="button">
+            <LockKeyhole size={17} />
+          </button>
+        </div>
+      </header>
+
+      {engineView === "test" ? (
+        <section className="engine-test-view">
+          <h1>Engine Test</h1>
+        </section>
+      ) : (
+        <section className="engine-main">
+          {activeEngineTab === "search" ? (
+            <EngineSearchPanel engineMediaProxyUrl={engineMediaProxyUrl} engineStatus={engineStatus} entries={searchEvents} useVespa={engineUseVespa} />
+          ) : (
+            <EngineQueryPanel engineMediaProxyUrl={engineMediaProxyUrl} engineStatus={engineStatus} entries={queryEvents} useVespa={engineUseVespa} />
+          )}
+
+          <form className="engine-input-bar" onSubmit={submitEnginePrompt}>
+            <label className="engine-input-wrap">
+              {activeEngineTab === "search" ? <Search size={16} /> : <Sparkles size={16} />}
+              <input
+                autoComplete="off"
+                onChange={(event) => setEngineInput(event.target.value)}
+                placeholder={activeEngineTab === "search" ? "输入检索内容" : "输入问题"}
+                type="text"
+                value={engineInput}
+              />
+            </label>
+            <button className="primary-button engine-submit-button" type="submit">
+              {activeEngineTab === "search" ? <Search size={15} /> : <Play size={15} />}
+              <span>{activeEngineTab === "search" ? "Search" : "Query"}</span>
+            </button>
+          </form>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function EngineSearchPanel({ engineMediaProxyUrl, engineStatus, entries, useVespa }) {
+  return (
+    <section className="engine-presenter">
+      <div className="engine-panel-head">
+        <div>
+          <strong>Search</strong>
+          <span>{useVespa ? "Vespa hybrid" : "Local multi-index"}</span>
+        </div>
+        <span className={`engine-status-pill ${engineStatus.status}`}>{getEngineStatusLabel(engineStatus.status)}</span>
+      </div>
+      <div className="engine-result-list">
+        {entries.length === 0 ? (
+          <div className="engine-empty-state">等待检索</div>
+        ) : (
+          entries.map((entry) => (
+            <article className={`engine-result-item ${entry.status}`} key={entry.id}>
+              <div>
+                <strong>{entry.prompt}</strong>
+                <span>
+                  {entry.scopeTitle} · {entry.versionMode || entry.version} · {entry.time}
+                </span>
+                <EngineSearchEntryBody entry={entry} mediaProxyUrl={engineMediaProxyUrl} />
+              </div>
+              <b>{getEngineEntryStatusLabel(entry)}</b>
+            </article>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function EngineSearchEntryBody({ entry, mediaProxyUrl }) {
+  if (entry.status === "loading") {
+    return <p className="engine-entry-message">正在执行多索引检索...</p>;
+  }
+
+  if (entry.status === "error") {
+    return <p className="engine-entry-message error">{entry.error}</p>;
+  }
+
+  const results = entry.response?.results || [];
+  const planSummary = getEnginePlanSummary(entry.response?.debug?.query_plan);
+  if (results.length === 0) {
+    return (
+      <div className="engine-hit-stack">
+        {planSummary && <p className="engine-plan-line">{planSummary}</p>}
+        <p className="engine-entry-message">没有找到可引用证据。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="engine-hit-stack">
+      {planSummary && <p className="engine-plan-line">{planSummary}</p>}
+      {results.slice(0, 5).map((hit, index) => (
+        <EngineSearchHit hit={hit} key={hit.id || `${entry.id}-${index}`} mediaProxyUrl={mediaProxyUrl} support={getEngineSearchSupport(entry.response, index)} />
+      ))}
+    </div>
+  );
+}
+
+function EngineSearchHit({ hit, mediaProxyUrl, support }) {
+  const evidenceRefs = hit.evidence_refs || [];
+  const rawRef = getEngineRawRefFromReferences(evidenceRefs);
+  const timeRange = formatEngineTimeRange(hit.time_range);
+  const matchedFields = (hit.matched_fields || []).slice(0, 3).join(" / ");
+
+  return (
+    <article className="engine-hit">
+      <div className="engine-hit-title-row">
+        <strong>{hit.title || hit.id}</strong>
+        <span>{Number(hit.score || 0).toFixed(3)}</span>
+      </div>
+      <div className="engine-meta-row">
+        <span>{getEngineSourceLabel(hit.type)}</span>
+        {support && <span>{support}</span>}
+        {timeRange && <span>{timeRange}</span>}
+        <span>{getEngineEvidenceCountLabel(evidenceRefs.length)}</span>
+        {matchedFields && <span>{matchedFields}</span>}
+      </div>
+      {hit.snippet && <p>{hit.snippet}</p>}
+      <EngineMediaPreview mediaProxyUrl={mediaProxyUrl} rawRef={rawRef} />
+    </article>
+  );
+}
+
+function EngineQueryPanel({ engineMediaProxyUrl, engineStatus, entries, useVespa }) {
+  return (
+    <section className="engine-presenter">
+      <div className="engine-panel-head">
+        <div>
+          <strong>Query</strong>
+          <span>{useVespa ? "Vespa hybrid" : "Local multi-index"}</span>
+        </div>
+        <span className={`engine-status-pill ${engineStatus.status}`}>{getEngineStatusLabel(engineStatus.status)}</span>
+      </div>
+      <div className="engine-qa-stream">
+        {entries.length === 0 ? (
+          <div className="engine-empty-state">等待 query</div>
+        ) : (
+          entries.map((entry) => (
+            <article className="engine-qa-pair" key={entry.id}>
+              <div className="engine-question">
+                <strong>{entry.prompt}</strong>
+                <span>
+                  {entry.versionMode || entry.version} · {entry.time}
+                </span>
+              </div>
+              <div className="engine-answer">
+                <Sparkles size={15} />
+                <EngineQueryEntryBody entry={entry} mediaProxyUrl={engineMediaProxyUrl} />
+              </div>
+            </article>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function getEngineQueryStageLabel(stage) {
+  switch (stage) {
+    case "evidence":
+      return "EvidencePack 构建中";
+    case "grounded":
+      return "Grounded answer 已生成";
+    case "reasoning":
+      return "Evidence reasoning 已生成";
+    case "retrieval":
+      return "Retrieval results 已生成";
+    case "llm":
+      return "LLM refinement 流式生成中";
+    case "llm_error":
+      return "LLM refinement 不可用，保留 grounded answer";
+    case "done_refined":
+      return "最终回答已由 LLM refinement 改写并通过证据校验";
+    case "done_grounded":
+      return "最终回答来自 grounded answer";
+    default:
+      return "正在构建 evidence pack";
+  }
+}
+
+function getEngineReasoningStepLabel(step) {
+  switch (step) {
+    case "retrieval":
+      return "Retrieval";
+    case "support_check":
+      return "Support";
+    case "synthesis":
+      return "Synthesis";
+    case "gap":
+      return "Gap";
+    default:
+      return "Reasoning";
+  }
+}
+
+function getEngineSupportLabel(support) {
+  switch (support) {
+    case "direct":
+      return "direct";
+    case "inference":
+      return "inference";
+    case "near":
+      return "near";
+    case "missing":
+      return "missing";
+    case "not_found":
+      return "not found";
+    default:
+      return "support";
+  }
+}
+
+function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
+  const response = entry.response || {};
+  const citations = response.citations || [];
+  const evidenceReasoning = response.evidence_reasoning || [];
+  const retrievalResults = response.retrieval_results || [];
+  const planSummary = getEnginePlanSummary(response.plan);
+
+  if (entry.status === "loading" && !response.answer && !citations.length && !evidenceReasoning.length) {
+    return <span>正在构建 evidence pack...</span>;
+  }
+
+  if (entry.status === "error") {
+    return <span className="engine-error-text">{entry.error}</span>;
+  }
+
+  return (
+    <div className="engine-answer-content">
+      <div className="engine-meta-row">
+        <span>{getEngineConfidenceLabel(response.confidence)}</span>
+        <span>{getEngineEvidenceCountLabel(citations.length)}</span>
+        <span>{getEngineQueryStageLabel(entry.streamStage)}</span>
+        {entry.elapsedMs && <span>{entry.elapsedMs} ms</span>}
+      </div>
+      {planSummary && <p className="engine-plan-line">{planSummary}</p>}
+      <p>{response.answer || "正在等待 grounded answer..."}</p>
+      {response.refinement_error && <p className="engine-entry-message error">{response.refinement_error}</p>}
+      {evidenceReasoning.length > 0 && (
+        <div className="engine-reasoning-list">
+          {evidenceReasoning.slice(0, 8).map((step, index) => (
+            <article className="engine-reasoning-step" key={`${step.step || "step"}-${index}`}>
+              <div>
+                <strong>{getEngineReasoningStepLabel(step.step)}</strong>
+                <span>{getEngineSupportLabel(step.support)}</span>
+              </div>
+              <p>{step.claim}</p>
+              {step.reason && <small>{step.reason}</small>}
+            </article>
+          ))}
+        </div>
+      )}
+      {retrievalResults.length > 0 && (
+        <div className="engine-retrieval-result-list">
+          {retrievalResults.slice(0, 4).map((result, index) => (
+            <div className="engine-retrieval-result" key={result.id || index}>
+              <strong>{result.title || `${getEngineSourceLabel(result.type)} ${index + 1}`}</strong>
+              <span>
+                {getEngineSourceLabel(result.type)} · score {Number(result.score || 0).toFixed(3)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {citations.length > 0 && (
+        <div className="engine-citation-list">
+          {citations.slice(0, 5).map((citation, index) => (
+            <div className="engine-citation" key={citation.source_id || citation.span_id || index}>
+              <strong>{citation.label || citation.source_id || `证据 ${index + 1}`}</strong>
+              <span>
+                {getEngineSourceLabel(citation.source_type)} · {formatEngineTimeRange(citation.time_range) || "无时间范围"}
+              </span>
+              <EngineMediaPreview mediaProxyUrl={mediaProxyUrl} rawRef={getEngineRawRefFromReferences([citation])} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResearchExportWorkspace() {
+  const [adminStatus, setAdminStatus] = useState("loading");
+  const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
+  const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
+  const [filters, setFilters] = useState({ userId: "", parseStatus: "" });
+  const [users, setUsers] = useState([]);
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [videoCount, setVideoCount] = useState(0);
+  const [audioCount, setAudioCount] = useState(0);
+  const [activeAssetId, setActiveAssetId] = useState(null);
+  const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
+  const [listState, setListState] = useState({ status: "loading", message: "" });
+  const [parsedState, setParsedState] = useState({ status: "idle", data: null, message: "" });
+  const [exportState, setExportState] = useState({ status: "idle", message: "", downloadUrl: "", filename: "" });
+  const downloadObjectUrlRef = useRef("");
+  const groups = useMemo(() => groupResearchItems(items), [items]);
+  const activeItem = useMemo(
+    () => items.find((item) => Number(item.asset_id) === Number(activeAssetId)) || null,
+    [activeAssetId, items]
+  );
+  const allLoadedSelected = items.length > 0 && items.every((item) => selectedAssetIds.has(Number(item.asset_id)));
+  const loadedCount = items.length;
+  const hasMore = total > loadedCount;
+  const canExportSelected = selectedAssetIds.size > 0 && exportState.status !== "working";
+  const canExportAll = total > 0 && exportState.status !== "working";
+
+  useEffect(() => {
+    refreshResearchData();
+    return () => {
+      if (downloadObjectUrlRef.current) {
+        URL.revokeObjectURL(downloadObjectUrlRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeItem) {
+      setParsedState({ status: "idle", data: null, message: "" });
+      return;
+    }
+
+    let isCancelled = false;
+    setParsedState({ status: "loading", data: null, message: "" });
+    requestResearchAdmin(activeItem.parsed_data_url)
+      .then((data) => {
+        if (!isCancelled) {
+          setParsedState({ status: "ready", data, message: "" });
+        }
+      })
+      .catch((error) => {
+        if (isCancelled) {
+          return;
+        }
+        if (isResearchAdminAuthError(error)) {
+          setAdminStatus("auth");
+        }
+        setParsedState({ status: "error", data: null, message: getResearchAdminErrorMessage(error) || "Parsed data 加载失败" });
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeItem?.asset_id]);
+
+  function handleResearchError(error) {
+    const message = getResearchAdminErrorMessage(error);
+    if (isResearchAdminAuthError(error)) {
+      setAdminStatus("auth");
+      setListState({ status: "auth", message: "请先登录 Research Admin" });
+    } else {
+      setListState({ status: "error", message });
+    }
+  }
+
+  async function loadResearchUsers() {
+    const data = await requestResearchAdmin("/admin/research/users");
+    setUsers(data.items || []);
+  }
+
+  async function loadResearchVideos({ append = false, nextFilters = filters } = {}) {
+    const offset = append ? items.length : 0;
+    setListState({ status: append ? "loading-more" : "loading", message: "" });
+    const data = await requestResearchAdmin(getResearchListPath(nextFilters, offset));
+    const incomingItems = data.items || [];
+    const nextItems = append ? mergeResearchItems(items, incomingItems) : incomingItems;
+    setItems(nextItems);
+    setTotal(data.total || nextItems.length);
+    setVideoCount(data.video_count || 0);
+    setAudioCount(data.audio_count || 0);
+    setAdminStatus("ready");
+    setListState({ status: "ready", message: "" });
+    if (!append) {
+      setSelectedAssetIds(new Set());
+    }
+    setActiveAssetId((current) => {
+      if (current && nextItems.some((item) => Number(item.asset_id) === Number(current))) {
+        return current;
+      }
+      return nextItems[0]?.asset_id ? Number(nextItems[0].asset_id) : null;
+    });
+  }
+
+  async function refreshResearchData() {
+    setAdminStatus((current) => (current === "ready" ? current : "loading"));
+    try {
+      await loadResearchUsers();
+      await loadResearchVideos({ append: false });
+      setExportState((current) => ({ ...current, status: current.downloadUrl ? "ready" : "idle", message: "" }));
+    } catch (error) {
+      handleResearchError(error);
+    }
+  }
+
+  async function submitResearchLogin(event) {
+    event.preventDefault();
+    setLoginStatus({ status: "checking", message: "验证中" });
+    try {
+      await requestResearchAdmin("/admin/research/login", {
+        method: "POST",
+        form: loginForm,
+        responseType: "text"
+      });
+      await loadResearchUsers();
+      await loadResearchVideos({ append: false });
+      setLoginStatus({ status: "idle", message: "" });
+      setLoginForm((current) => ({ ...current, password: "" }));
+    } catch (error) {
+      setAdminStatus("auth");
+      setLoginStatus({ status: "error", message: isResearchAdminAuthError(error) ? "Research Admin 登录失败" : getResearchAdminErrorMessage(error) });
+    }
+  }
+
+  async function logoutResearchAdmin() {
+    try {
+      await requestResearchAdmin("/admin/research/logout", { method: "POST", responseType: "text" });
+    } catch {
+      // The UI should still return to the login state if server-side logout response is unavailable.
+    }
+    setAdminStatus("auth");
+    setItems([]);
+    setUsers([]);
+    setSelectedAssetIds(new Set());
+    setActiveAssetId(null);
+    setParsedState({ status: "idle", data: null, message: "" });
+    setListState({ status: "auth", message: "已退出 Research Admin" });
+  }
+
+  function changeResearchFilter(changes) {
+    const nextFilters = { ...filters, ...changes };
+    setFilters(nextFilters);
+    loadResearchVideos({ append: false, nextFilters }).catch(handleResearchError);
+  }
+
+  function selectResearchAsset(item, event) {
+    const assetId = Number(item.asset_id);
+    if (event?.metaKey || event?.ctrlKey || event?.shiftKey) {
+      toggleResearchSelection(assetId);
+      return;
+    }
+    setActiveAssetId(assetId);
+  }
+
+  function toggleResearchSelection(assetId) {
+    setSelectedAssetIds((current) => {
+      const next = new Set(current);
+      if (next.has(Number(assetId))) {
+        next.delete(Number(assetId));
+      } else {
+        next.add(Number(assetId));
+      }
+      return next;
+    });
+  }
+
+  function toggleSelectAllResearchItems() {
+    setSelectedAssetIds((current) => {
+      const next = new Set(current);
+      if (allLoadedSelected) {
+        items.forEach((item) => next.delete(Number(item.asset_id)));
+      } else {
+        items.forEach((item) => next.add(Number(item.asset_id)));
+      }
+      return next;
+    });
+  }
+
+  function setResearchDownload(url, filename, isObjectUrl = false) {
+    if (downloadObjectUrlRef.current && downloadObjectUrlRef.current !== url) {
+      URL.revokeObjectURL(downloadObjectUrlRef.current);
+      downloadObjectUrlRef.current = "";
+    }
+    if (isObjectUrl) {
+      downloadObjectUrlRef.current = url;
+    }
+    setExportState({
+      status: "ready",
+      message: `Ready - ${filename || "research-videos.zip"}`,
+      downloadUrl: url,
+      filename: filename || "research-videos.zip"
+    });
+    triggerResearchDownload(url, filename || "research-videos.zip");
+  }
+
+  async function downloadResearchExport(payload) {
+    setExportState({ status: "working", message: "Preparing...", downloadUrl: "", filename: "" });
+    const result = await requestResearchAdmin("/admin/research/assets/videos/export", {
+      method: "POST",
+      body: {
+        delivery: "oss",
+        include_metadata: true,
+        include_parsed_data: true,
+        ...payload
+      },
+      responseType: "download"
+    });
+
+    if (result.download_url) {
+      setResearchDownload(result.download_url, result.filename || "research-videos.zip");
+      setExportState((current) => ({
+        ...current,
+        message: `Ready - ${formatBytes(result.size_bytes) || "zip"} · ${Math.round(Number(result.expires_seconds || 0) / 60)}m`
+      }));
+      return;
+    }
+
+    const blob =
+      result.blob ||
+      (result.base64 ? base64ToBlob(result.base64, result.content_type || "application/zip") : null);
+    if (!blob) {
+      throw new Error("Export did not return a downloadable zip");
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    setResearchDownload(objectUrl, result.filename || "research-videos.zip", true);
+  }
+
+  async function exportSelectedResearchItems() {
+    if (!selectedAssetIds.size) {
+      return;
+    }
+    try {
+      await downloadResearchExport({ asset_ids: Array.from(selectedAssetIds) });
+    } catch (error) {
+      setExportState({ status: "error", message: getResearchAdminErrorMessage(error) || "导出失败", downloadUrl: "", filename: "" });
+    }
+  }
+
+  async function exportAllResearchItems() {
+    try {
+      await downloadResearchExport({
+        max_assets: 2000,
+        parse_status: filters.parseStatus || null,
+        select_all: true,
+        user_id: filters.userId ? Number(filters.userId) : null
+      });
+    } catch (error) {
+      setExportState({ status: "error", message: getResearchAdminErrorMessage(error) || "导出失败", downloadUrl: "", filename: "" });
+    }
+  }
+
+  if (adminStatus === "auth") {
+    return (
+      <ResearchAdminLogin
+        form={loginForm}
+        loginStatus={loginStatus}
+        onChange={(changes) => setLoginForm((current) => ({ ...current, ...changes }))}
+        onSubmit={submitResearchLogin}
+      />
+    );
+  }
+
+  return (
+    <section className="research-page">
+      <header className="research-toolbar">
+        <div className="research-title-block">
+          <strong>DL Research</strong>
+          <span>
+            {loadedCount} / {total || loadedCount} files · Selected {selectedAssetIds.size}
+          </span>
+        </div>
+        <div className="research-metrics">
+          <ResearchMetric icon={<FileVideo size={15} />} label="Videos" value={videoCount} />
+          <ResearchMetric icon={<FileAudio size={15} />} label="Audio" value={audioCount} />
+        </div>
+        <div className="research-actions">
+          <button className="ghost-button" onClick={toggleSelectAllResearchItems} type="button">
+            <SquareCheck size={15} />
+            <span>{allLoadedSelected ? "Clear loaded" : "Select all"}</span>
+          </button>
+          <button className="primary-button" disabled={!canExportSelected} onClick={exportSelectedResearchItems} type="button">
+            <Download size={15} />
+            <span>Export selected</span>
+          </button>
+          <button className="secondary-button" disabled={!canExportAll} onClick={exportAllResearchItems} type="button">
+            <Archive size={15} />
+            <span>Export all</span>
+          </button>
+          <button className="secondary-button research-icon-action" disabled={listState.status === "loading"} onClick={refreshResearchData} title="Refresh" type="button">
+            <RotateCcw size={15} />
+          </button>
+          <button className="ghost-button research-icon-action" onClick={logoutResearchAdmin} title="Logout" type="button">
+            <UserRound size={15} />
+          </button>
+        </div>
+        <div className="research-filter-row">
+          <label className="research-select">
+            <UserRound size={15} />
+            <select onChange={(event) => changeResearchFilter({ userId: event.target.value })} value={filters.userId}>
+              <option value="">All users</option>
+              {users.map((user) => (
+                <option key={user.user_id} value={user.user_id}>
+                  {user.label || `User ${user.user_id}`} · parsed {user.parsed_asset_count ?? 0}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="research-select">
+            <CheckCheck size={15} />
+            <select onChange={(event) => changeResearchFilter({ parseStatus: event.target.value })} value={filters.parseStatus}>
+              <option value="">All parsed statuses</option>
+              {RESEARCH_PARSE_STATUSES.map((status) => (
+                <option key={status} value={status}>
+                  {status}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className={`research-export-status ${exportState.status}`}>{exportState.message}</span>
+          {exportState.downloadUrl && (
+            <a className="research-download-link" href={exportState.downloadUrl} rel="noopener" target="_blank">
+              Download zip
+            </a>
+          )}
+        </div>
+      </header>
+
+      <div className="research-shell">
+        <main className="research-gallery">
+          {listState.status === "loading" && items.length === 0 ? (
+            <div className="research-empty">正在读取 Research videos...</div>
+          ) : listState.status === "error" ? (
+            <div className="research-alert">
+              <TriangleAlert size={16} />
+              <span>{listState.message}</span>
+            </div>
+          ) : groups.length === 0 ? (
+            <div className="research-empty">No matching videos</div>
+          ) : (
+            <>
+              {groups.map((group) => (
+                <section className="research-group" key={group.date_key}>
+                  <h2>
+                    {group.date_label}
+                    <span>{group.capture_count} captures</span>
+                  </h2>
+                  <div className="research-media-grid">
+                    {group.items.map((item) => (
+                      <ResearchMediaTile
+                        active={Number(activeAssetId) === Number(item.asset_id)}
+                        item={item}
+                        key={item.asset_id}
+                        onDoubleClick={() => toggleResearchSelection(item.asset_id)}
+                        onSelect={(event) => selectResearchAsset(item, event)}
+                        selected={selectedAssetIds.has(Number(item.asset_id))}
+                      />
+                    ))}
+                  </div>
+                </section>
+              ))}
+              {hasMore && (
+                <button className="research-load-more" disabled={listState.status === "loading-more"} onClick={() => loadResearchVideos({ append: true }).catch(handleResearchError)} type="button">
+                  <Download size={15} />
+                  <span>{listState.status === "loading-more" ? "Fetching..." : `Show next ${Math.min(RESEARCH_PAGE_SIZE, total - loadedCount)}`}</span>
+                </button>
+              )}
+            </>
+          )}
+        </main>
+        <ResearchDetailPanel activeItem={activeItem} parsedState={parsedState} />
+      </div>
+    </section>
+  );
+}
+
+function ResearchAdminLogin({ form, loginStatus, onChange, onSubmit }) {
+  const isChecking = loginStatus.status === "checking";
+  return (
+    <section className="research-login-page">
+      <form className="research-login-card" onSubmit={onSubmit}>
+        <div className="engine-gate-heading">
+          <LockKeyhole size={18} />
+          <div>
+            <strong>DL Research</strong>
+            <span>Research Admin</span>
+          </div>
+        </div>
+        <label className="login-field">
+          <span>用户名</span>
+          <div className="login-input-wrap">
+            <UserRound size={15} />
+            <input
+              autoComplete="username"
+              disabled={isChecking}
+              onChange={(event) => onChange({ username: event.target.value })}
+              placeholder="admin"
+              type="text"
+              value={form.username}
+            />
+          </div>
+        </label>
+        <label className="login-field">
+          <span>密码</span>
+          <div className="login-input-wrap">
+            <LockKeyhole size={15} />
+            <input
+              autoComplete="current-password"
+              disabled={isChecking}
+              onChange={(event) => onChange({ password: event.target.value })}
+              placeholder="输入 Research Admin 密码"
+              type="password"
+              value={form.password}
+            />
+          </div>
+        </label>
+        {loginStatus.message && <div className={`login-status ${loginStatus.status}`}>{loginStatus.message}</div>}
+        <button className="primary-button" disabled={isChecking} type="submit">
+          {isChecking ? "验证中" : "登录"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
+function ResearchMetric({ icon, label, value }) {
+  return (
+    <div className="research-metric">
+      {icon}
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ResearchMediaTile({ active, item, onDoubleClick, onSelect, selected }) {
+  const mediaType = String(item.asset_type || item.media_type || "").toLowerCase();
+  const isAudio = mediaType === "audio" || String(item.mime || "").startsWith("audio/");
+  const thumbnailUrl = item.thumbnail_url ? resolveInferaAdminUrl(item.thumbnail_url) : "";
+  const title = item.file_name || `Asset ${item.asset_id}`;
+
+  return (
+    <article
+      className={["research-tile", active ? "active" : "", selected ? "selected" : ""].filter(Boolean).join(" ")}
+      onClick={onSelect}
+      onDoubleClick={onDoubleClick}
+      title={title}
+    >
+      <div className="research-thumb">
+        {thumbnailUrl ? <img alt="" draggable="false" src={thumbnailUrl} /> : <span>{isAudio ? "Audio" : "No preview"}</span>}
+        <b>{formatDurationCompact(Number(item.duration_ms || 0)) || "-"}</b>
+        <i>{formatResearchShortTime(item.timestamp_ms)}</i>
+        <em>
+          <Play size={16} />
+        </em>
+        <strong>
+          <CheckCheck size={15} />
+        </strong>
+      </div>
+      <div className="research-tile-meta">
+        <span>{title}</span>
+        <small>{item.parse_status || "-"}</small>
+      </div>
+    </article>
+  );
+}
+
+function ResearchDetailPanel({ activeItem, parsedState }) {
+  if (!activeItem) {
+    return (
+      <aside className="research-detail">
+        <div className="research-detail-empty">Select a video</div>
+      </aside>
+    );
+  }
+
+  const mediaUrl = resolveInferaAdminUrl(activeItem.media_url || activeItem.video_url);
+  const isAudio =
+    String(activeItem.asset_type || activeItem.media_type || "").toLowerCase() === "audio" ||
+    String(activeItem.mime || "").startsWith("audio/");
+
+  return (
+    <aside className="research-detail">
+      <section className="research-preview-panel">
+        <header>
+          <div>
+            <strong>{activeItem.file_name || `Asset ${activeItem.asset_id}`}</strong>
+            <span>
+              {activeItem.parse_status || "-"} · {formatRepositoryDate(activeItem.timestamp_ms) || "-"}
+            </span>
+          </div>
+          <span className="repository-status parsed">{activeItem.asset_type || "media"}</span>
+        </header>
+        {isAudio ? <audio controls key={mediaUrl} src={mediaUrl} /> : <video controls key={mediaUrl} src={mediaUrl} />}
+      </section>
+      <section className="research-parsed-panel">
+        <header>
+          <strong>Parsed Data</strong>
+          <span>{parsedState.status === "loading" ? "Loading" : parsedState.data?.parse_status || ""}</span>
+        </header>
+        <ResearchParsedData parsedState={parsedState} />
+      </section>
+    </aside>
+  );
+}
+
+function ResearchParsedData({ parsedState }) {
+  if (parsedState.status === "loading") {
+    return <div className="research-parsed-empty">Loading</div>;
+  }
+  if (parsedState.status === "error") {
+    return <div className="research-parsed-empty">{parsedState.message}</div>;
+  }
+  if (!parsedState.data) {
+    return <div className="research-parsed-empty">Select a video</div>;
+  }
+
+  const data = parsedState.data;
+  const segments = data.segments || [];
+  const chunks = data.transcript_chunks || [];
+  const keyframes = data.keyframes || [];
+  const observations = data.observations || [];
+  const events = data.events || [];
+
+  return (
+    <div className="research-parsed-content">
+      <ResearchParsedSection title="Summary">
+        <div className="research-parsed-item">{data.summary_text || "No summary"}</div>
+      </ResearchParsedSection>
+      <ResearchParsedSection title={`Segments (${segments.length})`}>
+        {segments.slice(0, 30).map((item, index) => (
+          <ResearchParsedTimelineItem key={`${item.start_ms || index}-segment`} timeMs={item.start_ms} text={item.content_text || item.title || ""} />
+        ))}
+        {segments.length === 0 && <span className="research-muted">None</span>}
+      </ResearchParsedSection>
+      <ResearchParsedSection title={`Transcript (${chunks.length})`}>
+        {chunks.slice(0, 30).map((item, index) => (
+          <ResearchParsedTimelineItem key={`${item.start_ms || index}-chunk`} timeMs={item.start_ms} text={item.content_text || item.text || ""} />
+        ))}
+        {chunks.length === 0 && <span className="research-muted">None</span>}
+      </ResearchParsedSection>
+      <ResearchParsedSection title={`Keyframes (${keyframes.length})`}>
+        {keyframes.slice(0, 20).map((item, index) => (
+          <ResearchParsedTimelineItem key={`${item.timestamp_ms || index}-keyframe`} timeMs={item.timestamp_ms} text={item.caption_text || item.ocr_text || ""} />
+        ))}
+        {keyframes.length === 0 && <span className="research-muted">None</span>}
+      </ResearchParsedSection>
+      <ResearchParsedSection title={`Signals (${observations.length + events.length})`}>
+        {[...observations.slice(0, 8), ...events.slice(0, 8)].map((item, index) => (
+          <div className="research-parsed-item" key={`${item.id || index}-signal`}>
+            {item.content_text || item.description || item.event_text || item.label || JSON.stringify(item)}
+          </div>
+        ))}
+        {observations.length + events.length === 0 && <span className="research-muted">None</span>}
+      </ResearchParsedSection>
+    </div>
+  );
+}
+
+function ResearchParsedSection({ children, title }) {
+  return (
+    <section className="research-parsed-section">
+      <h3>{title}</h3>
+      {children}
+    </section>
+  );
+}
+
+function ResearchParsedTimelineItem({ text, timeMs }) {
+  return (
+    <div className="research-parsed-item">
+      <strong>{formatDurationCompact(Number(timeMs || 0)) || "0s"}</strong>
+      <span>{text || "-"}</span>
+    </div>
   );
 }
 
@@ -3353,6 +4992,96 @@ function getCloudFilterCount(stats, filterId) {
   if (filterId === "parsed") return stats.parsed;
   if (filterId === "processing") return stats.processing;
   return stats.total;
+}
+
+function getResearchListPath(filters, offset = 0) {
+  const params = new URLSearchParams({
+    limit: String(RESEARCH_PAGE_SIZE),
+    offset: String(offset)
+  });
+  if (filters.userId) {
+    params.set("user_id", filters.userId);
+  }
+  if (filters.parseStatus) {
+    params.set("parse_status", filters.parseStatus);
+  }
+  return `/admin/research/assets/videos?${params.toString()}`;
+}
+
+function mergeResearchItems(currentItems, nextItems) {
+  const merged = [...currentItems];
+  const seen = new Set(currentItems.map((item) => Number(item.asset_id)).filter(Boolean));
+  nextItems.forEach((item) => {
+    const assetId = Number(item.asset_id);
+    if (!assetId || seen.has(assetId)) {
+      return;
+    }
+    seen.add(assetId);
+    merged.push(item);
+  });
+  return merged;
+}
+
+function groupResearchItems(items) {
+  const groups = new Map();
+  items.forEach((item) => {
+    const dateKey = item.captured_date_key || "unknown";
+    if (!groups.has(dateKey)) {
+      groups.set(dateKey, {
+        date_key: dateKey,
+        date_label: item.captured_date_label || dateKey,
+        capture_count: 0,
+        items: []
+      });
+    }
+    const group = groups.get(dateKey);
+    group.capture_count += 1;
+    group.items.push(item);
+  });
+  return Array.from(groups.values());
+}
+
+function isResearchAdminAuthError(error) {
+  return /Research admin login required|401|unauthorized/i.test(error?.message || "");
+}
+
+function getResearchAdminErrorMessage(error) {
+  const message = error?.message || "Research 请求失败";
+  if (/Not Found|404|endpoint not found/i.test(message)) {
+    return "Research admin endpoint not found。开发模式下请重启 Electron 主进程，让 /admin/research 请求不要再走 /api/infera。";
+  }
+  return message;
+}
+
+function formatResearchShortTime(value) {
+  if (!value) return "";
+  const timestamp = typeof value === "number" || /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "2-digit"
+  }).format(new Date(timestamp));
+}
+
+function triggerResearchDownload(url, filename) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "research-videos.zip";
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function base64ToBlob(base64, contentType = "application/zip") {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: contentType });
 }
 
 function filterCloudRepositoryItems(items, filterId, query) {
