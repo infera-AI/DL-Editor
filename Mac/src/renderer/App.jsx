@@ -429,6 +429,7 @@ function App() {
     selectedJobs.every(isJobUploadable) &&
     !isRunning &&
     !isUploadActive(uploadState);
+  const canClearFinished = jobs.some((job) => canClearFinishedJob(job, automationOptions));
 
   useEffect(() => {
     dlEditor.getCapabilities().then((data) => {
@@ -1382,11 +1383,14 @@ function App() {
   }
 
   function clearFinished() {
-    setJobs((current) => current.filter((job) => job.status !== "done"));
+    const options = automationOptionsRef.current;
+    setJobs((current) => current.filter((job) => !canClearFinishedJob(job, options)));
   }
 
   function removeJob(id) {
-    setJobs((current) => current.filter((job) => job.id !== id));
+    const options = automationOptionsRef.current;
+    const currentUploadState = uploadStateRef.current;
+    setJobs((current) => current.filter((job) => job.id !== id || !canRemoveJob(job, options, currentUploadState)));
   }
 
   function openStartTimeEditor(job) {
@@ -1822,7 +1826,7 @@ function App() {
               <button className="icon-button" disabled={!canUploadSelection} onClick={uploadSelectedJobs} title="上传到 Delphi Repository" type="button">
                 <Upload size={18} />
               </button>
-              <button className="icon-button" disabled={isRunning} onClick={clearFinished} title="清除已完成" type="button">
+              <button className="icon-button" disabled={isRunning || !canClearFinished} onClick={clearFinished} title="清除已完成" type="button">
                 <RotateCcw size={18} />
               </button>
               <button className="secondary-button" disabled={isRunning} onClick={addVideos} type="button">
@@ -1882,6 +1886,7 @@ function App() {
                   onRemove={() => removeJob(job.id)}
                   onReveal={() => job.outputPath && dlEditor.revealPath(job.outputPath)}
                   onToggleSelection={() => toggleJobSelection(job.id)}
+                  removeDisabled={isRunning || !canRemoveJob(job, automationOptions, uploadState)}
                   selected={selectedJobIds.has(job.id)}
                   selectionMode={selectionMode}
                 />
@@ -3257,6 +3262,42 @@ function hasPendingAutomationActions(job, options) {
   return Boolean((options?.autoUpload && shouldAutoUploadJob(job)) || (options?.autoBackup && shouldAutoBackupJob(job)));
 }
 
+function canClearFinishedJob(job, options) {
+  if (job?.status !== "done") {
+    return false;
+  }
+
+  return !hasPendingAutomationActions(job, options) && !hasIncompleteTransferStatus(job);
+}
+
+function canRemoveJob(job, options, uploadState) {
+  return !hasPendingAutomationActions(job, options) && !hasActiveTransferStatus(job) && !hasActiveUploadItem(job?.id, uploadState);
+}
+
+function hasIncompleteTransferStatus(job) {
+  const uploadStatus = normalizeJobTransferStatus("upload", job?.autoUploadStatus || "");
+  const backupStatus = normalizeJobTransferStatus("backup", job?.autoBackupStatus || "");
+  return Boolean((uploadStatus && uploadStatus !== "done") || (backupStatus && backupStatus !== "done"));
+}
+
+function hasActiveTransferStatus(job) {
+  const uploadStatus = normalizeJobTransferStatus("upload", job?.autoUploadStatus || "");
+  const backupStatus = normalizeJobTransferStatus("backup", job?.autoBackupStatus || "");
+  return isActiveTransferStatus(uploadStatus) || isActiveTransferStatus(backupStatus);
+}
+
+function isActiveTransferStatus(status) {
+  return status === "queued" || status === "uploading" || status === "processing" || status === "paused" || status === "canceling";
+}
+
+function hasActiveUploadItem(jobId, uploadState) {
+  if (!jobId || !Array.isArray(uploadState?.items)) {
+    return false;
+  }
+
+  return uploadState.items.some((item) => item.jobId === jobId && isActiveTransferStatus(normalizeJobTransferStatus("upload", item.status)));
+}
+
 function getAutomationQueueMessage({ backupQueued, uploadQueued }) {
   if (uploadQueued && backupQueued) {
     return "等待自动上传/备份";
@@ -3746,7 +3787,7 @@ function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }
   );
 }
 
-function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal, onToggleSelection, selected, selectionMode }) {
+function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal, onToggleSelection, removeDisabled, selected, selectionMode }) {
   const elapsedMs = getElapsedMs(job, now);
   const remainingMs = getEstimatedRemainingMs(job, elapsedMs);
   const durationMs = Math.max(0, Math.round((Number(job.duration) || 0) * 1000));
@@ -3824,7 +3865,7 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
                 </button>
               </>
             )}
-            <button disabled={disabled} onClick={onRemove} type="button">
+            <button disabled={removeDisabled} onClick={onRemove} type="button">
               移除
             </button>
           </div>

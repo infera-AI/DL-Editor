@@ -281,28 +281,47 @@ function emitUploadProgress(sender, payload) {
   sender.send("infera:upload-progress", payload);
 }
 
+const TRANSFER_SPEED_WINDOW_MS = 2000;
+const TRANSFER_SPEED_SAMPLE_INTERVAL_MS = 250;
+
 function createTransferSpeedMeter(initialBytes = 0) {
-  let lastBytes = Math.max(0, Number(initialBytes) || 0);
-  let lastAt = Date.now();
+  let samples = [{ at: Date.now(), bytes: Math.max(0, Number(initialBytes) || 0) }];
   let speedBytesPerSecond = 0;
 
+  const pruneSamples = (now) => {
+    const cutoff = now - TRANSFER_SPEED_WINDOW_MS;
+    while (samples.length > 1 && samples[1].at <= cutoff) {
+      samples.shift();
+    }
+  };
+
   return {
-    reset(bytes = lastBytes) {
-      lastBytes = Math.max(0, Number(bytes) || 0);
-      lastAt = Date.now();
+    reset(bytes = samples[samples.length - 1]?.bytes || 0) {
+      samples = [{ at: Date.now(), bytes: Math.max(0, Number(bytes) || 0) }];
       speedBytesPerSecond = 0;
     },
     sample(bytes) {
       const currentBytes = Math.max(0, Number(bytes) || 0);
       const now = Date.now();
-      const elapsedMs = now - lastAt;
-      const deltaBytes = currentBytes - lastBytes;
+      const lastSample = samples[samples.length - 1];
 
-      if (elapsedMs >= 250 || deltaBytes <= 0) {
-        speedBytesPerSecond = elapsedMs > 0 && deltaBytes > 0 ? Math.round(deltaBytes / (elapsedMs / 1000)) : 0;
-        lastBytes = currentBytes;
-        lastAt = now;
+      if (!lastSample || currentBytes < lastSample.bytes) {
+        samples = [{ at: now, bytes: currentBytes }];
+        speedBytesPerSecond = 0;
+        return speedBytesPerSecond;
       }
+
+      if (now - lastSample.at < TRANSFER_SPEED_SAMPLE_INTERVAL_MS) {
+        return speedBytesPerSecond;
+      }
+
+      samples.push({ at: now, bytes: currentBytes });
+      pruneSamples(now);
+
+      const firstSample = samples[0];
+      const elapsedMs = now - firstSample.at;
+      const deltaBytes = currentBytes - firstSample.bytes;
+      speedBytesPerSecond = elapsedMs > 0 && deltaBytes > 0 ? Math.round(deltaBytes / (elapsedMs / 1000)) : 0;
 
       return speedBytesPerSecond;
     }
