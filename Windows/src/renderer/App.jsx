@@ -76,7 +76,7 @@ const STATUS_LABELS = {
   queued: "等待",
   processing: "处理中",
   done: "完成",
-  error: "失败",
+  error: "压制失败",
   canceled: "取消",
   paused: "暂停"
 };
@@ -98,7 +98,9 @@ const UPLOAD_STATUS_LABELS = {
   uploading: "上传中",
   processing: "服务器处理中",
   done: "完成",
-  error: "失败",
+  error: "传输失败",
+  upload_error: "上传失败",
+  backup_error: "备份失败",
   canceled: "已取消",
   canceling: "取消中",
   paused: "已暂停"
@@ -381,7 +383,9 @@ function App() {
     expanded: false,
     uploadId: "",
     items: [],
-    message: ""
+    message: "",
+    retryJobs: [],
+    retryOptions: null
   });
   const [autoUploadNotice, setAutoUploadNotice] = useState({
     visible: false,
@@ -417,7 +421,7 @@ function App() {
   const activeEncodingJob = getActiveEncodingJob(jobs);
   const selectedJobs = useMemo(() => jobs.filter((job) => selectedJobIds.has(job.id)), [jobs, selectedJobIds]);
   const allJobsSelected = jobs.length > 0 && selectedJobIds.size === jobs.length;
-  const canBackupSelection = selectedJobs.length > 0 && !isRunning && !isUploadActive(uploadState);
+  const canBackupSelection = selectedJobs.length > 0 && selectedJobs.every(isJobBackupable) && !isRunning && !isUploadActive(uploadState);
   const canUploadSelection =
     selectedJobs.length > 0 &&
     selectedJobs.every(isJobUploadable) &&
@@ -795,17 +799,21 @@ function App() {
     const options = automationOptionsRef.current;
     const uploadJobs = options.autoUpload ? candidateJobs.filter((job) => shouldAutoUploadJob(job)) : [];
     const backupJobs = options.autoBackup ? candidateJobs.filter((job) => shouldAutoBackupJob(job)).map(prepareBackupJob) : [];
+    let uploadFailureSnapshot = null;
+    let backupFailed = false;
 
     if (uploadJobs.length > 0) {
+      const uploadOptions = {
+        autoClearLocal: options.autoClearLocal,
+        clearLocalTarget: "output",
+        destination: "Delphi Repository",
+        endpoint: WEB_VIDEO_UPLOAD_PATH,
+        mode: "auto-upload"
+      };
       try {
-        await uploadJobsToRepository(uploadJobs, {
-          autoClearLocal: options.autoClearLocal,
-          clearLocalTarget: "output",
-          destination: "Delphi Repository",
-          endpoint: WEB_VIDEO_UPLOAD_PATH,
-          mode: "auto-upload"
-        });
-      } catch {
+        await uploadJobsToRepository(uploadJobs, uploadOptions);
+      } catch (error) {
+        uploadFailureSnapshot = error?.transferFailureSnapshot || null;
         // Keep the automation worker alive so backup can still run for the same finished jobs.
       }
     }
@@ -820,9 +828,34 @@ function App() {
           mode: "auto-backup"
         });
       } catch {
+        backupFailed = true;
         // Errors are already reflected in the upload panel and job status.
       }
     }
+
+    if (uploadFailureSnapshot && backupJobs.length > 0 && !backupFailed) {
+      restoreTransferFailureSnapshot(uploadFailureSnapshot);
+    }
+  }
+
+  function restoreTransferFailureSnapshot(snapshot) {
+    if (!snapshot?.retryJobs?.length) {
+      return;
+    }
+
+    setUploadState({
+      status: snapshot.status,
+      visible: true,
+      expanded: false,
+      uploadId: "",
+      destination: snapshot.destination,
+      mode: snapshot.mode,
+      items: snapshot.items,
+      retryJobs: snapshot.retryJobs,
+      retryOptions: snapshot.retryOptions,
+      message: snapshot.message
+    });
+    setNotice(snapshot.message);
   }
 
   async function uploadJobsToRepository(
@@ -866,6 +899,7 @@ function App() {
 
     const uploadKind = isAutoBackup ? "auto-backup" : isAutoUpload ? "auto-upload" : isBackup ? "backup" : "upload";
     const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const retryOptions = { autoClearLocal, clearLocalTarget, destination, endpoint, mode };
     uploadCancelRequestedRef.current = false;
     if (isAutomatic) {
       const attemptedAt = new Date().toISOString();
@@ -892,6 +926,8 @@ function App() {
       destination,
       mode,
       items: createUploadItems(jobsToUpload),
+      retryJobs: jobsToUpload,
+      retryOptions,
       message: `${isAutomatic ? actionLabel : `准备${actionLabel}`} ${jobsToUpload.length} 个视频`
     });
     setNotice(`${isAutomatic ? actionLabel : `正在${actionLabel}`} ${jobsToUpload.length} 个视频到 ${destination}`);
@@ -923,6 +959,7 @@ function App() {
         );
         const result = await dlEditor.uploadInferaVideo({
           durationSeconds: job.duration,
+          durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
           jobId: job.id,
           path: job.uploadPath,
           fileName: job.uploadName,
@@ -975,6 +1012,8 @@ function App() {
         ...current,
         status: "ready",
         visible: current.visible,
+        retryJobs: [],
+        retryOptions: null,
         message: `${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频`
       }));
       setNotice(`${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频到 ${destination}`);
@@ -983,12 +1022,17 @@ function App() {
       const message = error.message || "上传失败";
       const canceled = message.includes("取消");
       const doneField = isAutoBackup ? "backedUpAt" : "uploadedAt";
+      const transferErrorStatus = getTransferErrorStatus(mode);
+      const retryJobs = canceled ? [] : jobsToUpload.slice(completed);
+      const retryOptionsForError = canceled ? null : retryOptions;
       setUploadState((current) => {
         const now = Date.now();
         return {
           ...current,
-          status: canceled ? "canceled" : "error",
+          status: canceled ? "canceled" : transferErrorStatus,
           visible: current.visible,
+          retryJobs,
+          retryOptions: retryOptionsForError,
           message,
           items: current.items.map((item) =>
             item.status === "done"
@@ -999,7 +1043,7 @@ function App() {
                   elapsedMs: item.startedAt ? getUploadItemElapsedMs(item, now) : item.elapsedMs,
                   estimatedRemainingMs: null,
                   message: item.status === "uploading" || item.status === "processing" ? message : item.message,
-                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : "error"
+                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : transferErrorStatus
                 }
           )
         };
@@ -1011,13 +1055,23 @@ function App() {
               ? {
                   ...job,
                   ...(isAutoBackup
-                    ? { autoBackupStatus: canceled ? "canceled" : "error" }
-                    : { autoUploadStatus: canceled ? "canceled" : "error" }),
+                    ? { autoBackupStatus: canceled ? "canceled" : "backup_error" }
+                    : { autoUploadStatus: canceled ? "canceled" : "upload_error" }),
                   message
                 }
               : job
           )
         );
+      }
+      if (!canceled && retryJobs.length > 0 && error && typeof error === "object") {
+        error.transferFailureSnapshot = createTransferFailureSnapshot({
+          destination,
+          jobs: retryJobs,
+          message,
+          mode,
+          retryOptions,
+          status: transferErrorStatus
+        });
       }
       setNotice(message);
       throw error;
@@ -1043,6 +1097,17 @@ function App() {
 
     try {
       await uploadJobsToRepository(selectedJobs);
+    } catch {
+      // Upload state and notice are already updated by uploadJobsToRepository.
+    }
+  }
+
+  async function retryFailedUpload() {
+    const retryJobs = uploadState.retryJobs || [];
+    if (!isTransferErrorStatus(uploadState.status) || !retryJobs.length) return;
+
+    try {
+      await uploadJobsToRepository(retryJobs, uploadState.retryOptions || {});
     } catch {
       // Upload state and notice are already updated by uploadJobsToRepository.
     }
@@ -1677,7 +1742,7 @@ function App() {
             <Metric icon={<ListVideo size={16} />} label="总数" value={totals.total} />
             <Metric icon={<Clock3 size={16} />} label="处理中" value={totals.active} />
             <Metric icon={<CheckCircle2 size={16} />} label="完成" value={totals.done} />
-            <Metric icon={<TriangleAlert size={16} />} label="失败" value={totals.errors} />
+            <Metric icon={<TriangleAlert size={16} />} label="压制失败" value={totals.errors} />
           </div>
 
           {notice && (
@@ -1699,6 +1764,7 @@ function App() {
               now={clockNow}
               onClose={closeUploadPanel}
               onPauseToggle={toggleCurrentUploadPaused}
+              onRetry={retryFailedUpload}
               onToggleDetails={toggleUploadDetails}
               state={uploadState}
             />
@@ -2643,12 +2709,13 @@ function AutomationOptions({ onChange, options }) {
   );
 }
 
-function UploadProgressPanel({ now, onClose, onPauseToggle, onToggleDetails, state }) {
+function UploadProgressPanel({ now, onClose, onPauseToggle, onRetry, onToggleDetails, state }) {
   const total = state.items.length;
   const completed = state.items.filter((item) => item.status === "done").length;
   const active = isUploadActive(state);
   const paused = state.status === "paused";
   const canPause = isUploadPausable(state);
+  const canRetry = isTransferErrorStatus(state.status) && (state.retryJobs || []).length > 0;
   const overallPercent = getUploadOverallPercent(state);
   const statusLabel = UPLOAD_STATUS_LABELS[state.status] || (state.status === "ready" ? "完成" : "上传");
   const destination = state.destination || "Delphi Repository";
@@ -2680,9 +2747,15 @@ function UploadProgressPanel({ now, onClose, onPauseToggle, onToggleDetails, sta
           <p>{state.message || statusLabel}</p>
         </div>
         <div className="upload-actions">
-          <button disabled={!canPause} onClick={onPauseToggle} title={paused ? "继续上传" : "暂停上传"} type="button">
-            {paused ? <Play size={15} /> : <Pause size={15} />}
-          </button>
+          {canRetry ? (
+            <button onClick={onRetry} title="重传" type="button">
+              <RotateCcw size={15} />
+            </button>
+          ) : (
+            <button disabled={!canPause} onClick={onPauseToggle} title={paused ? "继续上传" : "暂停上传"} type="button">
+              {paused ? <Play size={15} /> : <Pause size={15} />}
+            </button>
+          )}
           <button onClick={onClose} title={active ? "关闭并取消上传" : "关闭卡片"} type="button">
             <X size={15} />
           </button>
@@ -2742,6 +2815,28 @@ function createUploadItems(jobs) {
     status: "queued",
     totalBytes: 0
   }));
+}
+
+function createTransferFailureSnapshot({ destination, jobs, message, mode, retryOptions, status }) {
+  const retryJobs = Array.isArray(jobs) ? jobs : [];
+  const now = Date.now();
+  return {
+    destination,
+    items: createUploadItems(retryJobs).map((item) => ({
+      ...item,
+      completedAt: now,
+      elapsedMs: 0,
+      estimatedRemainingMs: null,
+      message,
+      startedAt: now,
+      status
+    })),
+    message,
+    mode,
+    retryJobs,
+    retryOptions,
+    status
+  };
 }
 
 function getUploadDoneMessage(clearResult, operation = "upload") {
@@ -2813,6 +2908,14 @@ function isUploadActive(state) {
 
 function isUploadPausable(state) {
   return state?.status === "uploading" || state?.status === "paused";
+}
+
+function getTransferErrorStatus(mode) {
+  return mode === "backup" || mode === "auto-backup" ? "backup_error" : "upload_error";
+}
+
+function isTransferErrorStatus(status) {
+  return status === "error" || status === "upload_error" || status === "backup_error";
 }
 
 function markUploadItem(state, jobId, patch) {
@@ -2908,7 +3011,7 @@ function getUploadItemElapsedMs(item, now = Date.now()) {
     return Number(item.elapsedMs) || 0;
   }
 
-  if (item.status === "done" || item.status === "error" || item.status === "canceled") {
+  if (item.status === "done" || item.status === "canceled" || isTransferErrorStatus(item.status)) {
     return Number(item.elapsedMs) || Math.max(0, Number(item.completedAt || now) - Number(item.startedAt));
   }
 
@@ -2922,6 +3025,9 @@ function getUploadItemElapsedMs(item, now = Date.now()) {
 function getUploadEstimatedRemainingMs({ bytesUploaded, elapsedMs, percent, speedBytesPerSecond, status, totalBytes }) {
   if (status === "done") {
     return 0;
+  }
+  if (status === "canceled" || isTransferErrorStatus(status)) {
+    return null;
   }
 
   const uploaded = Number(bytesUploaded);
@@ -2965,7 +3071,7 @@ function getUploadItemRemainingMs(item, now = Date.now()) {
 }
 
 function getUploadCurrentSpeed(state) {
-  if (state.status === "paused") {
+  if (state.status === "paused" || state.status === "canceled" || state.status === "ready" || isTransferErrorStatus(state.status)) {
     return 0;
   }
 
@@ -3024,6 +3130,10 @@ function getJobUploadPath(job) {
 
 function isJobUploadable(job) {
   return Boolean(getJobUploadPath(job));
+}
+
+function isJobBackupable(job) {
+  return Boolean(job?.path) && !job.deletedOriginalPath;
 }
 
 function shouldAutoUploadJob(job) {
@@ -3548,6 +3658,7 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
                   <span>{formatEncodingSpeed(job)}</span>
                 </span>
               )}
+              <TransferStatusChips job={job} />
             </div>
           </div>
           <span className="status-badge">{STATUS_LABELS[job.status] || job.status}</span>
@@ -3589,6 +3700,58 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
       </div>
     </article>
   );
+}
+
+function TransferStatusChips({ job }) {
+  const chips = getJobTransferChips(job);
+  if (!chips.length) {
+    return null;
+  }
+
+  return (
+    <span className="transfer-status-chips">
+      {chips.map((chip) => (
+        <span className={`transfer-status-chip ${chip.status}`} key={chip.key}>
+          {chip.label}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function getJobTransferChips(job) {
+  const chips = [];
+  const uploadStatus = normalizeJobTransferStatus("upload", job?.autoUploadStatus || (job?.uploadedAt ? "done" : ""));
+  const backupStatus = normalizeJobTransferStatus("backup", job?.autoBackupStatus || (job?.backedUpAt ? "done" : ""));
+
+  if (uploadStatus) {
+    chips.push({ key: "upload", label: formatJobTransferStatusLabel("upload", uploadStatus), status: uploadStatus });
+  }
+  if (backupStatus) {
+    chips.push({ key: "backup", label: formatJobTransferStatusLabel("backup", backupStatus), status: backupStatus });
+  }
+
+  return chips;
+}
+
+function normalizeJobTransferStatus(kind, status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (!value) {
+    return "";
+  }
+  if (value === "error") {
+    return kind === "backup" ? "backup_error" : "upload_error";
+  }
+  return value;
+}
+
+function formatJobTransferStatusLabel(kind, status) {
+  const action = kind === "backup" ? "备份" : "上传";
+  if (status === "done") return `${action}完成`;
+  if (status === "queued") return `${action}排队`;
+  if (status === "canceled") return `${action}取消`;
+  if (status === "upload_error" || status === "backup_error") return `${action}失败`;
+  return `${action}${status}`;
 }
 
 function DurationValue({ value, referenceValue = value }) {

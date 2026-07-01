@@ -42,6 +42,13 @@ let gpuSampleInFlight = false;
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
+const WEB_VIDEO_RESUMABLE_UPLOAD_PATH = "/memory/assets/web-video/resumable";
+const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const RAW_DATA_RESUMABLE_UPLOAD_PATH = "/memory/raw-data/videos/resumable";
+const RAW_DATA_DEDUPLICATE_PATH = "/memory/raw-data/videos/deduplicate";
+const RAW_DATA_RESUMABLE_SESSION_FILE = "raw-data-upload-sessions.json";
+const RESUMABLE_UPLOAD_RETRY_ATTEMPTS = 3;
+const RETRYABLE_UPLOAD_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 const VIDEO_MIME_TYPES = {
   avi: "video/x-msvideo",
   m4v: "video/x-m4v",
@@ -142,6 +149,21 @@ function getUploadHttpErrorMessage(statusCode, responseText) {
   return normalizedDetail || `上传失败 (${statusCode})`;
 }
 
+function createUploadError(message, { retryable, statusCode } = {}) {
+  const error = new Error(message || "上传失败");
+  if (statusCode !== undefined && statusCode !== null && Number.isFinite(Number(statusCode))) {
+    error.statusCode = Number(statusCode);
+  }
+  if (retryable !== undefined) {
+    error.retryable = Boolean(retryable);
+  }
+  return error;
+}
+
+function isRetryableUploadStatus(statusCode) {
+  return RETRYABLE_UPLOAD_STATUS_CODES.has(Number(statusCode));
+}
+
 function parseRawSseEventBlock(block) {
   let eventName = "message";
   const dataLines = [];
@@ -169,7 +191,11 @@ function parseInferaUploadEvents(responseText) {
   const parsedJson = parseJsonSafely(responseText);
   if (parsedJson && typeof parsedJson === "object" && "success" in parsedJson) {
     if (parsedJson.success === false) {
-      throw new Error(parsedJson.message || "上传失败");
+      const statusCode = Number(parsedJson.code) || undefined;
+      throw createUploadError(parsedJson.message || "上传失败", {
+        retryable: isRetryableUploadStatus(statusCode),
+        statusCode
+      });
     }
 
     return parsedJson.result ?? parsedJson;
@@ -187,14 +213,22 @@ function parseInferaUploadEvents(responseText) {
     lastPayload = parsed.payload;
     if (parsed.event === "error") {
       const detail = parsed.payload?.message || parsed.payload?.detail || parsed.payload;
-      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      const statusCode = Number(parsed.payload?.code) || undefined;
+      throw createUploadError(typeof detail === "string" ? detail : JSON.stringify(detail), {
+        retryable: isRetryableUploadStatus(statusCode),
+        statusCode
+      });
     }
 
     if (parsed.event === "preview_ready" || parsed.event === "done") {
       const envelope = parsed.payload;
       if (envelope && typeof envelope === "object" && "success" in envelope) {
         if (envelope.success === false) {
-          throw new Error(envelope.message || "上传失败");
+          const statusCode = Number(envelope.code) || undefined;
+          throw createUploadError(envelope.message || "上传失败", {
+            retryable: isRetryableUploadStatus(statusCode),
+            statusCode
+          });
         }
 
         return envelope.result ?? {};
@@ -235,12 +269,211 @@ function normalizeUploadDuration(value) {
   return Number.isFinite(duration) && duration > 0 ? Math.round(duration * 1000) / 1000 : "";
 }
 
+function normalizeUploadDurationMs(value) {
+  const durationMs = Number(value);
+  return Number.isFinite(durationMs) && durationMs > 0 ? Math.round(durationMs) : null;
+}
+
 function emitUploadProgress(sender, payload) {
   if (!sender || sender.isDestroyed?.()) {
     return;
   }
 
   sender.send("infera:upload-progress", payload);
+}
+
+function isRawDataVideoUploadPath(value) {
+  try {
+    const target = new URL(resolveInferaUrl(value || RAW_DATA_VIDEO_UPLOAD_PATH));
+    return /\/memory\/raw[-_]data\/videos\/?$/.test(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isWebVideoUploadPath(value) {
+  try {
+    const target = new URL(resolveInferaUrl(value || WEB_VIDEO_UPLOAD_PATH));
+    return /\/memory\/assets\/web-video(?:\/events)?\/?$/.test(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function getResumableVideoUploadConfig(uploadPath) {
+  if (isRawDataVideoUploadPath(uploadPath)) {
+    return {
+      deduplicatePath: RAW_DATA_DEDUPLICATE_PATH,
+      kind: "raw-data",
+      resumablePath: RAW_DATA_RESUMABLE_UPLOAD_PATH
+    };
+  }
+  if (isWebVideoUploadPath(uploadPath)) {
+    return {
+      deduplicatePath: "",
+      kind: "web-video",
+      resumablePath: WEB_VIDEO_RESUMABLE_UPLOAD_PATH
+    };
+  }
+  return null;
+}
+
+function getRawDataUploadSessionStorePath() {
+  return path.join(app.getPath("userData"), RAW_DATA_RESUMABLE_SESSION_FILE);
+}
+
+function readRawDataUploadSessions() {
+  try {
+    const storePath = getRawDataUploadSessionStorePath();
+    if (!fs.existsSync(storePath)) {
+      return {};
+    }
+    const parsed = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRawDataUploadSessions(sessions) {
+  const storePath = getRawDataUploadSessionStorePath();
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  fs.writeFileSync(storePath, JSON.stringify(sessions, null, 2));
+}
+
+function getRawDataUploadSessionKey({ fileName, filePath, kind = "raw-data", stats }) {
+  return crypto
+    .createHash("sha256")
+    .update(`${kind}\n${path.resolve(filePath)}\n${fileName}\n${stats.size}\n${Math.round(stats.mtimeMs)}`)
+    .digest("hex");
+}
+
+function saveRawDataUploadSession(sessionKey, session) {
+  const sessions = readRawDataUploadSessions();
+  sessions[sessionKey] = {
+    ...session,
+    savedAt: new Date().toISOString()
+  };
+  writeRawDataUploadSessions(sessions);
+}
+
+function removeRawDataUploadSession(sessionKey) {
+  const sessions = readRawDataUploadSessions();
+  if (sessions[sessionKey]) {
+    delete sessions[sessionKey];
+    writeRawDataUploadSessions(sessions);
+  }
+}
+
+function requestUploadJson({ body, method = "POST", token, uploadRecord, url }) {
+  return new Promise((resolve, reject) => {
+    if (uploadRecord?.canceled) {
+      reject(new Error("上传已取消"));
+      return;
+    }
+    const payload = body === undefined ? "" : JSON.stringify(body);
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? https : http;
+    const request = transport.request(
+      target,
+      {
+        method,
+        headers: {
+          Accept: "application/json",
+          ...(payload ? { "Content-Length": Buffer.byteLength(payload), "Content-Type": "application/json" } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("end", () => {
+          if (uploadRecord?.request === request) {
+            uploadRecord.request = null;
+          }
+          if (uploadRecord?.canceled) {
+            reject(new Error("上传已取消"));
+            return;
+          }
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(getUploadHttpErrorMessage(response.statusCode, text)));
+            return;
+          }
+          try {
+            const parsed = text ? JSON.parse(text) : {};
+            resolve(parsed?.result ?? parsed);
+          } catch {
+            reject(new Error("Upload service returned invalid JSON."));
+          }
+        });
+      }
+    );
+    if (uploadRecord) {
+      uploadRecord.request = request;
+    }
+    request.on("error", (error) => {
+      if (uploadRecord?.request === request) {
+        uploadRecord.request = null;
+      }
+      reject(uploadRecord?.canceled ? new Error("上传已取消") : error);
+    });
+    if (payload) {
+      request.write(payload);
+    }
+    request.end();
+  });
+}
+
+function waitUntilUploadCanSend(uploadRecord) {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (uploadRecord.canceled) {
+        reject(new Error("上传已取消"));
+        return;
+      }
+      if (!uploadRecord.paused) {
+        resolve();
+        return;
+      }
+      uploadRecord.pauseWaiters.push(check);
+    };
+    check();
+  });
+}
+
+function wakeUploadPauseWaiters(uploadRecord) {
+  const waiters = uploadRecord.pauseWaiters.splice(0);
+  for (const waiter of waiters) {
+    waiter();
+  }
+}
+
+function hashFileSha256({ filePath, uploadRecord }) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    uploadRecord.stream = stream;
+    stream.on("data", (chunk) => {
+      if (uploadRecord.canceled) {
+        stream.destroy(new Error("上传已取消"));
+        return;
+      }
+      hash.update(chunk);
+    });
+    stream.on("error", (error) => {
+      uploadRecord.stream = null;
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.on("end", () => {
+      uploadRecord.stream = null;
+      if (uploadRecord.canceled) {
+        reject(new Error("上传已取消"));
+        return;
+      }
+      resolve(hash.digest("hex"));
+    });
+  });
 }
 
 function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, uploadId, url }) {
@@ -399,6 +632,326 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
   });
 }
 
+function uploadResumableVideoPart({ filePath, jobId, partNumber, sender, token, uploadRecord, uploadToken, url, start, end, stats, uploadedBeforePart }) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? https : http;
+    const partBytes = end - start + 1;
+    let bytesSent = 0;
+    const request = transport.request(
+      target,
+      {
+        method: "PUT",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+          "Content-Length": partBytes,
+          "Content-Type": "application/octet-stream",
+          "X-Upload-Token": uploadToken
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          uploadRecord.stream = null;
+          uploadRecord.request = null;
+          if (uploadRecord.canceled) {
+            reject(new Error("上传已取消"));
+            return;
+          }
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(getUploadHttpErrorMessage(response.statusCode, text)));
+            return;
+          }
+          try {
+            const parsed = text ? JSON.parse(text) : {};
+            resolve(parsed?.result ?? parsed);
+          } catch {
+            reject(new Error("Upload service returned invalid JSON."));
+          }
+        });
+      }
+    );
+    const stream = fs.createReadStream(filePath, { start, end });
+    uploadRecord.request = request;
+    uploadRecord.stream = stream;
+    request.on("error", (error) => {
+      uploadRecord.stream = null;
+      uploadRecord.request = null;
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.on("data", (chunk) => {
+      bytesSent += chunk.length;
+      uploadRecord.bytesUploaded = uploadedBeforePart + bytesSent;
+      uploadRecord.sendProgress?.("uploading", {
+        bytesUploaded: uploadRecord.bytesUploaded,
+        message: partNumber > 1 ? "继续上传" : "正在上传"
+      });
+    });
+    stream.on("error", (error) => {
+      request.destroy(error);
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.pipe(request);
+  });
+}
+
+function abortResumableUploadSession(uploadRecord) {
+  if (!uploadRecord?.abortUrl || !uploadRecord.uploadToken || uploadRecord.remoteAbortStarted) {
+    return;
+  }
+  if (uploadRecord.phase === "completing" || uploadRecord.phase === "completed") {
+    return;
+  }
+  uploadRecord.remoteAbortStarted = true;
+  requestUploadJson({
+    body: { uploadToken: uploadRecord.uploadToken },
+    token: uploadRecord.token,
+    url: uploadRecord.abortUrl
+  }).catch(() => undefined);
+  if (uploadRecord.sessionKey) {
+    removeRawDataUploadSession(uploadRecord.sessionKey);
+  }
+}
+
+async function uploadResumableVideo({ config, fields, filePath, fileName, jobId, sender, token, uploadId }) {
+  const stats = fs.statSync(filePath);
+  const sessionKey = getRawDataUploadSessionKey({ fileName, filePath, kind: config.kind, stats });
+  const uploadStartedAt = Date.now();
+  const uploadRecord = {
+    abortUrl: null,
+    bytesUploaded: 0,
+    canceled: false,
+    paused: false,
+    pausedAt: null,
+    pausedMs: 0,
+    phase: "hashing",
+    pauseWaiters: [],
+    remoteAbortStarted: false,
+    request: null,
+    sendProgress: null,
+    sessionKey,
+    stream: null,
+    token,
+    uploadToken: null
+  };
+  const sendProgress = (status, extra = {}) => {
+    const currentPausedMs = uploadRecord.paused && uploadRecord.pausedAt ? Date.now() - uploadRecord.pausedAt : 0;
+    const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt - uploadRecord.pausedMs - currentPausedMs) / 1000);
+    const bytesUploaded = Number(extra.bytesUploaded ?? uploadRecord.bytesUploaded) || 0;
+    emitUploadProgress(sender, {
+      bytesUploaded,
+      filePath,
+      jobId,
+      percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
+      speedBytesPerSecond: status === "paused" ? 0 : Math.round(bytesUploaded / elapsedSeconds),
+      status,
+      totalBytes: stats.size,
+      uploadId,
+      ...extra
+    });
+  };
+  uploadRecord.sendProgress = sendProgress;
+  uploadRecord.cancel = () => {
+    if (uploadRecord.canceled) {
+      return;
+    }
+    uploadRecord.canceled = true;
+    abortResumableUploadSession(uploadRecord);
+    sendProgress("canceled", { message: "上传已取消", speedBytesPerSecond: 0 });
+    uploadRecord.stream?.destroy(new Error("上传已取消"));
+    uploadRecord.request?.destroy(new Error("上传已取消"));
+    wakeUploadPauseWaiters(uploadRecord);
+  };
+  uploadRecord.pause = () => {
+    if (uploadRecord.canceled || uploadRecord.paused) {
+      return;
+    }
+    uploadRecord.paused = true;
+    uploadRecord.pausedAt = Date.now();
+    uploadRecord.stream?.pause();
+    sendProgress("paused", { message: "上传已暂停", speedBytesPerSecond: 0 });
+  };
+  uploadRecord.resume = () => {
+    if (uploadRecord.canceled || !uploadRecord.paused) {
+      return;
+    }
+    uploadRecord.paused = false;
+    if (uploadRecord.pausedAt) {
+      uploadRecord.pausedMs += Date.now() - uploadRecord.pausedAt;
+    }
+    uploadRecord.pausedAt = null;
+    uploadRecord.stream?.resume();
+    wakeUploadPauseWaiters(uploadRecord);
+    sendProgress("uploading", { message: "继续上传" });
+  };
+  activeUploadRequests.set(uploadId, uploadRecord);
+
+  try {
+    const sessions = readRawDataUploadSessions();
+    if (sessions[sessionKey]?.uploadToken && sessions[sessionKey]?.resumablePath === config.resumablePath) {
+      uploadRecord.abortUrl = resolveInferaUrl(`${config.resumablePath}/abort`);
+      uploadRecord.uploadToken = sessions[sessionKey].uploadToken;
+    }
+    sendProgress("uploading", { bytesUploaded: 0, message: "正在校验文件" });
+    const sha256 = await hashFileSha256({ filePath, uploadRecord });
+    if (config.deduplicatePath) {
+      uploadRecord.phase = "checking";
+      sendProgress("uploading", { bytesUploaded: 0, message: "正在检查重复文件" });
+      const duplicate = await requestUploadJson({
+        body: { sha256, sizeBytes: stats.size },
+        token,
+        uploadRecord,
+        url: resolveInferaUrl(config.deduplicatePath)
+      });
+      if (duplicate?.duplicate && duplicate.archive) {
+        if (sessions[sessionKey]?.uploadToken) {
+          await requestUploadJson({
+            body: { uploadToken: sessions[sessionKey].uploadToken },
+            token,
+            uploadRecord,
+            url: resolveInferaUrl(`${config.resumablePath}/abort`)
+          }).catch(() => undefined);
+          removeRawDataUploadSession(sessionKey);
+        }
+        uploadRecord.bytesUploaded = stats.size;
+        sendProgress("processing", {
+          bytesUploaded: stats.size,
+          message: "文件已存在，跳过上传",
+          percent: 100
+        });
+        return duplicate.archive;
+      }
+    } else {
+      uploadRecord.phase = "initializing";
+      sendProgress("uploading", { bytesUploaded: 0, message: "正在准备分片上传" });
+    }
+
+    let session = sessions[sessionKey]?.uploadToken
+      ? await requestUploadJson({
+          body: { uploadToken: sessions[sessionKey].uploadToken },
+          token,
+          uploadRecord,
+          url: resolveInferaUrl(`${config.resumablePath}/status`)
+        }).catch(() => null)
+      : null;
+
+    if (!session) {
+      const initBody = {
+        fileName,
+        mime: getVideoMimeType(filePath),
+        sha256,
+        sizeBytes: stats.size
+      };
+      if (fields.duration_ms) {
+        initBody.durationMs = fields.duration_ms;
+      }
+      if (config.kind === "raw-data") {
+        initBody.capturedAtMs = fields.captured_at_ms;
+        initBody.durationMs = fields.duration_ms;
+      } else {
+        initBody.startTimestampMs = fields.start_timestamp_ms;
+      }
+      session = await requestUploadJson({
+        body: initBody,
+        token,
+        uploadRecord,
+        url: resolveInferaUrl(`${config.resumablePath}/init`)
+      });
+    }
+
+    uploadRecord.abortUrl = resolveInferaUrl(`${config.resumablePath}/abort`);
+    uploadRecord.uploadToken = session.uploadToken;
+    saveRawDataUploadSession(sessionKey, {
+      uploadToken: session.uploadToken,
+      fileName,
+      filePath,
+      kind: config.kind,
+      resumablePath: config.resumablePath,
+      sha256,
+      sizeBytes: stats.size
+    });
+
+    let uploadedBytes = Number(session.uploadedBytes) || 0;
+    uploadRecord.phase = "uploading";
+    uploadRecord.bytesUploaded = uploadedBytes;
+    sendProgress("uploading", { bytesUploaded: uploadedBytes, message: uploadedBytes > 0 ? "继续上传" : "正在上传" });
+
+    while (uploadedBytes < stats.size) {
+      if (uploadRecord.canceled) {
+        throw new Error("上传已取消");
+      }
+      await waitUntilUploadCanSend(uploadRecord);
+
+      const partSize = Number(session.partSizeBytes) || 16 * 1024 * 1024;
+      const partNumber = Number(session.nextPartNumber) || Math.floor(uploadedBytes / partSize) + 1;
+      const start = (partNumber - 1) * partSize;
+      const end = Math.min(stats.size - 1, start + partSize - 1);
+      let lastError = null;
+      for (let attempt = 1; attempt <= RESUMABLE_UPLOAD_RETRY_ATTEMPTS; attempt += 1) {
+        try {
+          session = await uploadResumableVideoPart({
+            end,
+            filePath,
+            jobId,
+            partNumber,
+            sender,
+            start,
+            stats,
+            token,
+            uploadRecord,
+            uploadToken: session.uploadToken,
+            uploadedBeforePart: uploadedBytes,
+            url: resolveInferaUrl(`${config.resumablePath}/parts/${partNumber}`)
+          });
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (uploadRecord.canceled || attempt >= RESUMABLE_UPLOAD_RETRY_ATTEMPTS) {
+            throw error;
+          }
+          sendProgress("uploading", {
+            bytesUploaded: uploadRecord.bytesUploaded,
+            message: `上传失败，正在重试 ${attempt}/${RESUMABLE_UPLOAD_RETRY_ATTEMPTS}`
+          });
+          await sleep(1000 * attempt);
+        }
+      }
+      if (lastError) {
+        throw lastError;
+      }
+      uploadedBytes = Number(session.uploadedBytes) || end + 1;
+      uploadRecord.bytesUploaded = uploadedBytes;
+      saveRawDataUploadSession(sessionKey, {
+        uploadToken: session.uploadToken,
+        fileName,
+        filePath,
+        kind: config.kind,
+        resumablePath: config.resumablePath,
+        sha256,
+        sizeBytes: stats.size
+      });
+    }
+
+    sendProgress("processing", { bytesUploaded: stats.size, percent: 100, message: "文件已发送，等待服务器处理" });
+    uploadRecord.phase = "completing";
+    const result = await requestUploadJson({
+      body: { uploadToken: session.uploadToken },
+      token,
+      uploadRecord,
+      url: resolveInferaUrl(`${config.resumablePath}/complete`)
+    });
+    uploadRecord.phase = "completed";
+    removeRawDataUploadSession(sessionKey);
+    return result;
+  } finally {
+    activeUploadRequests.delete(uploadId);
+  }
+}
+
 async function uploadInferaVideo(payload = {}, sender) {
   const filePath = String(payload.path || payload.filePath || "");
   if (!filePath || !fs.existsSync(filePath)) {
@@ -415,12 +968,35 @@ async function uploadInferaVideo(payload = {}, sender) {
   }
 
   const uploadId = String(payload.uploadId || crypto.randomUUID());
-  const fields = {
-    start_timestamp_ms: normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms)
-  };
+  const uploadPath = payload.uploadPath || WEB_VIDEO_UPLOAD_PATH;
+  const resumableConfig = getResumableVideoUploadConfig(uploadPath);
+  const isRawDataUpload = resumableConfig?.kind === "raw-data";
+  const uploadTimestampMs = normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms ?? payload.capturedAtMs ?? payload.captured_at_ms);
+  const fields = isRawDataUpload
+    ? { captured_at_ms: uploadTimestampMs }
+    : { start_timestamp_ms: uploadTimestampMs };
   const durationSeconds = normalizeUploadDuration(payload.durationSeconds ?? payload.duration_seconds);
-  if (durationSeconds) {
+  const durationMs = normalizeUploadDurationMs(
+    payload.durationMs ?? payload.duration_ms ?? (durationSeconds ? Number(durationSeconds) * 1000 : null)
+  );
+  if (durationMs) {
+    fields.duration_ms = durationMs;
+  }
+  if (durationSeconds && !resumableConfig) {
     fields.duration_seconds = durationSeconds;
+  }
+
+  if (resumableConfig) {
+    return uploadResumableVideo({
+      config: resumableConfig,
+      fields,
+      fileName: payload.fileName || path.basename(filePath),
+      filePath,
+      jobId: payload.jobId,
+      sender,
+      token: payload.token,
+      uploadId
+    });
   }
 
   return uploadMultipart({
@@ -431,7 +1007,7 @@ async function uploadInferaVideo(payload = {}, sender) {
     sender,
     token: payload.token,
     uploadId,
-    url: resolveInferaUrl(payload.uploadPath || WEB_VIDEO_UPLOAD_PATH)
+    url: resolveInferaUrl(uploadPath)
   });
 }
 
