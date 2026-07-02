@@ -833,7 +833,7 @@ function App() {
 
   async function runTransferTask(task, token) {
     const taskJob = createJobFromTransferTask(task);
-    const options = getTransferTaskUploadOptions(task);
+    const options = getTransferTaskUploadOptions(task, () => Boolean(automationOptionsRef.current.autoClearLocal));
 
     updateTransferTask(task.id, {
       completedAt: null,
@@ -2930,14 +2930,14 @@ function createJobFromTransferTask(task) {
   };
 }
 
-function getTransferTaskUploadOptions(task) {
+function getTransferTaskUploadOptions(task, shouldClearLocalOnComplete = null) {
   return {
     autoClearLocal: Boolean(task.autoClearLocal),
     clearLocalTarget: task.clearLocalTarget,
     destination: task.destination,
     endpoint: task.endpoint,
     mode: task.kind === "backup" ? "backup" : "manual",
-    shouldClearLocalOnComplete: () => Boolean(automationOptionsRef.current.autoClearLocal)
+    shouldClearLocalOnComplete
   };
 }
 
