@@ -46,7 +46,7 @@ jobs:
             ffprobe: ffprobe-arm64
             ffprobe_match: "Mach-O 64-bit executable arm64"
           - arch: x64
-            runner: macos-13
+            runner: macos-15-intel
             ffprobe: ffprobe-x64
             ffprobe_match: "Mach-O 64-bit executable x86_64"
     env:
