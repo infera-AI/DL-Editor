@@ -255,6 +255,21 @@ jobs:
                   return "darwin", arch, "mac"
               return "", "", "unknown"
 
+          def make_progress_callback(name, size_bytes):
+              last_reported = {"percent": -1}
+
+              def progress(consumed_bytes, total_bytes):
+                  total = total_bytes or size_bytes
+                  if total <= 0:
+                      print(f"Uploading {name}: {consumed_bytes} bytes", flush=True)
+                      return
+                  percent = min(100, int(consumed_bytes * 100 / total))
+                  if percent == 100 or percent >= last_reported["percent"] + 10:
+                      last_reported["percent"] = percent
+                      print(f"Uploading {name}: {consumed_bytes}/{total} bytes ({percent}%)", flush=True)
+
+              return progress
+
           assets = []
           for path in files:
               name = path.name
@@ -268,7 +283,13 @@ jobs:
               sha256, size_bytes = hash_file(path)
               object_key = f"{release_root}/{platform_dir}/{name}"
               content_type = content_type_for(name)
-              bucket.put_object_from_file(object_key, str(path), headers={"Content-Type": content_type})
+              print(f"Starting OSS upload {name} -> oss://{bucket_name}/{object_key} ({size_bytes} bytes)", flush=True)
+              bucket.put_object_from_file(
+                  object_key,
+                  str(path),
+                  headers={"Content-Type": content_type},
+                  progress_callback=make_progress_callback(name, size_bytes),
+              )
               assets.append(
                   {
                       "platform": platform,
@@ -280,7 +301,7 @@ jobs:
                       "contentType": content_type,
                   }
               )
-              print(f"Uploaded {name} -> oss://{bucket_name}/{object_key} ({platform}/{arch}, {size_bytes} bytes)")
+              print(f"Uploaded {name} -> oss://{bucket_name}/{object_key} ({platform}/{arch}, {size_bytes} bytes)", flush=True)
 
           if not assets:
               raise RuntimeError("No installer assets were found for OSS publishing")
