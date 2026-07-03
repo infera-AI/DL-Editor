@@ -97,6 +97,8 @@ const CLOUD_SPACES = [
 ];
 const RESEARCH_PARSE_STATUSES = ["PARSED", "FALLBACK_PARSED", "PARTIAL_PARSED"];
 const RESEARCH_PAGE_SIZE = 200;
+const ENGINE_INDEX_QUERY = "*";
+const ENGINE_INDEX_HITS = 100;
 const UPLOAD_STATUS_LABELS = {
   queued: "等待上传",
   uploading: "上传中",
@@ -144,6 +146,7 @@ const dlEditor = window.dlEditor || {
   streamEngineQa: async () => ({ ok: false }),
   cancelEngineQaStream: async () => ({ cancelled: false }),
   onEngineQaStreamEvent: () => () => undefined,
+  getEngineIndexContent: async () => null,
   uploadInferaVideo: async () => ({}),
   cancelInferaUpload: async () => ({ canceled: false }),
   pauseInferaUpload: async () => ({ paused: false }),
@@ -2260,6 +2263,44 @@ function getEngineEntryStatusLabel(entry) {
   return `${entry.response?.results?.length || 0} hits`;
 }
 
+function getEngineIndexResults(response) {
+  if (Array.isArray(response?.results)) {
+    return response.results;
+  }
+  if (Array.isArray(response?.items)) {
+    return response.items;
+  }
+  if (Array.isArray(response?.data)) {
+    return response.data;
+  }
+  return [];
+}
+
+function getEngineIndexResultKey(hit, index) {
+  return hit?.id || hit?.source_id || hit?.span_id || hit?.asset_id || `${index}-index-result`;
+}
+
+function getEngineIndexContentText(hit) {
+  return (
+    hit?.content_text ||
+    hit?.text ||
+    hit?.summary_text ||
+    hit?.summary ||
+    hit?.description ||
+    hit?.caption_text ||
+    hit?.ocr_text ||
+    ""
+  );
+}
+
+function formatEngineJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value || "");
+  }
+}
+
 function getEngineRawRefFromReferences(references) {
   for (const reference of references || []) {
     const rawRef = (reference?.raw_refs || []).find((item) => item?.asset_id);
@@ -2388,6 +2429,12 @@ function EngineWorkspace({ onLock }) {
   const [queryEvents, setQueryEvents] = useState([]);
   const [engineStatus, setEngineStatus] = useState({ status: "checking", message: "", health: null });
   const [engineMediaProxyUrl, setEngineMediaProxyUrl] = useState("");
+  const [engineIndexState, setEngineIndexState] = useState({
+    status: "idle",
+    message: "",
+    response: null,
+    loadedAt: ""
+  });
 
   useEffect(() => {
     let isCurrent = true;
@@ -2647,8 +2694,61 @@ function EngineWorkspace({ onLock }) {
     setEngineInput("");
   }
 
-  function runEngineTest() {
+  async function loadEngineIndexContent() {
     setEngineView("test");
+    setEngineIndexState({
+      status: "loading",
+      message: "",
+      response: null,
+      loadedAt: ""
+    });
+
+    try {
+      let response = null;
+      if (typeof dlEditor.getEngineIndexContent === "function") {
+        try {
+          response = await dlEditor.getEngineIndexContent();
+        } catch (error) {
+          if (/No handler registered for 'engine:get-index-content'/i.test(String(error?.message || error))) {
+            throw new Error("Engine index handler 还没有加载，请重启 Electron dev app 后再点测试 icon。");
+          }
+          throw error;
+        }
+      }
+      if (!response) {
+        response = await requestEngine("/v1/search", {
+          method: "POST",
+          body: {
+            query: ENGINE_INDEX_QUERY,
+            hits: ENGINE_INDEX_HITS,
+            include_debug: true,
+            use_vespa: engineUseVespa,
+            request_id: `engine-index-${Date.now()}`
+          }
+        });
+      }
+
+      setEngineIndexState({
+        status: "done",
+        message: "",
+        response,
+        loadedAt: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+      });
+      setEngineStatus((current) => ({ status: "online", message: "", health: current.health || { status: "ok" } }));
+    } catch (error) {
+      const message = getEngineErrorMessage(error);
+      setEngineIndexState({
+        status: "error",
+        message,
+        response: null,
+        loadedAt: ""
+      });
+      setEngineStatus({ status: "offline", message, health: null });
+    }
+  }
+
+  function runEngineTest() {
+    loadEngineIndexContent();
   }
 
   function clearEngineWorkspace() {
@@ -2656,6 +2756,7 @@ function EngineWorkspace({ onLock }) {
     setEngineInput("");
     setSearchEvents([]);
     setQueryEvents([]);
+    setEngineIndexState({ status: "idle", message: "", response: null, loadedAt: "" });
     refreshEngineHealth();
   }
 
@@ -2702,9 +2803,12 @@ function EngineWorkspace({ onLock }) {
       </header>
 
       {engineView === "test" ? (
-        <section className="engine-test-view">
-          <h1>Engine Test</h1>
-        </section>
+        <EngineTestView
+          engineIndexState={engineIndexState}
+          engineMediaProxyUrl={engineMediaProxyUrl}
+          onRefresh={loadEngineIndexContent}
+          useVespa={engineUseVespa}
+        />
       ) : (
         <section className="engine-main">
           {activeEngineTab === "search" ? (
@@ -2732,6 +2836,119 @@ function EngineWorkspace({ onLock }) {
         </section>
       )}
     </section>
+  );
+}
+
+function EngineTestView({ engineIndexState, engineMediaProxyUrl, onRefresh, useVespa }) {
+  const response = engineIndexState.response || null;
+  const results = getEngineIndexResults(response);
+  const isLoading = engineIndexState.status === "loading";
+  const planSummary = getEnginePlanSummary(response?.debug?.query_plan || response?.plan);
+  const rawJson = response ? formatEngineJson(response) : "";
+  const counts = Array.isArray(response?.counts) ? response.counts : [];
+  const sourceLabel = response?.db_path ? "SQLite records" : "Search API";
+
+  return (
+    <section className="engine-test-view">
+      <header className="engine-panel-head">
+        <div>
+          <strong>Index Content</strong>
+          <span>
+            {useVespa ? "Vespa hybrid" : "Local multi-index"} · {results.length} results
+            {engineIndexState.loadedAt ? ` · ${engineIndexState.loadedAt}` : ""}
+          </span>
+        </div>
+        <button className="secondary-button engine-test-refresh" disabled={isLoading} onClick={onRefresh} type="button">
+          <RotateCcw size={15} />
+          <span>{isLoading ? "Loading" : "Refresh"}</span>
+        </button>
+      </header>
+
+      <div className="engine-test-body">
+        {isLoading ? (
+          <div className="engine-empty-state">Loading index content</div>
+        ) : engineIndexState.status === "error" ? (
+          <div className="engine-test-alert">
+            <TriangleAlert size={16} />
+            <span>{engineIndexState.message}</span>
+          </div>
+        ) : !response ? (
+          <div className="engine-empty-state">No index response</div>
+        ) : (
+          <>
+            <div className="engine-index-summary">
+              <div>
+                <span>Source</span>
+                <strong>{sourceLabel}</strong>
+              </div>
+              <div>
+                <span>Records</span>
+                <strong>{results.length}</strong>
+              </div>
+              <div>
+                <span>Kinds</span>
+                <strong>{counts.length || "-"}</strong>
+              </div>
+            </div>
+            {response?.db_path && <p className="engine-plan-line">{response.db_path}</p>}
+            {counts.length > 0 && (
+              <div className="engine-index-counts">
+                {counts.map((item) => (
+                  <span key={item.kind}>
+                    {item.kind}: {item.count}
+                  </span>
+                ))}
+              </div>
+            )}
+            {planSummary && <p className="engine-plan-line">{planSummary}</p>}
+            <div className="engine-index-list">
+              {results.length === 0 ? (
+                <div className="engine-empty-state">No index content returned</div>
+              ) : (
+                results.map((hit, index) => (
+                  <EngineIndexResult hit={hit} index={index} key={getEngineIndexResultKey(hit, index)} mediaProxyUrl={engineMediaProxyUrl} />
+                ))
+              )}
+            </div>
+            <details className="engine-index-raw">
+              <summary>Raw index response</summary>
+              <pre>{rawJson}</pre>
+            </details>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function EngineIndexResult({ hit, index, mediaProxyUrl }) {
+  const evidenceRefs = hit?.evidence_refs || hit?.references || [];
+  const rawRef = getEngineRawRefFromReferences(evidenceRefs);
+  const timeRange = formatEngineTimeRange(hit?.time_range);
+  const matchedFields = Array.isArray(hit?.matched_fields) ? hit.matched_fields.join(" / ") : "";
+  const contentText = getEngineIndexContentText(hit);
+
+  return (
+    <article className="engine-index-result">
+      <div className="engine-hit-title-row">
+        <strong>{hit?.title || hit?.label || hit?.id || `Index ${index + 1}`}</strong>
+        <span>{Number(hit?.score || 0).toFixed(3)}</span>
+      </div>
+      <div className="engine-meta-row">
+        <span>{getEngineSourceLabel(hit?.type || hit?.source_type)}</span>
+        {hit?.id && <span>{hit.id}</span>}
+        {timeRange && <span>{timeRange}</span>}
+        <span>{getEngineEvidenceCountLabel(evidenceRefs.length)}</span>
+        {matchedFields && <span>{matchedFields}</span>}
+      </div>
+      {hit?.snippet && <p>{hit.snippet}</p>}
+      {contentText && contentText !== hit?.snippet && <p>{contentText}</p>}
+      <EngineMediaPreview mediaProxyUrl={mediaProxyUrl} rawRef={rawRef} />
+      <details className="engine-index-result-raw">
+        <summary>JSON</summary>
+        <pre>{formatEngineJson(hit)}</pre>
+      </details>
+    </article>
   );
 }
 
@@ -2790,7 +3007,7 @@ function EngineSearchEntryBody({ entry, mediaProxyUrl }) {
   return (
     <div className="engine-hit-stack">
       {planSummary && <p className="engine-plan-line">{planSummary}</p>}
-      {results.slice(0, 5).map((hit, index) => (
+      {results.map((hit, index) => (
         <EngineSearchHit hit={hit} key={hit.id || `${entry.id}-${index}`} mediaProxyUrl={mediaProxyUrl} support={getEngineSearchSupport(entry.response, index)} />
       ))}
     </div>
@@ -2939,7 +3156,7 @@ function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
       {response.refinement_error && <p className="engine-entry-message error">{response.refinement_error}</p>}
       {evidenceReasoning.length > 0 && (
         <div className="engine-reasoning-list">
-          {evidenceReasoning.slice(0, 8).map((step, index) => (
+          {evidenceReasoning.map((step, index) => (
             <article className="engine-reasoning-step" key={`${step.step || "step"}-${index}`}>
               <div>
                 <strong>{getEngineReasoningStepLabel(step.step)}</strong>
@@ -2953,7 +3170,7 @@ function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
       )}
       {retrievalResults.length > 0 && (
         <div className="engine-retrieval-result-list">
-          {retrievalResults.slice(0, 4).map((result, index) => (
+          {retrievalResults.map((result, index) => (
             <div className="engine-retrieval-result" key={result.id || index}>
               <strong>{result.title || `${getEngineSourceLabel(result.type)} ${index + 1}`}</strong>
               <span>
@@ -2965,7 +3182,7 @@ function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
       )}
       {citations.length > 0 && (
         <div className="engine-citation-list">
-          {citations.slice(0, 5).map((citation, index) => (
+          {citations.map((citation, index) => (
             <div className="engine-citation" key={citation.source_id || citation.span_id || index}>
               <strong>{citation.label || citation.source_id || `证据 ${index + 1}`}</strong>
               <span>

@@ -6,6 +6,7 @@ const http = require("http");
 const https = require("https");
 const os = require("os");
 const path = require("path");
+const { Readable } = require("stream");
 const { getDecoderArgs } = require("./decoderArgs.cjs");
 const { getMuxOriginalAudioArgs, getOutputStreamArgs } = require("./ffmpegArgs.cjs");
 const { deriveStartTimeMs } = require("./mediaStartTime.cjs");
@@ -20,6 +21,11 @@ const { buildVideoFilters } = require("./videoFilters.cjs");
 
 const APP_NAME = "DL Studio";
 const INFERA_API_BASE_URL = process.env.INFERA_API_BASE_URL || process.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
+const DL_ENGINE_API_BASE_URL = process.env.DL_ENGINE_API_BASE_URL || process.env.VITE_DL_ENGINE_API_BASE_URL || "http://127.0.0.1:8787";
+const DL_ENGINE_TENANT_ID = process.env.DL_ENGINE_TENANT_ID || process.env.DL_LOCAL_QUERY_TENANT_ID || "ae0f6251-9fda-7320-b9a4-d1b5f43fcff7";
+const DL_ENGINE_USER_ID = process.env.DL_ENGINE_USER_ID || process.env.DL_LOCAL_QUERY_USER_ID || "b67b45aa-16ed-7546-8460-c28c228ca30e";
+const DL_ENGINE_AUTH_TOKEN = process.env.DL_ENGINE_AUTH_TOKEN || "";
+const DL_ENGINE_INDEX_DB_PATH = process.env.DL_ENGINE_INDEX_DB_PATH || "";
 const TITLE_BAR_HEIGHT = 42;
 const ZOOM_MIN = -3;
 const ZOOM_MAX = 3;
@@ -39,6 +45,11 @@ let cpuUsageSnapshot = null;
 let latestUsage = null;
 let usageMonitor = null;
 let gpuSampleInFlight = false;
+let researchAdminCookieHeader = "";
+let engineMediaProxyServer = null;
+let engineMediaProxyUrl = "";
+let engineMediaProxyStartPromise = null;
+const activeEngineQaStreams = new Map();
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
@@ -56,6 +67,104 @@ app.setName(APP_NAME);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function getEngineIndexDbPath() {
+  const candidates = [
+    DL_ENGINE_INDEX_DB_PATH,
+    path.resolve(__dirname, "../../../../DL-Memory-V1/data/indexes/haven_repro.sqlite"),
+    path.resolve(process.cwd(), "../DL-Memory-V1/data/indexes/haven_repro.sqlite")
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || "";
+}
+
+function readEngineIndexContent() {
+  const dbPath = getEngineIndexDbPath();
+  if (!dbPath || !fs.existsSync(dbPath)) {
+    throw new Error(`DL Engine index sqlite not found: ${dbPath || "unset"}`);
+  }
+
+  const script = `
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+conn = sqlite3.connect(str(db_path))
+conn.row_factory = sqlite3.Row
+tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+if "records" not in tables:
+    print(json.dumps({"db_path": str(db_path), "tables": tables, "counts": [], "results": []}))
+    raise SystemExit(0)
+counts = [
+    {"kind": row["kind"], "count": int(row["n"])}
+    for row in conn.execute("SELECT kind, COUNT(*) AS n FROM records GROUP BY kind ORDER BY kind")
+]
+rows = conn.execute(
+    "SELECT kind, video_id, record_id, payload, updated_at FROM records ORDER BY kind, video_id, record_id"
+).fetchall()
+results = []
+for row in rows:
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except Exception:
+        payload = {"raw_payload": row["payload"]}
+    title = (
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("summary")
+        or payload.get("summary_text")
+        or payload.get("description")
+        or row["record_id"]
+    )
+    snippet = (
+        payload.get("search_text")
+        or payload.get("content_text")
+        or payload.get("summary_text")
+        or payload.get("description")
+        or payload.get("evidence_text")
+        or ""
+    )
+    results.append({
+        "id": row["record_id"],
+        "record_id": row["record_id"],
+        "video_id": row["video_id"],
+        "type": row["kind"],
+        "title": str(title)[:240],
+        "snippet": str(snippet)[:1200],
+        "updated_at": row["updated_at"],
+        "payload": payload,
+    })
+print(json.dumps({"db_path": str(db_path), "tables": tables, "counts": counts, "results": results}))
+`;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.env.PYTHON || "python", ["-c", script, dbPath], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `Unable to read DL Engine index sqlite (${code})`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (error) {
+        reject(new Error(error.message || "Unable to parse DL Engine index sqlite output."));
+      }
+    });
+  });
+}
+
 function resolveInferaUrl(value) {
   if (!value) {
     throw new Error("Missing infera request path.");
@@ -71,6 +180,259 @@ function resolveInferaUrl(value) {
   return new URL(normalizedPath, `${normalizedBase}/`).toString();
 }
 
+function resolveInferaAdminUrl(value) {
+  if (!value) {
+    throw new Error("Missing infera admin request path.");
+  }
+
+  const rawPath = String(value);
+  if (/^https?:\/\//i.test(rawPath)) {
+    return rawPath;
+  }
+
+  const apiUrl = new URL(INFERA_API_BASE_URL);
+  const normalizedPath = rawPath.replace(/^\/+/, "");
+  return new URL(normalizedPath, `${apiUrl.origin}/`).toString();
+}
+
+function resolveEngineUrl(value) {
+  if (!value) {
+    throw new Error("Missing DL Engine request path.");
+  }
+
+  const rawPath = String(value);
+  const baseUrl = new URL(DL_ENGINE_API_BASE_URL);
+  if (/^https?:\/\//i.test(rawPath)) {
+    const requestUrl = new URL(rawPath);
+    if (requestUrl.origin !== baseUrl.origin) {
+      throw new Error("DL Engine request must target the configured local engine origin.");
+    }
+    return requestUrl.toString();
+  }
+
+  const normalizedBase = DL_ENGINE_API_BASE_URL.replace(/\/+$/, "");
+  const normalizedPath = rawPath.replace(/^\/+/, "");
+  return new URL(normalizedPath, `${normalizedBase}/`).toString();
+}
+
+function getEngineAuthorization() {
+  if (DL_ENGINE_AUTH_TOKEN) {
+    return DL_ENGINE_AUTH_TOKEN.startsWith("Bearer ") ? DL_ENGINE_AUTH_TOKEN : `Bearer ${DL_ENGINE_AUTH_TOKEN}`;
+  }
+
+  return `Bearer dev:${DL_ENGINE_TENANT_ID}:${DL_ENGINE_USER_ID}`;
+}
+
+function compactProxyHeaders(headers) {
+  return Object.fromEntries(Object.entries(headers).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+}
+
+function sendEngineMediaProxyError(response, status, message) {
+  if (response.headersSent) {
+    response.destroy();
+    return;
+  }
+
+  response.writeHead(status, {
+    "access-control-allow-origin": "*",
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8"
+  });
+  response.end(JSON.stringify({ message }));
+}
+
+async function handleEngineMediaProxyRequest(request, response) {
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,HEAD,OPTIONS",
+      "access-control-allow-headers": "range",
+      "cache-control": "no-store"
+    });
+    response.end();
+    return;
+  }
+
+  if (!["GET", "HEAD"].includes(request.method || "")) {
+    sendEngineMediaProxyError(response, 405, "Method not allowed.");
+    return;
+  }
+
+  const url = new URL(request.url || "/", "http://127.0.0.1");
+  const mediaMatch = url.pathname.match(/^\/engine-media\/assets\/([^/]+)\/media$/);
+  if (!mediaMatch) {
+    sendEngineMediaProxyError(response, 404, "Not found.");
+    return;
+  }
+
+  const assetId = decodeURIComponent(mediaMatch[1]);
+  if (!/^[A-Za-z0-9_-]+(?:-[A-Za-z0-9_-]+)*$/.test(assetId)) {
+    sendEngineMediaProxyError(response, 400, "Invalid asset id.");
+    return;
+  }
+
+  const enginePath = `/v1/assets/${encodeURIComponent(assetId)}/media?expires_seconds=${encodeURIComponent(url.searchParams.get("expires_seconds") || "600")}`;
+  let engineResponse;
+  try {
+    engineResponse = await fetch(resolveEngineUrl(enginePath), {
+      headers: compactProxyHeaders({
+        Accept: request.headers.accept || "video/*,application/octet-stream",
+        Authorization: getEngineAuthorization(),
+        Range: request.headers.range || undefined,
+        "x-trace-id": `dl-studio-engine-media-${Date.now()}-${crypto.randomUUID()}`
+      }),
+      method: request.method === "HEAD" ? "GET" : request.method,
+      redirect: "follow"
+    });
+  } catch (error) {
+    sendEngineMediaProxyError(response, 502, error.message || "DL Engine media request failed.");
+    return;
+  }
+
+  response.writeHead(
+    engineResponse.status,
+    compactProxyHeaders({
+      "access-control-allow-origin": "*",
+      "accept-ranges": engineResponse.headers.get("accept-ranges") || "bytes",
+      "cache-control": "no-store",
+      "content-length": engineResponse.headers.get("content-length"),
+      "content-range": engineResponse.headers.get("content-range"),
+      "content-type": engineResponse.headers.get("content-type") || "application/octet-stream"
+    })
+  );
+
+  if (request.method === "HEAD" || !engineResponse.body) {
+    response.end();
+    return;
+  }
+
+  Readable.fromWeb(engineResponse.body)
+    .on("error", () => response.destroy())
+    .pipe(response);
+}
+
+function startEngineMediaProxy() {
+  if (engineMediaProxyUrl) {
+    return Promise.resolve(engineMediaProxyUrl);
+  }
+  if (engineMediaProxyStartPromise) {
+    return engineMediaProxyStartPromise;
+  }
+
+  engineMediaProxyStartPromise = new Promise((resolve, reject) => {
+    const server = http.createServer((request, response) => {
+      handleEngineMediaProxyRequest(request, response).catch((error) => {
+        sendEngineMediaProxyError(response, 500, error.message || "DL Engine media proxy failed.");
+      });
+    });
+
+    server.on("error", (error) => {
+      engineMediaProxyStartPromise = null;
+      reject(error);
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        engineMediaProxyStartPromise = null;
+        reject(new Error("Unable to start DL Engine media proxy."));
+        return;
+      }
+
+      engineMediaProxyServer = server;
+      engineMediaProxyUrl = `http://127.0.0.1:${address.port}`;
+      resolve(engineMediaProxyUrl);
+    });
+  });
+
+  return engineMediaProxyStartPromise;
+}
+
+function stopEngineMediaProxy() {
+  if (engineMediaProxyServer) {
+    engineMediaProxyServer.close();
+  }
+  engineMediaProxyServer = null;
+  engineMediaProxyUrl = "";
+  engineMediaProxyStartPromise = null;
+}
+
+function getSetCookieHeaders(headers) {
+  if (!headers) {
+    return [];
+  }
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+
+  const value = headers.get?.("set-cookie");
+  return value ? [value] : [];
+}
+
+async function persistResearchAdminCookie(response, requestUrl) {
+  const setCookieHeaders = getSetCookieHeaders(response.headers);
+  if (!setCookieHeaders.length) {
+    return;
+  }
+
+  const cookies = new Map();
+  for (const cookiePart of researchAdminCookieHeader.split(";")) {
+    const [name, ...rest] = cookiePart.trim().split("=");
+    if (name && rest.length) {
+      cookies.set(name, rest.join("="));
+    }
+  }
+
+  const url = new URL(requestUrl);
+  for (const header of setCookieHeaders) {
+    const [pair] = String(header || "").split(";");
+    const [rawName, ...rawValueParts] = pair.trim().split("=");
+    const name = rawName?.trim();
+    if (!name || rawValueParts.length === 0) {
+      continue;
+    }
+
+    const value = rawValueParts.join("=");
+    if (!value) {
+      cookies.delete(name);
+      try {
+        await mainWindow?.webContents.session.cookies.remove(url.origin, name);
+      } catch {
+        // Ignore cookie-store cleanup failures; the raw header is still authoritative.
+      }
+      continue;
+    }
+
+    cookies.set(name, value);
+    try {
+      await mainWindow?.webContents.session.cookies.set({
+        url: url.origin,
+        name,
+        value,
+        path: "/"
+      });
+    } catch {
+      // Some admin cookies may include attributes Electron will reject when replayed manually.
+    }
+  }
+
+  researchAdminCookieHeader = [...cookies.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+function getResponseFilename(response, fallback = "research-videos.zip") {
+  const disposition = response.headers.get("content-disposition") || "";
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || fallback;
+}
+
 function isAllowedUpdateUrl(value) {
   const url = String(value || "");
   const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
@@ -84,20 +446,69 @@ function isAllowedUpdateUrl(value) {
 
 async function requestInfera(payload = {}) {
   const method = String(payload.method || "GET").toUpperCase();
-  const headers = { Accept: "application/json" };
+  const isAdminRequest = Boolean(payload.admin);
+  const responseType = payload.responseType || "json";
+  const headers = { Accept: payload.accept || (responseType === "download" ? "application/json, application/zip" : "application/json") };
+  let body;
 
-  if (payload.body !== undefined) {
+  if (payload.form !== undefined) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    body = new URLSearchParams(payload.form).toString();
+  } else if (payload.body !== undefined) {
     headers["Content-Type"] = "application/json";
+    body = JSON.stringify(payload.body);
   }
   if (payload.token) {
     headers.Authorization = `Bearer ${payload.token}`;
   }
+  if (isAdminRequest && researchAdminCookieHeader) {
+    headers.Cookie = researchAdminCookieHeader;
+  }
 
-  const response = await fetch(resolveInferaUrl(payload.path), {
+  const requestUrl = isAdminRequest ? resolveInferaAdminUrl(payload.path) : resolveInferaUrl(payload.path);
+
+  const response = await fetch(requestUrl, {
     method,
     headers,
-    body: payload.body === undefined ? undefined : JSON.stringify(payload.body)
+    body,
+    redirect: payload.redirect || "follow"
   });
+
+  if (isAdminRequest) {
+    await persistResearchAdminCookie(response, requestUrl);
+  }
+
+  if (responseType === "text") {
+    const text = await response.text();
+    if (response.status >= 400) {
+      throw new Error(text || `请求失败 (${response.status})`);
+    }
+    return { status: response.status, redirected: response.redirected, text };
+  }
+
+  if (responseType === "download") {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const result = await response.json();
+      if (!response.ok) {
+        const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return result;
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!response.ok) {
+      throw new Error(`请求失败 (${response.status})`);
+    }
+    return {
+      delivery: "direct",
+      filename: getResponseFilename(response),
+      content_type: contentType || "application/zip",
+      base64: buffer.toString("base64"),
+      size_bytes: buffer.length
+    };
+  }
 
   let result = null;
   try {
@@ -108,10 +519,193 @@ async function requestInfera(payload = {}) {
 
   if (!response.ok) {
     const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
+    if (isAdminRequest && response.status === 404) {
+      throw new Error(`Research admin endpoint not found: ${new URL(requestUrl).pathname}`);
+    }
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
 
   return result;
+}
+
+async function requestEngine(payload = {}) {
+  const method = String(payload.method || "GET").toUpperCase();
+  const responseType = payload.responseType || "json";
+  const headers = {
+    Accept: payload.accept || "application/json",
+    Authorization: getEngineAuthorization(),
+    "x-trace-id": payload.traceId || `dl-studio-engine-${Date.now()}-${crypto.randomUUID()}`
+  };
+  let body;
+
+  if (payload.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(payload.body);
+  }
+
+  const response = await fetch(resolveEngineUrl(payload.path), {
+    method,
+    headers,
+    body,
+    redirect: payload.redirect || "follow"
+  });
+
+  if (responseType === "text") {
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(text || `DL Engine 请求失败 (${response.status})`);
+    }
+    return { status: response.status, text };
+  }
+
+  const text = await response.text();
+  let result = null;
+  try {
+    result = text ? JSON.parse(text) : null;
+  } catch {
+    result = null;
+  }
+
+  if (!response.ok) {
+    const detail = result?.message || result?.detail || result?.title || text || `DL Engine 请求失败 (${response.status})`;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+
+  return result;
+}
+
+function parseEngineSseMessage(rawMessage) {
+  let eventName = "message";
+  const dataLines = [];
+  for (const rawLine of String(rawMessage || "").split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith(":")) {
+      continue;
+    }
+    const separator = rawLine.indexOf(":");
+    const field = separator >= 0 ? rawLine.slice(0, separator) : rawLine;
+    const value = separator >= 0 ? rawLine.slice(separator + 1).replace(/^ /, "") : "";
+    if (field === "event") {
+      eventName = value || "message";
+    } else if (field === "data") {
+      dataLines.push(value);
+    }
+  }
+
+  const dataText = dataLines.join("\n");
+  let data = dataText;
+  if (dataText) {
+    try {
+      data = JSON.parse(dataText);
+    } catch {
+      data = dataText;
+    }
+  }
+  return { event: eventName, data };
+}
+
+function drainEngineSseBuffer(buffer) {
+  const messages = [];
+  let remaining = buffer;
+  while (remaining) {
+    const match = remaining.match(/\r?\n\r?\n/);
+    if (!match || match.index === undefined) {
+      break;
+    }
+    messages.push(remaining.slice(0, match.index));
+    remaining = remaining.slice(match.index + match[0].length);
+  }
+  return { messages, remaining };
+}
+
+async function streamEngineQa(event, payload = {}) {
+  const streamId = String(payload.streamId || "");
+  if (!/^[A-Za-z0-9_.:-]{8,120}$/.test(streamId)) {
+    throw new Error("Invalid DL Engine QA stream id.");
+  }
+
+  const sender = event.sender;
+  const channel = `engine:qa-stream:event:${streamId}`;
+  const controller = new AbortController();
+  activeEngineQaStreams.set(streamId, controller);
+
+  const emit = (message) => {
+    if (!sender.isDestroyed()) {
+      sender.send(channel, message);
+    }
+  };
+
+  try {
+    const response = await fetch(resolveEngineUrl("/v1/qa"), {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: getEngineAuthorization(),
+        "Content-Type": "application/json",
+        "x-trace-id": payload.traceId || `dl-studio-engine-qa-${Date.now()}-${crypto.randomUUID()}`
+      },
+      body: JSON.stringify({ ...(payload.body || {}), response_mode: "sse" }),
+      redirect: "follow",
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `DL Engine QA stream failed (${response.status})`);
+    }
+
+    if (!response.body) {
+      throw new Error("DL Engine QA stream returned no body.");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const drained = drainEngineSseBuffer(buffer);
+      buffer = drained.remaining;
+      for (const rawMessage of drained.messages) {
+        emit(parseEngineSseMessage(rawMessage));
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      emit(parseEngineSseMessage(buffer));
+    }
+    emit({ event: "stream_closed", data: { ok: true } });
+    return { ok: true };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      emit({ event: "stream_cancelled", data: { message: "cancelled" } });
+      return { ok: false, cancelled: true };
+    }
+    emit({ event: "stream_error", data: { message: error.message || "DL Engine QA stream failed." } });
+    throw error;
+  } finally {
+    activeEngineQaStreams.delete(streamId);
+  }
+}
+
+function cancelEngineQaStream(streamId) {
+  const controller = activeEngineQaStreams.get(String(streamId || ""));
+  if (!controller) {
+    return { cancelled: false };
+  }
+  controller.abort();
+  activeEngineQaStreams.delete(String(streamId || ""));
+  return { cancelled: true };
+}
+
+function cancelAllEngineQaStreams() {
+  for (const controller of activeEngineQaStreams.values()) {
+    controller.abort();
+  }
+  activeEngineQaStreams.clear();
 }
 
 function parseJsonSafely(value) {
@@ -1896,8 +2490,11 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
+  await startEngineMediaProxy().catch((error) => {
+    console.error(`Failed to start DL Engine media proxy: ${error.message || error}`);
+  });
   createWindow();
   startUsageMonitor();
 
@@ -1907,6 +2504,11 @@ app.whenReady().then(() => {
       startUsageMonitor();
     }
   });
+});
+
+app.on("before-quit", () => {
+  cancelAllEngineQaStreams();
+  stopEngineMediaProxy();
 });
 
 app.on("window-all-closed", () => {
@@ -1983,6 +2585,11 @@ ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVide
 ipcMain.handle("infera:cancel-upload", async (_event, uploadId) => cancelInferaUpload(uploadId));
 ipcMain.handle("infera:pause-upload", async (_event, uploadId) => pauseInferaUpload(uploadId));
 ipcMain.handle("infera:resume-upload", async (_event, uploadId) => resumeInferaUpload(uploadId));
+ipcMain.handle("engine:request", async (_event, payload) => requestEngine(payload));
+ipcMain.handle("engine:qa-stream", async (event, payload) => streamEngineQa(event, payload));
+ipcMain.handle("engine:qa-stream:cancel", async (_event, streamId) => cancelEngineQaStream(streamId));
+ipcMain.handle("engine:get-media-proxy-url", async () => startEngineMediaProxy());
+ipcMain.handle("engine:get-index-content", async () => readEngineIndexContent());
 
 ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
   const filePath = String(targetPath || "");

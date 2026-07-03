@@ -25,6 +25,7 @@ const DL_ENGINE_API_BASE_URL = process.env.DL_ENGINE_API_BASE_URL || process.env
 const DL_ENGINE_TENANT_ID = process.env.DL_ENGINE_TENANT_ID || process.env.DL_LOCAL_QUERY_TENANT_ID || "ae0f6251-9fda-7320-b9a4-d1b5f43fcff7";
 const DL_ENGINE_USER_ID = process.env.DL_ENGINE_USER_ID || process.env.DL_LOCAL_QUERY_USER_ID || "b67b45aa-16ed-7546-8460-c28c228ca30e";
 const DL_ENGINE_AUTH_TOKEN = process.env.DL_ENGINE_AUTH_TOKEN || "";
+const DL_ENGINE_INDEX_DB_PATH = process.env.DL_ENGINE_INDEX_DB_PATH || "";
 const TITLE_BAR_HEIGHT = 42;
 const ZOOM_MIN = -3;
 const ZOOM_MAX = 3;
@@ -65,6 +66,104 @@ const VIDEO_MIME_TYPES = {
 app.setName(APP_NAME);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function getEngineIndexDbPath() {
+  const candidates = [
+    DL_ENGINE_INDEX_DB_PATH,
+    path.resolve(__dirname, "../../../../DL-Memory-V1/data/indexes/haven_repro.sqlite"),
+    path.resolve(process.cwd(), "../DL-Memory-V1/data/indexes/haven_repro.sqlite")
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || "";
+}
+
+function readEngineIndexContent() {
+  const dbPath = getEngineIndexDbPath();
+  if (!dbPath || !fs.existsSync(dbPath)) {
+    throw new Error(`DL Engine index sqlite not found: ${dbPath || "unset"}`);
+  }
+
+  const script = `
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+conn = sqlite3.connect(str(db_path))
+conn.row_factory = sqlite3.Row
+tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+if "records" not in tables:
+    print(json.dumps({"db_path": str(db_path), "tables": tables, "counts": [], "results": []}))
+    raise SystemExit(0)
+counts = [
+    {"kind": row["kind"], "count": int(row["n"])}
+    for row in conn.execute("SELECT kind, COUNT(*) AS n FROM records GROUP BY kind ORDER BY kind")
+]
+rows = conn.execute(
+    "SELECT kind, video_id, record_id, payload, updated_at FROM records ORDER BY kind, video_id, record_id"
+).fetchall()
+results = []
+for row in rows:
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except Exception:
+        payload = {"raw_payload": row["payload"]}
+    title = (
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("summary")
+        or payload.get("summary_text")
+        or payload.get("description")
+        or row["record_id"]
+    )
+    snippet = (
+        payload.get("search_text")
+        or payload.get("content_text")
+        or payload.get("summary_text")
+        or payload.get("description")
+        or payload.get("evidence_text")
+        or ""
+    )
+    results.append({
+        "id": row["record_id"],
+        "record_id": row["record_id"],
+        "video_id": row["video_id"],
+        "type": row["kind"],
+        "title": str(title)[:240],
+        "snippet": str(snippet)[:1200],
+        "updated_at": row["updated_at"],
+        "payload": payload,
+    })
+print(json.dumps({"db_path": str(db_path), "tables": tables, "counts": counts, "results": results}))
+`;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.env.PYTHON || "python3", ["-c", script, dbPath], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `Unable to read DL Engine index sqlite (${code})`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (error) {
+        reject(new Error(error.message || "Unable to parse DL Engine index sqlite output."));
+      }
+    });
+  });
+}
 
 function resolveInferaUrl(value) {
   if (!value) {
@@ -2466,6 +2565,7 @@ ipcMain.handle("engine:request", async (_event, payload) => requestEngine(payloa
 ipcMain.handle("engine:qa-stream", async (event, payload) => streamEngineQa(event, payload));
 ipcMain.handle("engine:qa-stream:cancel", async (_event, streamId) => cancelEngineQaStream(streamId));
 ipcMain.handle("engine:get-media-proxy-url", async () => startEngineMediaProxy());
+ipcMain.handle("engine:get-index-content", async () => readEngineIndexContent());
 
 ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
   const filePath = String(targetPath || "");

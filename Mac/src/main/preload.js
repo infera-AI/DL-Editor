@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld("dlEditor", {
   cancelEngineQaStream: (streamId) => ipcRenderer.invoke("engine:qa-stream:cancel", streamId),
   onEngineQaStreamEvent: (streamId, listener) => on(`engine:qa-stream:event:${streamId}`, listener),
   getEngineMediaProxyUrl: () => ipcRenderer.invoke("engine:get-media-proxy-url"),
+  getEngineIndexContent: () => ipcRenderer.invoke("engine:get-index-content"),
   uploadInferaVideo: (payload) => ipcRenderer.invoke("infera:upload-video", payload),
   cancelInferaUpload: (uploadId) => ipcRenderer.invoke("infera:cancel-upload", uploadId),
   pauseInferaUpload: (uploadId) => ipcRenderer.invoke("infera:pause-upload", uploadId),
