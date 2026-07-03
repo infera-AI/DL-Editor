@@ -9,6 +9,7 @@ const on = (channel, listener) => {
 contextBridge.exposeInMainWorld("dlEditor", {
   platform: process.platform,
   selectVideos: () => ipcRenderer.invoke("videos:select"),
+  getVideoMetadata: (filePath) => ipcRenderer.invoke("videos:get-metadata", filePath),
   selectOutputDirectory: () => ipcRenderer.invoke("output:select-directory"),
   getCapabilities: () => ipcRenderer.invoke("system:get-capabilities"),
   getUsage: () => ipcRenderer.invoke("system:get-usage"),

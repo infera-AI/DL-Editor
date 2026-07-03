@@ -709,8 +709,22 @@ h2 {
 .cloud-nav {
   display: grid;
   align-content: start;
-  gap: 4px;
+  gap: 12px;
   min-height: 0;
+}
+
+.cloud-nav-group {
+  display: grid;
+  gap: 4px;
+}
+
+.cloud-nav-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  padding: 0 8px 3px;
 }
 
 .cloud-nav-item {
@@ -814,7 +828,7 @@ h2 {
 
 .cloud-toolbar {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(240px, 380px) auto;
+  grid-template-columns: minmax(120px, 1fr) minmax(200px, 320px) auto auto;
   align-items: center;
   gap: 10px;
   min-height: 38px;
@@ -858,6 +872,57 @@ h2 {
 .cloud-search input {
   width: 100%;
   min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  font: inherit;
+  font-size: 12px;
+}
+
+.cloud-date-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cloud-date-step {
+  display: inline-grid;
+  width: 34px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+}
+
+.cloud-date-step:hover {
+  border-color: rgba(15, 118, 110, 0.45);
+  background: rgba(15, 118, 110, 0.08);
+  color: var(--accent);
+}
+
+.cloud-date-filter label {
+  display: inline-grid;
+  grid-template-columns: auto 132px;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.cloud-date-filter input {
+  width: 132px;
   border: 0;
   background: transparent;
   color: var(--text);

@@ -2926,6 +2926,15 @@ ipcMain.handle("videos:select", async () => {
   return Promise.all(result.filePaths.map(getFileMetadata));
 });
 
+ipcMain.handle("videos:get-metadata", async (_event, filePath) => {
+  const normalizedPath = String(filePath || "").trim();
+  if (!normalizedPath) {
+    return null;
+  }
+
+  return getFileMetadata(normalizedPath);
+});
+
 ipcMain.handle("output:select-directory", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Choose output folder",
@@ -2942,7 +2951,8 @@ ipcMain.handle("system:get-usage", async () => latestUsage || buildUsageSnapshot
 ipcMain.handle("updates:check", async () =>
   checkForUpdate({
     currentVersion: app.getVersion(),
-    platform: process.platform
+    platform: process.platform,
+    arch: process.arch
   })
 );
 

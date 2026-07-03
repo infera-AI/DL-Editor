@@ -9,7 +9,7 @@ on:
       tag:
         description: "Release tag to upload installers to"
         required: true
-        default: "v1.0.6"
+        default: "v1.0.7"
 
 permissions:
   contents: write
@@ -34,11 +34,24 @@ jobs:
               --repo "${{ github.repository }}"
 
   mac:
-    name: macOS arm64 installers
-    runs-on: macos-14
+    name: macOS ${{ matrix.arch }} installers
+    runs-on: ${{ matrix.runner }}
     needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            ffprobe: ffprobe-arm64
+            ffprobe_match: "Mach-O 64-bit executable arm64"
+          - arch: x64
+            runner: macos-13
+            ffprobe: ffprobe-x64
+            ffprobe_match: "Mach-O 64-bit executable x86_64"
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      npm_config_arch: ${{ matrix.arch }}
     defaults:
       run:
         working-directory: Mac
@@ -51,30 +64,31 @@ jobs:
           cache-dependency-path: Mac/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: npx electron-builder --mac dmg pkg --arm64 --config.directories.output=release-upload
+      - run: npx electron-builder --mac dmg pkg --${{ matrix.arch }} --config.directories.output=release-upload
       - name: Verify macOS bundled binaries
         run: |
-          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffmpeg"
-          file "release-upload/mac-arm64/DL Studio.app/Contents/Resources/bin/ffprobe-arm64" | tee /tmp/ffprobe-file.txt
-          grep -q "Mach-O 64-bit executable arm64" /tmp/ffprobe-file.txt
+          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/ffmpeg" | tee /tmp/ffmpeg-file.txt
+          grep -q "${{ matrix.ffprobe_match }}" /tmp/ffmpeg-file.txt
+          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/${{ matrix.ffprobe }}" | tee /tmp/ffprobe-file.txt
+          grep -q "${{ matrix.ffprobe_match }}" /tmp/ffprobe-file.txt
       - name: Upload macOS assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(node -p "require('./package.json').version")"
           gh release upload "$RELEASE_TAG" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.dmg" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.pkg" \
-            "release-upload/DL-Studio-Mac-${version}-arm64.dmg.blockmap" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.dmg" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.pkg" \
+            "release-upload/DL-Studio-Mac-${version}-${{ matrix.arch }}.dmg.blockmap" \
             --clobber \
             --repo "${{ github.repository }}"
       - name: Upload macOS installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mac-installers
+          name: mac-${{ matrix.arch }}-installers
           path: |
-            Mac/release-upload/DL-Studio-Mac-*-arm64.dmg
-            Mac/release-upload/DL-Studio-Mac-*-arm64.pkg
+            Mac/release-upload/DL-Studio-Mac-*-${{ matrix.arch }}.dmg
+            Mac/release-upload/DL-Studio-Mac-*-${{ matrix.arch }}.pkg
           if-no-files-found: error
 
   windows:
@@ -230,7 +244,8 @@ jobs:
               if lower.endswith(".exe") or "windows" in lower:
                   return "win32", "x64", "windows"
               if lower.endswith((".dmg", ".pkg")) or "mac" in lower:
-                  return "darwin", "arm64", "mac"
+                  arch = "x64" if "x64" in lower or "x86_64" in lower else "arm64"
+                  return "darwin", arch, "mac"
               return "", "", "unknown"
 
           assets = []

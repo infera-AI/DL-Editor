@@ -4,6 +4,7 @@ import {
   CalendarClock,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleStop,
   Clock3,
@@ -54,6 +55,16 @@ const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https:/
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
 const RAW_DATA_LIST_PATH = "/memory/raw-data";
 const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const DELPHI_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const DELPHI_UPLOAD_FILE_NAME_PATTERN = /^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.mp4$/i;
+const DELPHI_UPLOAD_VALIDATION_MESSAGES = {
+  size: "文件需小于 2GB，请压制后上传。如需上传备份视频，请使用右侧按钮添加。",
+  name: "请检查是否为压制后视频，文件名需为 yyyy_mm_dd_hh_mm_ss.mp4"
+};
+const CLOUD_REPOSITORY_PAGE_SIZE = 100;
+const CLOUD_REPOSITORY_MAX_PAGES = 1000;
+const CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID = "all";
+const CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID = "all_status";
 const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine"];
 const ENGINE_PASSWORD = "111111";
 const DEFAULT_AUTOMATION_OPTIONS = {
@@ -82,8 +93,10 @@ const CLOUD_FILTERS = [
   { id: "all", label: "全部文件" },
   { id: "video", label: "视频" },
   { id: "audio", label: "音频" },
+  { id: "all_status", label: "全部状态" },
   { id: "parsed", label: "已解析" },
-  { id: "processing", label: "处理中" }
+  { id: "processing", label: "处理中" },
+  { id: "failed", label: "解析失败" }
 ];
 const CLOUD_VIEW_MODES = ["list", "grid"];
 const CLOUD_SPACES = [
@@ -106,7 +119,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-07-02",
+  updatedAt: "2026-07-03",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -114,6 +127,7 @@ const APP_INFO = {
 const dlEditor = window.dlEditor || {
   platform: navigator.platform?.toLowerCase().includes("win") ? "win32" : navigator.platform?.toLowerCase().includes("mac") ? "darwin" : "browser",
   selectVideos: async () => [],
+  getVideoMetadata: async () => null,
   selectOutputDirectory: async () => null,
   getCapabilities: async () => ({
     cpuModel: "CPU",
@@ -300,16 +314,117 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
-async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id) {
-  const result = await requestInfera(spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files?limit=50&include_page=true", { token });
-  const items = normalizeCloudItems(result);
+async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id, options = {}) {
+  const items = [];
+  let total = null;
+  let hasMore = true;
+  let cursor = null;
+  let offset = 0;
+  let pageCount = 0;
+  const endpoint = spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files";
+  const dateKey = typeof options.dateKey === "string" && spaceId !== "rawdata" ? options.dateKey : "";
+  const filterId = typeof options.filterId === "string" && spaceId !== "rawdata" ? options.filterId : "all";
+
+  while (hasMore && pageCount < CLOUD_REPOSITORY_MAX_PAGES) {
+    const result = await requestInfera(buildCloudRepositoryPagePath(endpoint, { cursor, dateKey, filterId, offset }), { token });
+    const pageItems = normalizeCloudItems(result);
+    items.push(...pageItems);
+    total = Number.isFinite(Number(result?.total)) ? Number(result.total) : total;
+    hasMore = Boolean(result?.has_more);
+    cursor = result?.next_cursor || null;
+    offset = Number.isFinite(Number(result?.next_offset)) ? Number(result.next_offset) : offset + pageItems.length;
+
+    if (!hasMore || (!cursor && !Number.isFinite(Number(result?.next_offset)))) {
+      hasMore = false;
+    }
+
+    pageCount += 1;
+  }
 
   return {
     items,
-    total: Number.isFinite(Number(result?.total)) ? Number(result.total) : items.length,
-    hasMore: Boolean(result?.has_more),
-    nextCursor: result?.next_cursor || null
+    total: total ?? items.length,
+    hasMore,
+    nextCursor: cursor
   };
+}
+
+function buildCloudRepositoryPagePath(endpoint, { cursor = null, dateKey = "", filterId = "all", offset = 0 } = {}) {
+  const params = new URLSearchParams({
+    include_page: "true",
+    limit: String(CLOUD_REPOSITORY_PAGE_SIZE),
+    page_mode: "cursor"
+  });
+
+  if (cursor) {
+    params.set("cursor", cursor);
+  } else if (offset > 0) {
+    params.set("offset", String(offset));
+  }
+
+  const dayRange = endpoint === "/device/files" ? getCloudRepositoryDateRange(dateKey) : null;
+  if (dayRange) {
+    params.set("start_timestamp_ms", String(dayRange.startTimestampMs));
+    params.set("end_timestamp_ms", String(dayRange.endTimestampMs));
+  }
+
+  const parseStatus = endpoint === "/device/files" ? getCloudRepositoryParseStatusParam(filterId) : "";
+  if (parseStatus) {
+    params.set("parse_status", parseStatus);
+  }
+
+  return `${endpoint}?${params.toString()}`;
+}
+
+function getCloudRepositoryParseStatusParam(filterId) {
+  if (filterId === "parsed") {
+    return "PARSED,FALLBACK_PARSED,PARTIAL_PARSED";
+  }
+  if (filterId === "processing") {
+    return "PENDING,QUEUED,PREVIEW_READY,POSTPROCESSING,SPLITTING,PROCESSING,PARSING,RUNNING,REINDEX_REQUIRED";
+  }
+  if (filterId === "failed") {
+    return "FAIL,FAILED,ERROR,PARSE_FAILED,PROCESSING_FAILED";
+  }
+  return "";
+}
+
+function getCloudRepositoryDateRange(dateKey) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+  if (!Number.isFinite(start.getTime()) || start.getFullYear() !== year || start.getMonth() !== month - 1 || start.getDate() !== day) {
+    return null;
+  }
+
+  return {
+    startTimestampMs: start.getTime(),
+    endTimestampMs: start.getTime() + 24 * 60 * 60 * 1000
+  };
+}
+
+function getLocalDateKey(date = new Date()) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function shiftLocalDateKey(dateKey, offsetDays) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return getLocalDateKey();
+  }
+
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + offsetDays);
+  return getLocalDateKey(date);
 }
 
 function normalizeCloudItems(result) {
@@ -371,6 +486,9 @@ function App() {
   const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
   const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
+  const [cloudRepositoryDateKey, setCloudRepositoryDateKey] = useState(() => getLocalDateKey());
+  const [cloudRepositoryMediaFilterId, setCloudRepositoryMediaFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID);
+  const [cloudRepositoryStatusFilterId, setCloudRepositoryStatusFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID);
   const [automationOptions, setAutomationOptions] = useState(readStoredAutomationOptions);
   const [uploadState, setUploadState] = useState({
     status: "idle",
@@ -393,10 +511,13 @@ function App() {
   const transferRunningRef = useRef(false);
   const authStateRef = useRef(authState);
   const automationOptionsRef = useRef(automationOptions);
+  const automationEnqueueRunningRef = useRef(false);
   const autoLoginPromptedRef = useRef(false);
   const [repositoryState, setRepositoryState] = useState({
     status: "idle",
     spaceId: cloudSpaceId,
+    dateKey: cloudRepositoryDateKey,
+    filterId: cloudRepositoryStatusFilterId,
     items: [],
     total: 0,
     hasMore: false,
@@ -537,7 +658,7 @@ function App() {
       return;
     }
 
-    enqueueAutomationTransfers(readyJobs);
+    void enqueueAutomationTransfers(readyJobs);
   }, [jobs]);
 
   useEffect(() => {
@@ -554,6 +675,8 @@ function App() {
       setRepositoryState({
         status: "auth",
         spaceId: cloudSpaceId,
+        dateKey: cloudSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+        filterId: getDefaultCloudStatusFilterIdForSpace(cloudSpaceId),
         items: [],
         total: 0,
         hasMore: false,
@@ -563,8 +686,8 @@ function App() {
       return;
     }
 
-    loadCloudRepository(authState, cloudSpaceId);
-  }, [activeNav, authState?.token, cloudSpaceId]);
+    loadCloudRepository(authState, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
+  }, [activeNav, authState?.token, cloudRepositoryDateKey, cloudRepositoryStatusFilterId, cloudSpaceId]);
 
   useEffect(() => {
     if (!hasProcessingJobs && !isUploadActive(uploadState) && !transferQueue.some((item) => item.status === "uploading")) {
@@ -659,22 +782,31 @@ function App() {
     }
   }
 
-  function enqueueAutomationTransfers(nextJobs) {
+  async function enqueueAutomationTransfers(nextJobs) {
+    if (automationEnqueueRunningRef.current) {
+      return;
+    }
+
+    automationEnqueueRunningRef.current = true;
     const tasks = [];
     const consumed = new Map();
-    for (const job of nextJobs) {
-      for (const kind of getPendingAutomationTransferKinds(job)) {
-        const task = createTransferTask(job, {
-          auto: true,
-          kind
-        });
-        if (task) {
-          tasks.push(task);
-          const entry = consumed.get(job.id) || { backup: false, upload: false };
-          entry[kind] = true;
-          consumed.set(job.id, entry);
+    try {
+      for (const job of nextJobs) {
+        for (const kind of getPendingAutomationTransferKinds(job)) {
+          const task = createTransferTask(await materializeAutomationTransferJob(job, kind), {
+            auto: true,
+            kind
+          });
+          if (task) {
+            tasks.push(task);
+            const entry = consumed.get(job.id) || { backup: false, upload: false };
+            entry[kind] = true;
+            consumed.set(job.id, entry);
+          }
         }
       }
+    } finally {
+      automationEnqueueRunningRef.current = false;
     }
 
     if (!tasks.length) {
@@ -702,13 +834,48 @@ function App() {
     scheduleTransferQueueStart({ restartFailed: false });
   }
 
+  async function materializeAutomationTransferJob(job, kind) {
+    const uploadPath = getTransferUploadPath(job, kind);
+    if (!uploadPath || typeof dlEditor.getVideoMetadata !== "function") {
+      return { ...job, uploadPath };
+    }
+
+    try {
+      const metadata = await dlEditor.getVideoMetadata(uploadPath);
+      if (!metadata) {
+        return { ...job, uploadPath };
+      }
+
+      return {
+        ...job,
+        name: metadata.name || job.name,
+        outputPath: kind === "backup" ? job.outputPath : metadata.path || uploadPath,
+        path: kind === "backup" ? metadata.path || uploadPath : job.path,
+        size: metadata.size,
+        sizeLabel: metadata.sizeLabel,
+        uploadPath: metadata.path || uploadPath
+      };
+    } catch {
+      return { ...job, uploadPath };
+    }
+  }
+
   async function addTransferFiles(kind) {
     if (!canAddTransfer) return;
 
     const selected = await dlEditor.selectVideos();
     if (!selected.length) return;
 
-    const tasks = selected
+    const selection = selected.map((job) => ({
+      error: kind === "upload" ? getManualDelphiUploadValidationError(job) : "",
+      job
+    }));
+    const rejectedErrors = selection.map((entry) => entry.error).filter(Boolean);
+    const validSelection = selection
+      .filter((entry) => !entry.error)
+      .map((entry) => entry.job);
+    const rejectedCount = rejectedErrors.length;
+    const tasks = validSelection
       .map((job) =>
         createTransferTask(job, {
           auto: false,
@@ -716,11 +883,19 @@ function App() {
         })
       )
       .filter(Boolean);
+    if (!tasks.length) {
+      setNotice(kind === "upload" ? getManualDelphiUploadErrorMessage(rejectedErrors) : "没有可添加的备份视频");
+      return;
+    }
     const nextQueue = [...transferQueueRef.current, ...tasks];
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
     setTransferDockExpanded(true);
-    setNotice(`已加入 ${tasks.length} 个${kind === "backup" ? "备份" : "上传"}任务`);
+    const rejectedText =
+      rejectedCount > 0
+        ? `，${rejectedCount} 个文件未加入：${getManualDelphiUploadErrorMessage(rejectedErrors)}`
+        : "";
+    setNotice(`已加入 ${tasks.length} 个${kind === "backup" ? "备份" : "上传"}任务${rejectedText}`);
   }
 
   function clearFinishedTransfers() {
@@ -1411,10 +1586,16 @@ function App() {
   }
 
   function changeCloudSpace(nextSpaceId) {
+    const nextMediaFilterId = getDefaultCloudMediaFilterIdForSpace(nextSpaceId);
+    const nextStatusFilterId = getDefaultCloudStatusFilterIdForSpace(nextSpaceId);
     setCloudSpaceId(nextSpaceId);
+    setCloudRepositoryMediaFilterId(nextMediaFilterId);
+    setCloudRepositoryStatusFilterId(nextStatusFilterId);
     setRepositoryState({
       status: authStateRef.current?.token ? "loading" : "auth",
       spaceId: nextSpaceId,
+      dateKey: nextSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+      filterId: nextStatusFilterId,
       items: [],
       total: 0,
       hasMore: false,
@@ -1450,7 +1631,7 @@ function App() {
       setShowLogin(false);
 
       if (activeNav === "Cloud") {
-        loadCloudRepository(nextAuth, cloudSpaceId);
+        loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
       }
     } catch (error) {
       setLoginStatus({
@@ -1467,6 +1648,8 @@ function App() {
     setRepositoryState({
       status: "auth",
       spaceId: cloudSpaceId,
+      dateKey: cloudSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+      filterId: getDefaultCloudStatusFilterIdForSpace(cloudSpaceId),
       items: [],
       total: 0,
       hasMore: false,
@@ -1475,12 +1658,21 @@ function App() {
     });
   }
 
-  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId) {
+  async function loadCloudRepository(
+    authOverride = authState,
+    spaceIdOverride = cloudSpaceId,
+    dateKeyOverride = cloudRepositoryDateKey,
+    filterIdOverride = cloudRepositoryStatusFilterId
+  ) {
     const token = authOverride?.token;
+    const effectiveDateKey = spaceIdOverride === "rawdata" ? "" : dateKeyOverride;
+    const effectiveFilterId = getCloudStatusFilterIdForSpace(spaceIdOverride, filterIdOverride);
     if (!token) {
       setRepositoryState({
         status: "auth",
         spaceId: spaceIdOverride,
+        dateKey: effectiveDateKey,
+        filterId: effectiveFilterId,
         items: [],
         total: 0,
         hasMore: false,
@@ -1492,19 +1684,29 @@ function App() {
 
     setRepositoryState((current) => ({
       ...current,
-      items: current.spaceId === spaceIdOverride ? current.items : [],
+      items:
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
+          ? current.items
+          : [],
       spaceId: spaceIdOverride,
+      dateKey: effectiveDateKey,
+      filterId: effectiveFilterId,
       status: "loading",
       message: ""
     }));
 
     try {
-      const repository = await fetchCloudRepository(token, spaceIdOverride);
+      const repository = await fetchCloudRepository(token, spaceIdOverride, {
+        dateKey: effectiveDateKey,
+        filterId: effectiveFilterId
+      });
       setRepositoryState((current) =>
-        current.spaceId === spaceIdOverride
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
           ? {
               status: "ready",
               spaceId: spaceIdOverride,
+              dateKey: effectiveDateKey,
+              filterId: effectiveFilterId,
               items: repository.items,
               total: repository.total,
               hasMore: repository.hasMore,
@@ -1515,10 +1717,12 @@ function App() {
       );
     } catch (error) {
       setRepositoryState((current) =>
-        current.spaceId === spaceIdOverride
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
           ? {
               ...current,
               spaceId: spaceIdOverride,
+              dateKey: effectiveDateKey,
+              filterId: effectiveFilterId,
               status: "error",
               message: error.message || "无法读取 Cloud repository"
             }
@@ -1540,15 +1744,17 @@ function App() {
     }
 
     const title = getRepositoryTitle(item);
-    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, status: "loading", message: "" }));
+    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, dateKey: "", filterId: "all", status: "loading", message: "" }));
     try {
       await deleteRawDataArchive(authState.token, item);
       setNotice(`已删除 ${title}`);
-      await loadCloudRepository(authState, spaceIdOverride);
+      await loadCloudRepository(authState, spaceIdOverride, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
     } catch (error) {
       setRepositoryState((current) => ({
         ...current,
         spaceId: spaceIdOverride,
+        dateKey: "",
+        filterId: "all",
         status: "error",
         message: error.message || "删除 Rawdata 失败"
       }));
@@ -1821,9 +2027,15 @@ function App() {
         <CloudRepository
           authState={authState}
           cloudSpaceId={cloudSpaceId}
+          cloudRepositoryDateKey={cloudRepositoryDateKey}
+          cloudRepositoryMediaFilterId={cloudRepositoryMediaFilterId}
+          cloudRepositoryStatusFilterId={cloudRepositoryStatusFilterId}
           onDeleteItem={deleteCloudRepositoryItem}
+          onMediaFilterChange={setCloudRepositoryMediaFilterId}
+          onStatusFilterChange={setCloudRepositoryStatusFilterId}
+          onRepositoryDateChange={setCloudRepositoryDateKey}
           onLogin={() => setShowLogin(true)}
-          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId)}
+          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId)}
           onSpaceChange={changeCloudSpace}
           repositoryState={repositoryState}
         />
@@ -1930,28 +2142,46 @@ function EngineGate({ error, onChange, onSubmit, value }) {
   );
 }
 
-function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRefresh, onSpaceChange, repositoryState }) {
+function CloudRepository({
+  authState,
+  cloudRepositoryDateKey,
+  cloudRepositoryMediaFilterId,
+  cloudRepositoryStatusFilterId,
+  cloudSpaceId,
+  onDeleteItem,
+  onLogin,
+  onMediaFilterChange,
+  onRefresh,
+  onRepositoryDateChange,
+  onSpaceChange,
+  onStatusFilterChange,
+  repositoryState
+}) {
   const items = repositoryState.items || [];
   const isLoading = repositoryState.status === "loading";
   const [cloudQuery, setCloudQuery] = useState("");
   const [cloudViewMode, setCloudViewMode] = useState("list");
-  const [activeCloudFilter, setActiveCloudFilter] = useState("all");
   const [isCloudSpaceMenuOpen, setCloudSpaceMenuOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState("");
   const [repositoryMenuPosition, setRepositoryMenuPosition] = useState(null);
   const displaySpaceId = repositoryState.spaceId || cloudSpaceId;
   const isRawDataSpace = displaySpaceId === "rawdata";
-  const visibleFilters = useMemo(() => getCloudFiltersForSpace(displaySpaceId), [displaySpaceId]);
+  const activeMediaFilter = cloudRepositoryMediaFilterId;
+  const activeStatusFilter = cloudRepositoryStatusFilterId;
+  const visibleMediaFilters = useMemo(() => getCloudMediaFiltersForSpace(displaySpaceId), [displaySpaceId]);
+  const visibleStatusFilters = useMemo(() => getCloudStatusFiltersForSpace(displaySpaceId), [displaySpaceId]);
   const stats = useMemo(() => getCloudRepositoryStats(items), [items]);
   const filteredItems = useMemo(
-    () => filterCloudRepositoryItems(items, activeCloudFilter, cloudQuery),
-    [activeCloudFilter, cloudQuery, items]
+    () => filterCloudRepositoryItems(items, activeMediaFilter, activeStatusFilter, cloudQuery),
+    [activeMediaFilter, activeStatusFilter, cloudQuery, items]
   );
   const openMenuItem = useMemo(
     () => filteredItems.find((item) => getRepositoryItemKey(item) === openMenuId) || null,
     [filteredItems, openMenuId]
   );
-  const activeFilterLabel = visibleFilters.find((filter) => filter.id === activeCloudFilter)?.label || visibleFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeMediaFilterLabel = visibleMediaFilters.find((filter) => filter.id === activeMediaFilter)?.label || visibleMediaFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeStatusFilterLabel = visibleStatusFilters.find((filter) => filter.id === activeStatusFilter)?.label || "";
+  const activeFilterLabel = activeStatusFilterLabel ? `${activeMediaFilterLabel} / ${activeStatusFilterLabel}` : activeMediaFilterLabel;
   const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === displaySpaceId) || CLOUD_SPACES[0];
   const storagePercent = Math.min(92, Math.max(4, Math.round((stats.totalBytes / (5 * 1024 * 1024 * 1024)) * 100)));
 
@@ -1973,11 +2203,14 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
   }
 
   useEffect(() => {
-    if (!visibleFilters.some((filter) => filter.id === activeCloudFilter)) {
-      setActiveCloudFilter("all");
+    if (!visibleMediaFilters.some((filter) => filter.id === activeMediaFilter)) {
+      onMediaFilterChange(getDefaultCloudMediaFilterIdForSpace(displaySpaceId));
+    }
+    if (!visibleStatusFilters.some((filter) => filter.id === activeStatusFilter)) {
+      onStatusFilterChange(getDefaultCloudStatusFilterIdForSpace(displaySpaceId));
     }
     closeRepositoryMenu();
-  }, [activeCloudFilter, displaySpaceId, visibleFilters]);
+  }, [activeMediaFilter, activeStatusFilter, displaySpaceId, onMediaFilterChange, onStatusFilterChange, visibleMediaFilters, visibleStatusFilters]);
 
   useEffect(() => {
     if (!openMenuId) {
@@ -2034,18 +2267,38 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
           </div>
 
           <nav aria-label="Cloud files" className="cloud-nav">
-            {visibleFilters.map((filter) => (
-              <button
-                className={activeCloudFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
-                key={filter.id}
-                onClick={() => setActiveCloudFilter(filter.id)}
-                type="button"
-              >
-                <CloudFilterIcon id={filter.id} />
-                <span>{filter.label}</span>
-                <b>{getCloudFilterCount(stats, filter.id)}</b>
-              </button>
-            ))}
+            <div className="cloud-nav-group">
+              <span className="cloud-nav-label">文件类型</span>
+              {visibleMediaFilters.map((filter) => (
+                <button
+                  className={activeMediaFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
+                  key={filter.id}
+                  onClick={() => onMediaFilterChange(filter.id)}
+                  type="button"
+                >
+                  <CloudFilterIcon id={filter.id} />
+                  <span>{filter.label}</span>
+                  <b>{getCloudFilterCount(stats, filter.id)}</b>
+                </button>
+              ))}
+            </div>
+            {visibleStatusFilters.length > 0 && (
+              <div className="cloud-nav-group">
+                <span className="cloud-nav-label">解析状态</span>
+                {visibleStatusFilters.map((filter) => (
+                  <button
+                    className={activeStatusFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
+                    key={filter.id}
+                    onClick={() => onStatusFilterChange(filter.id)}
+                    type="button"
+                  >
+                    <CloudFilterIcon id={filter.id} />
+                    <span>{filter.label}</span>
+                    <b>{getCloudFilterCount(stats, filter.id)}</b>
+                  </button>
+                ))}
+              </div>
+            )}
           </nav>
 
           <div className="cloud-storage">
@@ -2090,6 +2343,34 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLogin, onRef
                     value={cloudQuery}
                   />
                 </label>
+                {!isRawDataSpace && (
+                  <div className="cloud-date-filter">
+                    <button
+                      className="cloud-date-step"
+                      onClick={() => onRepositoryDateChange(shiftLocalDateKey(cloudRepositoryDateKey, -1))}
+                      title="前一天"
+                      type="button"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <label>
+                      <span>Date</span>
+                      <input
+                        onChange={(event) => onRepositoryDateChange(event.currentTarget.value || getLocalDateKey())}
+                        type="date"
+                        value={cloudRepositoryDateKey}
+                      />
+                    </label>
+                    <button
+                      className="cloud-date-step"
+                      onClick={() => onRepositoryDateChange(shiftLocalDateKey(cloudRepositoryDateKey, 1))}
+                      title="后一天"
+                      type="button"
+                    >
+                      <ChevronRight size={14} />
+                    </button>
+                  </div>
+                )}
                 <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={() => onRefresh(displaySpaceId)} type="button">
                   <RotateCcw size={16} />
                   <span>{isLoading ? "同步中" : "刷新"}</span>
@@ -2223,6 +2504,7 @@ function CloudFilterIcon({ id }) {
   if (id === "audio") return <FileAudio size={15} />;
   if (id === "parsed") return <CheckCircle2 size={15} />;
   if (id === "processing") return <Clock3 size={15} />;
+  if (id === "failed") return <TriangleAlert size={15} />;
   return <Folder size={15} />;
 }
 
@@ -2881,12 +3163,14 @@ function createUploadItems(jobs) {
 
 function createTransferTask(job, { auto = false, autoClearLocal = false, kind = "upload" } = {}) {
   const isBackup = kind === "backup";
-  const uploadPath = isBackup ? job.path : job.uploadPath || getJobUploadPath(job) || job.path;
+  const uploadPath = getTransferUploadPath(job, kind);
   if (!uploadPath) {
     return null;
   }
 
   const createdAt = Date.now();
+  const displayName = job.name || job.outputName || getFileNameFromPath(uploadPath);
+  const totalBytes = Number(job.sizeBytes || job.size || job.outputSize || 0) || 0;
   return {
     auto,
     autoClearLocal,
@@ -2901,7 +3185,7 @@ function createTransferTask(job, { auto = false, autoClearLocal = false, kind = 
     id: `${kind}-${job.id || createdAt}-${createdAt}-${Math.random().toString(16).slice(2)}`,
     kind,
     message: "等待上传",
-    name: job.name || getFileNameFromPath(uploadPath),
+    name: displayName,
     outputPath: isBackup ? "" : uploadPath,
     path: isBackup ? uploadPath : job.path || uploadPath,
     percent: 0,
@@ -2909,10 +3193,35 @@ function createTransferTask(job, { auto = false, autoClearLocal = false, kind = 
     speedBytesPerSecond: 0,
     startTimeMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
     status: "queued",
-    totalBytes: Number(job.sizeBytes || job.size || 0) || 0,
+    totalBytes,
     uploadName: isBackup ? getProcessedStyleFileName(job) : getUploadFileName({ ...job, uploadPath }),
     uploadPath
   };
+}
+
+function getTransferUploadPath(job, kind = "upload") {
+  return kind === "backup" ? job.path : job.uploadPath || getJobUploadPath(job) || job.path;
+}
+
+function getManualDelphiUploadValidationError(job) {
+  const uploadPath = getTransferUploadPath(job, "upload");
+  const fileName = getFileNameFromPath(uploadPath || job?.name);
+  const sizeBytes = Number(job?.sizeBytes || job?.size || job?.outputSize || 0);
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes >= DELPHI_UPLOAD_MAX_BYTES) {
+    return DELPHI_UPLOAD_VALIDATION_MESSAGES.size;
+  }
+
+  if (!DELPHI_UPLOAD_FILE_NAME_PATTERN.test(fileName)) {
+    return DELPHI_UPLOAD_VALIDATION_MESSAGES.name;
+  }
+
+  return "";
+}
+
+function getManualDelphiUploadErrorMessage(errors) {
+  return errors.includes(DELPHI_UPLOAD_VALIDATION_MESSAGES.size)
+    ? DELPHI_UPLOAD_VALIDATION_MESSAGES.size
+    : DELPHI_UPLOAD_VALIDATION_MESSAGES.name;
 }
 
 function createJobFromTransferTask(task) {
@@ -2923,8 +3232,11 @@ function createJobFromTransferTask(task) {
     name: task.name,
     outputPath: task.kind === "backup" ? "" : task.uploadPath,
     path: task.path,
+    size: task.totalBytes,
+    sizeBytes: task.totalBytes,
     sourceJobId: task.sourceJobId,
     startTimeMs: task.startTimeMs,
+    totalBytes: task.totalBytes,
     uploadName: task.uploadName,
     uploadPath: task.uploadPath
   };
@@ -3425,12 +3737,32 @@ function isSamePath(left, right) {
   return String(left || "") === String(right || "");
 }
 
-function getCloudFiltersForSpace(spaceId) {
+function getCloudMediaFiltersForSpace() {
+  return CLOUD_FILTERS.filter((filter) => ["all", "video", "audio"].includes(filter.id));
+}
+
+function getCloudStatusFiltersForSpace(spaceId) {
   if (spaceId === "rawdata") {
-    return CLOUD_FILTERS.filter((filter) => filter.id !== "parsed" && filter.id !== "processing");
+    return [];
   }
 
-  return CLOUD_FILTERS;
+  return CLOUD_FILTERS.filter((filter) => ["all_status", "parsed", "processing", "failed"].includes(filter.id));
+}
+
+function getDefaultCloudMediaFilterIdForSpace() {
+  return CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID;
+}
+
+function getDefaultCloudStatusFilterIdForSpace() {
+  return CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID;
+}
+
+function getCloudStatusFilterIdForSpace(spaceId, filterId) {
+  const visibleFilters = getCloudStatusFiltersForSpace(spaceId);
+  if (visibleFilters.length === 0) {
+    return getDefaultCloudStatusFilterIdForSpace(spaceId);
+  }
+  return visibleFilters.some((filter) => filter.id === filterId) ? filterId : getDefaultCloudStatusFilterIdForSpace(spaceId);
 }
 
 function getRepositoryItemKey(item) {
@@ -3504,12 +3836,21 @@ function getRepositoryType(item) {
 }
 
 function isRepositoryParsed(item) {
-  return String(item.parse_status || "").toUpperCase() === "PARSED";
+  return ["PARSED", "FALLBACK_PARSED", "PARTIAL_PARSED"].includes(getRepositoryParseStatus(item));
 }
 
 function isRepositoryProcessing(item) {
-  const status = String(item.parse_status || "").toUpperCase();
-  return ["PENDING", "PROCESSING", "PREVIEW_READY"].includes(status);
+  return ["PENDING", "QUEUED", "PREVIEW_READY", "POSTPROCESSING", "SPLITTING", "PROCESSING", "PARSING", "RUNNING", "REINDEX_REQUIRED"].includes(
+    getRepositoryParseStatus(item)
+  );
+}
+
+function isRepositoryParseFailed(item) {
+  return ["FAIL", "FAILED", "ERROR", "PARSE_FAILED", "PROCESSING_FAILED"].includes(getRepositoryParseStatus(item));
+}
+
+function getRepositoryParseStatus(item) {
+  return String(item.parse_status || item.parseStatus || item.job_status || item.jobStatus || "").trim().toUpperCase() || "UNKNOWN";
 }
 
 function getCloudRepositoryStats(items) {
@@ -3527,11 +3868,12 @@ function getCloudRepositoryStats(items) {
         audio: stats.audio + (type === "audio" ? 1 : 0),
         parsed: stats.parsed + (isRepositoryParsed(item) ? 1 : 0),
         processing: stats.processing + (isRepositoryProcessing(item) ? 1 : 0),
+        failed: stats.failed + (isRepositoryParseFailed(item) ? 1 : 0),
         totalBytes: stats.totalBytes + (Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0),
         totalDurationSeconds: stats.totalDurationSeconds + (Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 0)
       };
     },
-    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, totalBytes: 0, totalDurationSeconds: 0 }
+    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, failed: 0, totalBytes: 0, totalDurationSeconds: 0 }
   );
 }
 
@@ -3540,23 +3882,27 @@ function getCloudFilterCount(stats, filterId) {
   if (filterId === "audio") return stats.audio;
   if (filterId === "parsed") return stats.parsed;
   if (filterId === "processing") return stats.processing;
+  if (filterId === "failed") return stats.failed;
   return stats.total;
 }
 
-function filterCloudRepositoryItems(items, filterId, query) {
+function filterCloudRepositoryItems(items, mediaFilterId, statusFilterId, query) {
   const normalizedQuery = String(query || "").trim().toLowerCase();
   const safeItems = Array.isArray(items) ? items : [];
 
   return safeItems.filter((item) => {
     const type = getRepositoryType(item);
-    const matchesFilter =
-      filterId === "all" ||
-      (filterId === "video" && type === "video") ||
-      (filterId === "audio" && type === "audio") ||
-      (filterId === "parsed" && isRepositoryParsed(item)) ||
-      (filterId === "processing" && isRepositoryProcessing(item));
+    const matchesMedia =
+      mediaFilterId === "all" ||
+      (mediaFilterId === "video" && type === "video") ||
+      (mediaFilterId === "audio" && type === "audio");
+    const matchesStatus =
+      statusFilterId === "all_status" ||
+      (statusFilterId === "parsed" && isRepositoryParsed(item)) ||
+      (statusFilterId === "processing" && isRepositoryProcessing(item)) ||
+      (statusFilterId === "failed" && isRepositoryParseFailed(item));
 
-    if (!matchesFilter) return false;
+    if (!matchesMedia || !matchesStatus) return false;
     if (!normalizedQuery) return true;
 
     return [
