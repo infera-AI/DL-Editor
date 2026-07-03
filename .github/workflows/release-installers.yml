@@ -67,9 +67,16 @@ jobs:
       - run: npx electron-builder --mac dmg pkg --${{ matrix.arch }} --config.directories.output=release-upload
       - name: Verify macOS bundled binaries
         run: |
-          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/ffmpeg" | tee /tmp/ffmpeg-file.txt
+          app_dir="$(find release-upload -type d -name "DL Studio.app" -print -quit)"
+          if [ -z "$app_dir" ]; then
+            find release-upload -maxdepth 3 -print
+            echo "DL Studio.app was not found in release-upload"
+            exit 1
+          fi
+          bin_dir="$app_dir/Contents/Resources/bin"
+          file "$bin_dir/ffmpeg" | tee /tmp/ffmpeg-file.txt
           grep -q "${{ matrix.ffprobe_match }}" /tmp/ffmpeg-file.txt
-          file "release-upload/mac-${{ matrix.arch }}/DL Studio.app/Contents/Resources/bin/${{ matrix.ffprobe }}" | tee /tmp/ffprobe-file.txt
+          file "$bin_dir/${{ matrix.ffprobe }}" | tee /tmp/ffprobe-file.txt
           grep -q "${{ matrix.ffprobe_match }}" /tmp/ffprobe-file.txt
       - name: Upload macOS assets
         env:
