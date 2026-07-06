@@ -48,8 +48,10 @@ const RAW_DATA_RESUMABLE_UPLOAD_PATH = "/memory/raw-data/videos/resumable";
 const RAW_DATA_DEDUPLICATE_PATH = "/memory/raw-data/videos/deduplicate";
 const RAW_DATA_RESUMABLE_SESSION_FILE = "raw-data-upload-sessions.json";
 const RESUMABLE_UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
-const UPLOAD_CONTROL_IDLE_TIMEOUT_MS = 60000;
-const UPLOAD_TRANSFER_IDLE_TIMEOUT_MS = 60000;
+const DEFAULT_RESUMABLE_PART_SIZE_BYTES = 8 * 1024 * 1024;
+const UPLOAD_CONTROL_IDLE_TIMEOUT_MS = 120000;
+const UPLOAD_TRANSFER_IDLE_TIMEOUT_MS = 180000;
+const UPLOAD_COMPLETE_IDLE_TIMEOUT_MS = 600000;
 const RETRYABLE_UPLOAD_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 const RETRYABLE_UPLOAD_ERROR_CODES = new Set([
   "EAI_AGAIN",
@@ -80,6 +82,135 @@ const VIDEO_MIME_TYPES = {
 };
 
 app.setName(APP_NAME);
+
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+let mainLogFilePath = null;
+let fileLoggerInitialized = false;
+let lastLoggedBatchState = null;
+const lastLoggedJobStates = new Map();
+const lastLoggedUploadStates = new Map();
+const originalConsole = {
+  debug: console.debug.bind(console),
+  error: console.error.bind(console),
+  info: console.info.bind(console),
+  log: console.log.bind(console),
+  warn: console.warn.bind(console)
+};
+
+function getMainLogFilePath() {
+  if (!mainLogFilePath) {
+    mainLogFilePath = path.join(app.getPath("userData"), "logs", "main.log");
+  }
+  return mainLogFilePath;
+}
+
+function formatLogArg(value) {
+  if (value instanceof Error) {
+    return value.stack || value.message;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeError(error) {
+  return {
+    code: error?.code,
+    message: error?.message || String(error),
+    name: error?.name,
+    stack: error?.stack,
+    statusCode: error?.statusCode
+  };
+}
+
+function rotateMainLogIfNeeded(filePath) {
+  try {
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= LOG_MAX_BYTES) {
+      return;
+    }
+
+    const oldLogPath = path.join(path.dirname(filePath), "main.old.log");
+    if (fs.existsSync(oldLogPath)) {
+      fs.unlinkSync(oldLogPath);
+    }
+    fs.renameSync(filePath, oldLogPath);
+  } catch (error) {
+    originalConsole.warn("Failed to rotate log file", error);
+  }
+}
+
+function writeLog(level, args) {
+  try {
+    const logPath = getMainLogFilePath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    rotateMainLogIfNeeded(logPath);
+    const message = args.map(formatLogArg).join(" ");
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] [${level}] ${message}\n`, "utf8");
+  } catch {
+    // Logging must never break app behavior.
+  }
+}
+
+function logInfo(...args) {
+  writeLog("INFO", args);
+}
+
+function logWarn(...args) {
+  writeLog("WARN", args);
+}
+
+function logError(...args) {
+  writeLog("ERROR", args);
+}
+
+function initializeFileLogger() {
+  if (fileLoggerInitialized) {
+    return;
+  }
+  fileLoggerInitialized = true;
+
+  console.debug = (...args) => {
+    originalConsole.debug(...args);
+    writeLog("DEBUG", args);
+  };
+  console.error = (...args) => {
+    originalConsole.error(...args);
+    writeLog("ERROR", args);
+  };
+  console.info = (...args) => {
+    originalConsole.info(...args);
+    writeLog("INFO", args);
+  };
+  console.log = (...args) => {
+    originalConsole.log(...args);
+    writeLog("INFO", args);
+  };
+  console.warn = (...args) => {
+    originalConsole.warn(...args);
+    writeLog("WARN", args);
+  };
+
+  process.on("uncaughtException", (error) => {
+    logError("Uncaught exception", summarizeError(error));
+  });
+  process.on("unhandledRejection", (reason) => {
+    logError("Unhandled rejection", reason instanceof Error ? summarizeError(reason) : reason);
+  });
+
+  logInfo("File logger initialized", {
+    arch: process.arch,
+    logFilePath: getMainLogFilePath(),
+    platform: process.platform,
+    version: app.getVersion()
+  });
+}
+
+initializeFileLogger();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -320,6 +451,13 @@ async function runUploadOperationWithRetry(operation, { getBytesUploaded, retry 
 
       const retryNumber = attempt + 1;
       const progressStatus = uploadRecord?.phase === "completing" ? "processing" : "uploading";
+      logWarn("Upload retry scheduled", {
+        attempt: retryNumber,
+        delayMs: RESUMABLE_UPLOAD_RETRY_DELAYS_MS[attempt],
+        error: summarizeError(error),
+        phase: uploadRecord?.phase,
+        uploadId: uploadRecord?.uploadId
+      });
       sendProgress?.(progressStatus, {
         bytesUploaded: typeof getBytesUploaded === "function" ? getBytesUploaded() : uploadRecord?.bytesUploaded,
         message: `${getUploadRetryReason(error)}，正在重试 ${retryNumber}/${RESUMABLE_UPLOAD_RETRY_DELAYS_MS.length}`
@@ -442,6 +580,35 @@ function normalizeUploadDurationMs(value) {
 }
 
 function emitUploadProgress(sender, payload) {
+  const uploadId = payload?.uploadId || payload?.jobId;
+  if (uploadId) {
+    const previous = lastLoggedUploadStates.get(uploadId) || {};
+    const current = {
+      message: payload?.message || "",
+      status: payload?.status || "",
+      uploadId
+    };
+    const shouldLog =
+      previous.status !== current.status ||
+      previous.message !== current.message ||
+      current.status === "completed" ||
+      current.status === "error" ||
+      current.status === "canceled";
+    if (shouldLog) {
+      lastLoggedUploadStates.set(uploadId, current);
+      logInfo("Upload state changed", {
+        bytesUploaded: payload?.bytesUploaded,
+        fileName: payload?.filePath ? path.basename(payload.filePath) : undefined,
+        jobId: payload?.jobId,
+        message: current.message,
+        percent: payload?.percent,
+        status: current.status,
+        totalBytes: payload?.totalBytes,
+        uploadId
+      });
+    }
+  }
+
   if (!sender || sender.isDestroyed?.()) {
     return;
   }
@@ -577,7 +744,7 @@ function removeRawDataUploadSession(sessionKey) {
   }
 }
 
-function requestUploadJsonOnce({ body, method = "POST", token, uploadRecord, url }) {
+function requestUploadJsonOnce({ body, method = "POST", timeoutMs = UPLOAD_CONTROL_IDLE_TIMEOUT_MS, token, uploadRecord, url }) {
   return new Promise((resolve, reject) => {
     if (uploadRecord?.canceled) {
       reject(new Error("上传已取消"));
@@ -633,7 +800,7 @@ function requestUploadJsonOnce({ body, method = "POST", token, uploadRecord, url
     const watchdog = createUploadIdleWatchdog({
       message: "上传请求超时，请重试",
       request,
-      timeoutMs: UPLOAD_CONTROL_IDLE_TIMEOUT_MS,
+      timeoutMs,
       uploadRecord
     });
     if (uploadRecord) {
@@ -653,9 +820,9 @@ function requestUploadJsonOnce({ body, method = "POST", token, uploadRecord, url
   });
 }
 
-function requestUploadJson({ body, method = "POST", retry = true, token, uploadRecord, url }) {
+function requestUploadJson({ body, method = "POST", retry = true, timeoutMs = UPLOAD_CONTROL_IDLE_TIMEOUT_MS, token, uploadRecord, url }) {
   return runUploadOperationWithRetry(
-    () => requestUploadJsonOnce({ body, method, token, uploadRecord, url }),
+    () => requestUploadJsonOnce({ body, method, timeoutMs, token, uploadRecord, url }),
     {
       getBytesUploaded: () => uploadRecord?.bytesUploaded || 0,
       retry,
@@ -760,6 +927,7 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       request: null,
       sendProgress: null,
       stream: null,
+      uploadId,
       cancel: null
     };
 
@@ -1061,6 +1229,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     sessionKey,
     stream: null,
     token,
+    uploadId,
     uploadToken: null
   };
   const sendProgress = (status, extra = {}) => {
@@ -1240,7 +1409,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       }
       await waitUntilUploadCanSend(uploadRecord);
 
-      const partSize = Number(session.partSizeBytes) || 16 * 1024 * 1024;
+      const partSize = Number(session.partSizeBytes) || DEFAULT_RESUMABLE_PART_SIZE_BYTES;
       const partNumber = Number(session.nextPartNumber) || Math.floor(uploadedBytes / partSize) + 1;
       const start = (partNumber - 1) * partSize;
       const end = Math.min(stats.size - 1, start + partSize - 1);
@@ -1284,6 +1453,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     uploadRecord.phase = "completing";
     const result = await requestUploadJson({
       body: { uploadToken: session.uploadToken },
+      timeoutMs: UPLOAD_COMPLETE_IDLE_TIMEOUT_MS,
       token,
       uploadRecord,
       url: resolveInferaUrl(`${config.resumablePath}/complete`)
@@ -1315,6 +1485,13 @@ async function uploadInferaVideo(payload = {}, sender) {
   const uploadPath = payload.uploadPath || WEB_VIDEO_UPLOAD_PATH;
   const resumableConfig = getResumableVideoUploadConfig(uploadPath);
   const isRawDataUpload = resumableConfig?.kind === "raw-data";
+  logInfo("Upload started", {
+    fileName: payload.fileName || path.basename(filePath),
+    sizeBytes: stats.size,
+    uploadId,
+    uploadPath,
+    uploadType: resumableConfig?.kind || "multipart"
+  });
   const uploadTimestampMs = normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms ?? payload.capturedAtMs ?? payload.captured_at_ms);
   const fields = isRawDataUpload
     ? { captured_at_ms: uploadTimestampMs }
@@ -1330,40 +1507,58 @@ async function uploadInferaVideo(payload = {}, sender) {
     fields.duration_seconds = durationSeconds;
   }
 
-  if (resumableConfig) {
-    return uploadResumableVideo({
-      config: resumableConfig,
-      fields,
+  try {
+    const result = resumableConfig
+      ? await uploadResumableVideo({
+          config: resumableConfig,
+          fields,
+          fileName: payload.fileName || path.basename(filePath),
+          filePath,
+          jobId: payload.jobId,
+          sender,
+          token: payload.token,
+          uploadId
+        })
+      : await runUploadOperationWithRetry(() =>
+          uploadMultipart({
+            fields,
+            fileName: payload.fileName || path.basename(filePath),
+            filePath,
+            jobId: payload.jobId,
+            sender,
+            token: payload.token,
+            uploadId,
+            url: resolveInferaUrl(uploadPath)
+          })
+        );
+    logInfo("Upload completed", {
       fileName: payload.fileName || path.basename(filePath),
-      filePath,
-      jobId: payload.jobId,
-      sender,
-      token: payload.token,
-      uploadId
-    });
-  }
-
-  return runUploadOperationWithRetry(() =>
-    uploadMultipart({
-      fields,
-      fileName: payload.fileName || path.basename(filePath),
-      filePath,
-      jobId: payload.jobId,
-      sender,
-      token: payload.token,
+      sizeBytes: stats.size,
       uploadId,
-      url: resolveInferaUrl(uploadPath)
-    })
-  );
+      uploadPath
+    });
+    return result;
+  } catch (error) {
+    logError("Upload failed", {
+      error: summarizeError(error),
+      fileName: payload.fileName || path.basename(filePath),
+      sizeBytes: stats.size,
+      uploadId,
+      uploadPath
+    });
+    throw error;
+  }
 }
 
 function cancelInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload cancel requested but upload is not active", { uploadId: id });
     return { canceled: false };
   }
 
+  logInfo("Upload cancel requested", { uploadId: id });
   upload.cancel?.();
   return { canceled: true };
 }
@@ -1372,9 +1567,11 @@ function pauseInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload pause requested but upload is not active", { uploadId: id });
     return { paused: false };
   }
 
+  logInfo("Upload pause requested", { uploadId: id });
   upload.pause?.();
   return { paused: true };
 }
@@ -1383,9 +1580,11 @@ function resumeInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload resume requested but upload is not active", { uploadId: id });
     return { resumed: false };
   }
 
+  logInfo("Upload resume requested", { uploadId: id });
   upload.resume?.();
   return { resumed: true };
 }
@@ -1504,6 +1703,23 @@ function createWindow() {
   });
 
   registerWindowShortcuts(mainWindow);
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    if (Number(level) >= 2) {
+      logWarn("Renderer console message", { level, line, message, sourceId });
+    }
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedUrl) => {
+    logError("Renderer failed to load", { errorCode, errorDescription, validatedUrl });
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    logError("Renderer process gone", details);
+  });
+  mainWindow.on("unresponsive", () => {
+    logWarn("Main window became unresponsive");
+  });
+  mainWindow.on("responsive", () => {
+    logInfo("Main window became responsive");
+  });
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -1543,6 +1759,7 @@ function getBundledBinary(name) {
 
 function runBinary(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    logInfo("Binary process started", { command: path.basename(command), argsCount: Array.isArray(args) ? args.length : 0 });
     const child = spawn(command, args, {
       windowsHide: true,
       ...options
@@ -1560,16 +1777,24 @@ function runBinary(command, args, options = {}) {
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("Binary process error", { command: path.basename(command), error: summarizeError(error) });
       reject(error);
     });
     child.on("close", (code) => {
       if (code === 0) {
+        logInfo("Binary process completed", { command: path.basename(command) });
         resolve({ stdout, stderr });
       } else {
         const error = new Error(stderr.trim() || stdout.trim() || `进程退出，代码 ${code}`);
         error.code = code;
         error.stdout = stdout;
         error.stderr = stderr;
+        logError("Binary process exited with error", {
+          code,
+          command: path.basename(command),
+          stderr: stderr.trim().slice(-2000),
+          stdout: stdout.trim().slice(-1000)
+        });
         reject(error);
       }
     });
@@ -2276,6 +2501,25 @@ function getEncodingStatsFromProgress({ currentTime, encodedFrames, outputFps, s
 }
 
 function emitJobUpdate(payload) {
+  const previous = payload?.id ? lastLoggedJobStates.get(payload.id) : null;
+  if (payload?.id) {
+    const current = {
+      message: payload?.message || "",
+      status: payload?.status || ""
+    };
+    if (previous?.status !== current.status || previous?.message !== current.message) {
+      lastLoggedJobStates.set(payload.id, current);
+      logInfo("Transcode job state changed", {
+        fileName: payload?.fileName || (payload?.path ? path.basename(payload.path) : undefined),
+        id: payload.id,
+        message: current.message,
+        outputPath: payload?.outputPath,
+        progress: payload?.progress,
+        status: current.status
+      });
+    }
+  }
+
   if (payload?.id) {
     jobSnapshots.set(payload.id, { ...(jobSnapshots.get(payload.id) || {}), ...payload });
   }
@@ -2283,6 +2527,30 @@ function emitJobUpdate(payload) {
 }
 
 function emitBatchUpdate(payload) {
+  const current = {
+    message: payload?.message || "",
+    paused: Boolean(payload?.paused),
+    status: payload?.status || ""
+  };
+  if (
+    !lastLoggedBatchState ||
+    lastLoggedBatchState.status !== current.status ||
+    lastLoggedBatchState.paused !== current.paused ||
+    lastLoggedBatchState.message !== current.message
+  ) {
+    lastLoggedBatchState = current;
+    logInfo("Transcode batch state changed", {
+      completed: payload?.completed,
+      failed: payload?.failed,
+      message: current.message,
+      outputDirectory: payload?.outputDirectory,
+      paused: current.paused,
+      processingDevice: payload?.processingDevice,
+      status: current.status,
+      total: payload?.total
+    });
+  }
+
   mainWindow?.webContents.send("transcode:batch-update", payload);
 }
 
@@ -2345,6 +2613,12 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
+    logInfo("FFmpeg process started", {
+      encoder,
+      inputFile: path.basename(job.path),
+      jobId: job.id,
+      outputPath
+    });
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
@@ -2391,20 +2665,46 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
       stderr += chunk.toString();
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      logError("FFmpeg process error", {
+        error: summarizeError(error),
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath
+      });
+      reject(error);
+    });
     child.on("close", (code) => {
       activeProcesses.delete(child);
 
       if (cancelRequested) {
+        logWarn("FFmpeg process canceled", {
+          code,
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath
+        });
         reject(new Error("用户已取消"));
         return;
       }
 
       if (code === 0) {
+        logInfo("FFmpeg process completed", {
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath
+        });
         resolve();
         return;
       }
 
+      logError("FFmpeg process exited with error", {
+        code,
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath,
+        stderr: stderr.trim().slice(-2000)
+      });
       reject(new Error(stderr.trim() || `FFmpeg 退出，代码 ${code}`));
     });
   });
@@ -2499,6 +2799,7 @@ function escapeConcatPath(filePath) {
 
 function runTrackedProcess(command, args) {
   return new Promise((resolve, reject) => {
+    logInfo("Tracked process started", { command: path.basename(command), argsCount: Array.isArray(args) ? args.length : 0 });
     const child = spawn(command, args, { windowsHide: true });
     trackProcess(child);
     let stdout = "";
@@ -2514,6 +2815,7 @@ function runTrackedProcess(command, args) {
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("Tracked process error", { command: path.basename(command), error: summarizeError(error) });
       reject(error);
     });
 
@@ -2521,10 +2823,18 @@ function runTrackedProcess(command, args) {
       activeProcesses.delete(child);
 
       if (cancelRequested) {
+        logWarn("Tracked process canceled", { code, command: path.basename(command) });
         reject(new Error("用户已取消"));
       } else if (code === 0) {
+        logInfo("Tracked process completed", { command: path.basename(command) });
         resolve({ stdout, stderr });
       } else {
+        logError("Tracked process exited with error", {
+          code,
+          command: path.basename(command),
+          stderr: stderr.trim().slice(-2000),
+          stdout: stdout.trim().slice(-1000)
+        });
         reject(new Error(stderr.trim() || stdout.trim() || `进程退出，代码 ${code}`));
       }
     });
@@ -2552,6 +2862,13 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
+    logInfo("FFmpeg segment process started", {
+      encoder,
+      inputFile: path.basename(job.path),
+      jobId: job.id,
+      outputPath: segment.outputPath,
+      segmentIndex: segment.index
+    });
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
@@ -2581,6 +2898,13 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("FFmpeg segment process error", {
+        error: summarizeError(error),
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath: segment.outputPath,
+        segmentIndex: segment.index
+      });
       reject(error);
     });
 
@@ -2588,16 +2912,37 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
       activeProcesses.delete(child);
 
       if (cancelRequested) {
+        logWarn("FFmpeg segment process canceled", {
+          code,
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath: segment.outputPath,
+          segmentIndex: segment.index
+        });
         reject(new Error("用户已取消"));
         return;
       }
 
       if (code === 0) {
+        logInfo("FFmpeg segment process completed", {
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath: segment.outputPath,
+          segmentIndex: segment.index
+        });
         onProgress(segment.index, segment.duration, startedAt, encodingStats);
         resolve();
         return;
       }
 
+      logError("FFmpeg segment process exited with error", {
+        code,
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath: segment.outputPath,
+        segmentIndex: segment.index,
+        stderr: stderr.trim().slice(-2000)
+      });
       reject(new Error(stderr.trim() || `FFmpeg 分段任务退出，代码 ${code}`));
     });
   });
@@ -2865,6 +3210,7 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
 }
 
 app.whenReady().then(() => {
+  logInfo("App ready");
   Menu.setApplicationMenu(null);
   createWindow();
   startUsageMonitor();
@@ -2878,6 +3224,7 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
+  logInfo("All windows closed");
   if (usageMonitor) {
     clearInterval(usageMonitor);
     usageMonitor = null;
@@ -2948,13 +3295,50 @@ ipcMain.handle("output:select-directory", async () => {
 ipcMain.handle("system:get-capabilities", async () => getCapabilities());
 ipcMain.handle("system:get-usage", async () => latestUsage || buildUsageSnapshot());
 
-ipcMain.handle("updates:check", async () =>
-  checkForUpdate({
+ipcMain.handle("logs:get-main-log-path", async () => getMainLogFilePath());
+ipcMain.handle("logs:write", async (_event, payload = {}) => {
+  const level = String(payload.level || "info").toLowerCase();
+  const message = String(payload.message || "Renderer event");
+  const details = payload.details && typeof payload.details === "object" ? payload.details : {};
+  if (level === "error") {
+    logError(message, details);
+  } else if (level === "warn") {
+    logWarn(message, details);
+  } else {
+    logInfo(message, details);
+  }
+  return { logged: true };
+});
+ipcMain.handle("logs:reveal-main-log", async () => {
+  const logPath = getMainLogFilePath();
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  if (!fs.existsSync(logPath)) {
+    fs.writeFileSync(logPath, "", "utf8");
+  }
+  shell.showItemInFolder(logPath);
+  logInfo("Main log revealed", { logPath });
+  return { opened: true, path: logPath };
+});
+
+ipcMain.handle("updates:check", async () => {
+  logInfo("Update check started", {
+    arch: process.arch,
     currentVersion: app.getVersion(),
-    platform: process.platform,
-    arch: process.arch
-  })
-);
+    platform: process.platform
+  });
+  try {
+    const result = await checkForUpdate({
+      currentVersion: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch
+    });
+    logInfo("Update check finished", result);
+    return result;
+  } catch (error) {
+    logError("Update check failed", summarizeError(error));
+    throw error;
+  }
+});
 
 ipcMain.handle("infera:request", async (_event, payload) => requestInfera(payload));
 ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVideo(payload, event.sender));
@@ -2967,11 +3351,13 @@ ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
   if (!filePath) {
     throw new Error("缺少本地文件路径");
   }
+  logInfo("Local file delete requested", { fileName: path.basename(filePath), filePath });
 
   let stats;
   try {
     stats = await fs.promises.stat(filePath);
   } catch {
+    logWarn("Local file delete skipped because file is missing", { fileName: path.basename(filePath), filePath });
     return { deleted: false, missing: true, path: filePath };
   }
 
@@ -2980,10 +3366,16 @@ ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
   }
 
   await shell.trashItem(filePath);
+  logInfo("Local file moved to trash", { fileName: path.basename(filePath), filePath, sizeBytes: stats.size });
   return { deleted: true, path: filePath };
 });
 
 ipcMain.handle("transcode:start-batch", async (_event, payload) => {
+  logInfo("Transcode start requested", {
+    jobCount: Array.isArray(payload?.jobs) ? payload.jobs.length : 0,
+    outputDirectory: payload?.outputDirectory,
+    processingDevice: payload?.options?.processingDevice
+  });
   if (queueBusy) {
     throw new Error("已有处理任务正在运行");
   }
@@ -3004,6 +3396,7 @@ ipcMain.handle("transcode:start-batch", async (_event, payload) => {
 });
 
 ipcMain.handle("transcode:cancel-batch", async () => {
+  logInfo("Transcode cancel requested");
   cancelRequested = true;
   pauseRequested = false;
   closeActivePauseInterval();
@@ -3017,6 +3410,7 @@ ipcMain.handle("transcode:cancel-batch", async () => {
 });
 
 ipcMain.handle("transcode:pause-batch", async () => {
+  logInfo("Transcode pause requested", { queueBusy, pauseRequested });
   if (!queueBusy || pauseRequested) {
     return { paused: pauseRequested };
   }
@@ -3039,6 +3433,7 @@ ipcMain.handle("transcode:pause-batch", async () => {
 });
 
 ipcMain.handle("transcode:resume-batch", async () => {
+  logInfo("Transcode resume requested", { queueBusy, pauseRequested });
   if (!queueBusy || !pauseRequested) {
     return { paused: pauseRequested };
   }
@@ -3061,6 +3456,7 @@ ipcMain.handle("transcode:resume-batch", async () => {
 });
 
 ipcMain.handle("shell:reveal-path", async (_event, targetPath) => {
+  logInfo("Reveal path requested", { targetPath });
   if (targetPath && fs.existsSync(targetPath)) {
     shell.showItemInFolder(targetPath);
     return { opened: true };
@@ -3069,6 +3465,7 @@ ipcMain.handle("shell:reveal-path", async (_event, targetPath) => {
 });
 
 ipcMain.handle("shell:open-path", async (_event, targetPath) => {
+  logInfo("Open path requested", { targetPath });
   if (targetPath && fs.existsSync(targetPath)) {
     const message = await shell.openPath(targetPath);
     return message ? { opened: false, message } : { opened: true };

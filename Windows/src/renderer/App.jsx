@@ -148,6 +148,9 @@ const dlEditor = window.dlEditor || {
   pauseBatch: async () => ({ paused: true }),
   resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
+  getMainLogPath: async () => "",
+  writeLog: async () => ({ logged: false }),
+  revealMainLog: async () => ({ opened: false }),
   checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
   uploadInferaVideo: async () => ({}),
   cancelInferaUpload: async () => ({ canceled: false }),
@@ -168,6 +171,14 @@ const dlEditor = window.dlEditor || {
   onSystemUsageUpdate: () => () => undefined,
   onWindowFullscreenChange: () => () => undefined
 };
+
+function logRendererEvent(message, details = {}, level = "info") {
+  try {
+    void dlEditor.writeLog?.({ details, level, message });
+  } catch {
+    // Renderer logging must never block UI state updates.
+  }
+}
 
 const EMAIL_IDENTIFIER_PATTERN = /^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$/;
 const PHONE_IDENTIFIER_PATTERN = /^\+?\d{6,20}$/;
@@ -754,6 +765,7 @@ function App() {
       const fresh = selected.filter((job) => !known.has(job.path));
       return [...current, ...fresh];
     });
+    logRendererEvent("Processing jobs added", { count: selected.length });
     setNotice(`已加入 ${selected.length} 个视频`);
   }
 
@@ -816,6 +828,11 @@ function App() {
     const nextQueue = [...transferQueueRef.current, ...tasks];
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
+    logRendererEvent("Automation transfer tasks enqueued", {
+      backupCount: tasks.filter((task) => task.kind === "backup").length,
+      queueLength: nextQueue.length,
+      uploadCount: tasks.filter((task) => task.kind === "upload").length
+    });
     setJobs((current) =>
       current.map((job) => {
         const entry = consumed.get(job.id);
@@ -891,6 +908,12 @@ function App() {
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
     setTransferDockExpanded(true);
+    logRendererEvent("Manual transfer tasks added", {
+      kind,
+      queueLength: nextQueue.length,
+      rejectedCount,
+      taskCount: tasks.length
+    });
     const rejectedText =
       rejectedCount > 0
         ? `，${rejectedCount} 个文件未加入：${getManualDelphiUploadErrorMessage(rejectedErrors)}`
@@ -900,24 +923,39 @@ function App() {
 
   function clearFinishedTransfers() {
     const nextQueue = transferQueueRef.current.filter((item) => item.status !== "done");
+    const clearedCount = transferQueueRef.current.length - nextQueue.length;
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
+    logRendererEvent("Finished transfer tasks cleared", { clearedCount, queueLength: nextQueue.length });
   }
 
   function removeTransferTask(taskId) {
+    const before = transferQueueRef.current;
     const nextQueue = transferQueueRef.current.filter(
       (item) => item.id !== taskId || (item.status !== "queued" && !isTransferErrorStatus(item.status))
     );
+    const removedTask = before.find((item) => item.id === taskId && !nextQueue.some((nextItem) => nextItem.id === item.id));
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
+    if (removedTask) {
+      logRendererEvent("Transfer task removed", {
+        kind: removedTask.kind,
+        name: removedTask.name,
+        previousStatus: removedTask.status,
+        queueLength: nextQueue.length,
+        taskId
+      });
+    }
   }
 
   function retryTransferTask(taskId) {
+    const retryTask = transferQueueRef.current.find((item) => item.id === taskId);
     const nextQueue = transferQueueRef.current.map((item) =>
         item.id === taskId && isTransferErrorStatus(item.status)
           ? {
               ...item,
               completedAt: null,
+              activeUploadId: "",
               elapsedMs: 0,
               message: "等待上传",
               percent: 0,
@@ -928,6 +966,14 @@ function App() {
     );
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
+    if (retryTask) {
+      logRendererEvent("Transfer task retry requested", {
+        kind: retryTask.kind,
+        name: retryTask.name,
+        previousStatus: retryTask.status,
+        taskId
+      });
+    }
     if (!transferRunningRef.current && !isUploadActive(uploadStateRef.current)) {
       scheduleTransferQueueStart({ restartFailed: false });
     }
@@ -945,6 +991,10 @@ function App() {
 
   async function startTransferQueue({ restartFailed = true } = {}) {
     if (transferRunningRef.current || isUploadActive(uploadStateRef.current)) return;
+    logRendererEvent("Transfer queue start requested", {
+      queueLength: transferQueueRef.current.length,
+      restartFailed
+    });
 
     const startableQueue = restartFailed
       ? transferQueueRef.current.map((item) =>
@@ -952,6 +1002,7 @@ function App() {
             ? {
                 ...item,
                 completedAt: null,
+                activeUploadId: "",
                 elapsedMs: 0,
                 message: "等待上传",
                 percent: 0,
@@ -962,6 +1013,7 @@ function App() {
         )
       : transferQueueRef.current;
     if (!startableQueue.some((item) => item.status === "queued")) {
+      logRendererEvent("Transfer queue start skipped", { reason: "no_queued_task" });
       return;
     }
 
@@ -972,6 +1024,7 @@ function App() {
         setShowLogin(true);
       }
       setNotice("上传/备份需要先登录");
+      logRendererEvent("Transfer queue start blocked", { reason: "missing_auth" }, "warn");
       return;
     }
 
@@ -981,6 +1034,10 @@ function App() {
     transferRunningRef.current = true;
     setTransferRunning(true);
     setTransferDockExpanded(true);
+    logRendererEvent("Transfer queue started", {
+      backupQueued: startableQueue.filter((item) => item.kind === "backup" && item.status === "queued").length,
+      uploadQueued: startableQueue.filter((item) => item.kind === "upload" && item.status === "queued").length
+    });
     try {
       while (true) {
         const nextTask = getNextTransferTask(transferQueueRef.current);
@@ -992,6 +1049,7 @@ function App() {
     } finally {
       transferRunningRef.current = false;
       setTransferRunning(false);
+      logRendererEvent("Transfer queue stopped", { queueLength: transferQueueRef.current.length });
       setUploadState((current) =>
         isUploadActive(current)
           ? current
@@ -1008,9 +1066,12 @@ function App() {
 
   async function runTransferTask(task, token) {
     const taskJob = createJobFromTransferTask(task);
+    const taskUploadId = `${task.kind}-${task.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const options = getTransferTaskUploadOptions(task, () => Boolean(automationOptionsRef.current.autoClearLocal));
+    logRendererEvent("Transfer task started", { kind: task.kind, name: task.name, taskId: task.id });
 
     updateTransferTask(task.id, {
+      activeUploadId: taskUploadId,
       completedAt: null,
       message: "正在上传",
       startedAt: Date.now(),
@@ -1018,53 +1079,77 @@ function App() {
     });
 
     try {
-      const result = await uploadJobsToRepository([taskJob], options);
+      const result = await uploadJobsToRepository([taskJob], { ...options, uploadId: taskUploadId });
       const failed = Boolean(result?.failureSnapshot || result?.failed);
       if (failed) {
         updateTransferTask(task.id, {
+          activeUploadId: "",
           completedAt: Date.now(),
           message: result?.failureSnapshot?.message || (task.kind === "backup" ? "备份失败" : "上传失败"),
           speedBytesPerSecond: 0,
           status: task.kind === "backup" ? "backup_error" : "upload_error"
         });
+        logRendererEvent("Transfer task failed", {
+          kind: task.kind,
+          message: result?.failureSnapshot?.message || (task.kind === "backup" ? "备份失败" : "上传失败"),
+          name: task.name,
+          taskId: task.id
+        }, "warn");
         setNotice(`${task.kind === "backup" ? "备份" : "上传"}失败：${task.name}`);
         return;
       }
 
       updateTransferTask(task.id, {
+        activeUploadId: "",
         completedAt: Date.now(),
         message: task.kind === "backup" ? "备份完成" : "上传完成",
         percent: 100,
         speedBytesPerSecond: 0,
         status: "done"
       });
+      logRendererEvent("Transfer task completed", { kind: task.kind, name: task.name, taskId: task.id });
       setNotice(`${task.kind === "backup" ? "备份" : "上传"}完成：${task.name}`);
     } catch (error) {
       const message = error.message || "上传失败";
       if (message.includes("取消")) {
         updateTransferTask(task.id, {
+          activeUploadId: "",
           completedAt: Date.now(),
           message: "上传已取消",
           speedBytesPerSecond: 0,
           status: "canceled"
         });
+        logRendererEvent("Transfer task canceled", { kind: task.kind, name: task.name, taskId: task.id }, "warn");
         return;
       }
 
       updateTransferTask(task.id, {
+        activeUploadId: "",
         completedAt: Date.now(),
         message,
         speedBytesPerSecond: 0,
         status: task.kind === "backup" ? "backup_error" : "upload_error"
       });
+      logRendererEvent("Transfer task failed", { kind: task.kind, message, name: task.name, taskId: task.id }, "warn");
       setNotice(`${task.kind === "backup" ? "备份" : "上传"}失败：${task.name}`);
     }
   }
 
   function updateTransferTask(taskId, patch) {
+    const previous = transferQueueRef.current.find((item) => item.id === taskId);
     const nextQueue = transferQueueRef.current.map((item) => (item.id === taskId ? { ...item, ...patch } : item));
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
+    if (previous && (patch.status || patch.message) && (patch.status !== previous.status || patch.message !== previous.message)) {
+      logRendererEvent("Transfer task state changed", {
+        kind: previous.kind,
+        message: patch.message,
+        name: previous.name,
+        previousStatus: previous.status,
+        status: patch.status || previous.status,
+        taskId
+      });
+    }
   }
 
   function wakeUploadPauseWaiters() {
@@ -1088,6 +1173,7 @@ function App() {
       destination = "Delphi Repository",
       endpoint = WEB_VIDEO_UPLOAD_PATH,
       mode = "manual",
+      uploadId: providedUploadId = "",
       shouldClearLocalOnComplete = null
     } = {}
   ) {
@@ -1119,7 +1205,7 @@ function App() {
     }
 
     const uploadKind = isBackup ? "backup" : "upload";
-    const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const uploadId = providedUploadId || `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const retryOptions = { autoClearLocal, clearLocalTarget, destination, endpoint, mode };
     uploadCancelRequestedRef.current = false;
     uploadPauseRequestedRef.current = false;
@@ -1582,6 +1668,15 @@ function App() {
         status: "error",
         message: error.message || "无法打开更新链接"
       }));
+    }
+  }
+
+  async function revealMainLog() {
+    try {
+      const result = await dlEditor.revealMainLog();
+      setNotice(result?.opened ? "已打开日志文件位置" : "无法打开日志文件位置");
+    } catch (error) {
+      setNotice(error.message || "无法打开日志文件位置");
     }
   }
 
@@ -2073,6 +2168,7 @@ function App() {
           onCheckUpdates={checkForUpdates}
           onClose={() => setShowAppInfo(false)}
           onOpenUpdate={openUpdateLink}
+          onRevealLog={revealMainLog}
           outputDirectory={outputDirectory}
           updateState={updateState}
         />
@@ -2783,7 +2879,17 @@ function AppChrome({
   );
 }
 
-function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onClose, onOpenUpdate, outputDirectory, updateState }) {
+function AppInfoDialog({
+  activeEncoder,
+  capabilities,
+  info,
+  onCheckUpdates,
+  onClose,
+  onOpenUpdate,
+  onRevealLog,
+  outputDirectory,
+  updateState
+}) {
   const gpuNames = capabilities?.gpuNames?.length ? capabilities.gpuNames.join(", ") : "未检测到";
   const isCheckingUpdate = updateState?.status === "checking";
   const canOpenUpdate =
@@ -2827,6 +2933,10 @@ function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onCl
           <span>{updateState?.message || "检查最新安装包"}</span>
         </div>
         <div className="dialog-actions app-info-actions">
+          <button className="ghost-button" onClick={onRevealLog} type="button">
+            <FolderOpen size={14} />
+            定位日志
+          </button>
           <button className="ghost-button" disabled={isCheckingUpdate} onClick={onCheckUpdates} type="button">
             <RotateCcw size={14} />
             {isCheckingUpdate ? "检查中" : "检查更新"}
@@ -3304,13 +3414,19 @@ function sortTransferQueue(queue) {
 }
 
 function applyTransferProgress(queue, progress) {
-  if (!progress?.jobId) {
+  if (!progress?.jobId || !progress?.uploadId) {
     return queue;
   }
 
   const status = progress.status || "uploading";
   return queue.map((item) => {
     if (item.id !== progress.jobId) {
+      return item;
+    }
+    if (!item.activeUploadId || item.activeUploadId !== progress.uploadId) {
+      return item;
+    }
+    if (item.status !== "uploading" && item.status !== "processing" && item.status !== "paused") {
       return item;
     }
 
@@ -3441,6 +3557,9 @@ function applyUploadProgress(state, progress) {
   if (!progress?.uploadId || progress.uploadId !== state.uploadId) {
     return state;
   }
+  if (!isUploadActive(state)) {
+    return state;
+  }
 
   const incomingStatus = progress.status || "uploading";
   const status = state.status === "paused" && incomingStatus === "uploading" ? "paused" : incomingStatus;
@@ -3451,6 +3570,9 @@ function applyUploadProgress(state, progress) {
   const nextItems = state.items.map((item) => {
     const matches = progress.jobId ? item.jobId === progress.jobId : item.path === progress.filePath;
     if (!matches) {
+      return item;
+    }
+    if (item.status !== "queued" && item.status !== "uploading" && item.status !== "processing" && item.status !== "paused") {
       return item;
     }
 
