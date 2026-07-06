@@ -1,6 +1,6 @@
 {
   "name": "dl-studio-windows",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "private": true,
   "description": "Desktop batch video downsampler for Windows.",
   "main": "src/main/main.js",

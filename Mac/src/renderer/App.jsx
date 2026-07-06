@@ -119,7 +119,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-07-03",
+  updatedAt: "2026-07-07",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
