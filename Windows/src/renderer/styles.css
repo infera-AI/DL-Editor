@@ -2176,25 +2176,17 @@ button:disabled {
   min-width: 0;
 }
 
-.start-time-button {
+.start-time-info {
   display: inline-flex;
   flex: 0 1 auto;
   min-width: 0;
   align-items: center;
   gap: 4px;
-  border: 0;
   border-radius: 5px;
-  background: transparent;
   color: var(--muted);
-  cursor: pointer;
   font-size: 12px;
   font-weight: 400;
   padding: 1px 4px;
-}
-
-.start-time-button:hover:not(:disabled) {
-  background: var(--surface-soft);
-  color: var(--text);
 }
 
 .frame-rate-chip,
@@ -2220,16 +2212,10 @@ button:disabled {
   color: var(--accent-strong);
 }
 
-.start-time-button span {
+.start-time-info span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.start-time-value {
-  text-decoration-line: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 2px;
 }
 
 .status-badge {

@@ -51,6 +51,7 @@ const THEME_STORAGE_KEY = "dl-studio-theme";
 const LEGACY_THEME_STORAGE_KEY = "dl-editor-theme";
 const AUTH_STORAGE_KEY = "dl-studio-auth";
 const AUTOMATION_STORAGE_KEY = "dl-studio-editor-automation";
+const TRANSFER_QUEUE_STORAGE_KEY = "dl-studio-transfer-queue";
 const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
 const RAW_DATA_LIST_PATH = "/memory/raw-data";
@@ -199,6 +200,58 @@ function readStoredAutomationOptions() {
   } catch {
     return DEFAULT_AUTOMATION_OPTIONS;
   }
+}
+
+function readStoredTransferQueue() {
+  try {
+    const stored = window.localStorage?.getItem(TRANSFER_QUEUE_STORAGE_KEY);
+    if (!stored) return [];
+    const parsed = JSON.parse(stored);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(normalizeStoredTransferTask).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredTransferQueue(queue) {
+  try {
+    const tasks = Array.isArray(queue) ? queue.map(normalizeStoredTransferTask).filter(Boolean) : [];
+    window.localStorage?.setItem(TRANSFER_QUEUE_STORAGE_KEY, JSON.stringify(tasks));
+  } catch {
+    // localStorage can be unavailable or full; the live queue should keep working.
+  }
+}
+
+function normalizeStoredTransferTask(task) {
+  if (!task || typeof task !== "object") return null;
+  if (task.kind !== "upload" && task.kind !== "backup") return null;
+  if (!task.id || !task.uploadPath) return null;
+  if (task.status === "done") return null;
+  if (task.status === "canceling") return null;
+  if (task.status === "canceled") return null;
+
+  const activeStatuses = new Set(["uploading", "processing", "paused"]);
+  const failedStatuses = new Set(["upload_error", "backup_error", "error"]);
+  const status = activeStatuses.has(task.status)
+    ? "queued"
+    : task.status === "queued" || failedStatuses.has(task.status)
+      ? task.status
+      : "queued";
+  const isQueuedFromActive = activeStatuses.has(task.status);
+
+  return {
+    ...task,
+    activeUploadId: "",
+    bytesUploaded: status === "queued" ? 0 : Number(task.bytesUploaded) || 0,
+    completedAt: status === "queued" ? null : task.completedAt || null,
+    elapsedMs: status === "queued" ? 0 : Number(task.elapsedMs) || 0,
+    message: isQueuedFromActive ? "等待上传" : task.message || (status === "queued" ? "等待上传" : ""),
+    percent: status === "queued" ? 0 : clampPercent(task.percent),
+    speedBytesPerSecond: 0,
+    status,
+    totalBytes: Number(task.totalBytes) || 0
+  };
 }
 
 function inferIdentifierType(identifier) {
@@ -511,7 +564,7 @@ function App() {
     retryJobs: [],
     retryOptions: null
   });
-  const [transferQueue, setTransferQueue] = useState([]);
+  const [transferQueue, setTransferQueue] = useState(readStoredTransferQueue);
   const [transferDockExpanded, setTransferDockExpanded] = useState(false);
   const [transferRunning, setTransferRunning] = useState(false);
   const uploadCancelRequestedRef = useRef(false);
@@ -530,6 +583,7 @@ function App() {
     dateKey: cloudRepositoryDateKey,
     filterId: cloudRepositoryStatusFilterId,
     items: [],
+    statsItems: [],
     total: 0,
     hasMore: false,
     nextCursor: null,
@@ -658,6 +712,7 @@ function App() {
 
   useEffect(() => {
     transferQueueRef.current = transferQueue;
+    writeStoredTransferQueue(transferQueue);
   }, [transferQueue]);
 
   useEffect(() => {
@@ -689,6 +744,7 @@ function App() {
         dateKey: cloudSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
         filterId: getDefaultCloudStatusFilterIdForSpace(cloudSpaceId),
         items: [],
+        statsItems: [],
         total: 0,
         hasMore: false,
         nextCursor: null,
@@ -805,6 +861,12 @@ function App() {
     try {
       for (const job of nextJobs) {
         for (const kind of getPendingAutomationTransferKinds(job)) {
+          if (hasExistingAutomationTransferTask(job, kind)) {
+            const entry = consumed.get(job.id) || { backup: false, upload: false };
+            entry[kind] = true;
+            consumed.set(job.id, entry);
+            continue;
+          }
           const task = createTransferTask(await materializeAutomationTransferJob(job, kind), {
             auto: true,
             kind
@@ -849,6 +911,15 @@ function App() {
     setTransferDockExpanded(true);
     setNotice(`已加入 ${tasks.length} 个上传/备份任务`);
     scheduleTransferQueueStart({ restartFailed: false });
+  }
+
+  function hasExistingAutomationTransferTask(job, kind) {
+    const sourceJobId = String(job?.id || "");
+    if (!sourceJobId) {
+      return false;
+    }
+
+    return transferQueueRef.current.some((item) => item.kind === kind && String(item.sourceJobId || "") === sourceJobId);
   }
 
   async function materializeAutomationTransferJob(job, kind) {
@@ -991,10 +1062,6 @@ function App() {
 
   async function startTransferQueue({ restartFailed = true } = {}) {
     if (transferRunningRef.current || isUploadActive(uploadStateRef.current)) return;
-    logRendererEvent("Transfer queue start requested", {
-      queueLength: transferQueueRef.current.length,
-      restartFailed
-    });
 
     const startableQueue = restartFailed
       ? transferQueueRef.current.map((item) =>
@@ -1013,7 +1080,6 @@ function App() {
         )
       : transferQueueRef.current;
     if (!startableQueue.some((item) => item.status === "queued")) {
-      logRendererEvent("Transfer queue start skipped", { reason: "no_queued_task" });
       return;
     }
 
@@ -1049,7 +1115,6 @@ function App() {
     } finally {
       transferRunningRef.current = false;
       setTransferRunning(false);
-      logRendererEvent("Transfer queue stopped", { queueLength: transferQueueRef.current.length });
       setUploadState((current) =>
         isUploadActive(current)
           ? current
@@ -1136,20 +1201,9 @@ function App() {
   }
 
   function updateTransferTask(taskId, patch) {
-    const previous = transferQueueRef.current.find((item) => item.id === taskId);
     const nextQueue = transferQueueRef.current.map((item) => (item.id === taskId ? { ...item, ...patch } : item));
     transferQueueRef.current = nextQueue;
     setTransferQueue(nextQueue);
-    if (previous && (patch.status || patch.message) && (patch.status !== previous.status || patch.message !== previous.message)) {
-      logRendererEvent("Transfer task state changed", {
-        kind: previous.kind,
-        message: patch.message,
-        name: previous.name,
-        previousStatus: previous.status,
-        status: patch.status || previous.status,
-        taskId
-      });
-    }
   }
 
   function wakeUploadPauseWaiters() {
@@ -1769,6 +1823,7 @@ function App() {
         dateKey: effectiveDateKey,
         filterId: effectiveFilterId,
         items: [],
+        statsItems: [],
         total: 0,
         hasMore: false,
         nextCursor: null,
@@ -1783,6 +1838,10 @@ function App() {
         current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
           ? current.items
           : [],
+      statsItems:
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey
+          ? current.statsItems || []
+          : [],
       spaceId: spaceIdOverride,
       dateKey: effectiveDateKey,
       filterId: effectiveFilterId,
@@ -1795,6 +1854,13 @@ function App() {
         dateKey: effectiveDateKey,
         filterId: effectiveFilterId
       });
+      const statsRepository =
+        spaceIdOverride !== "rawdata" && effectiveFilterId !== CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID
+          ? await fetchCloudRepository(token, spaceIdOverride, {
+              dateKey: effectiveDateKey,
+              filterId: CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID
+            })
+          : repository;
       setRepositoryState((current) =>
         current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
           ? {
@@ -1803,6 +1869,7 @@ function App() {
               dateKey: effectiveDateKey,
               filterId: effectiveFilterId,
               items: repository.items,
+              statsItems: statsRepository.items,
               total: repository.total,
               hasMore: repository.hasMore,
               nextCursor: repository.nextCursor,
@@ -2086,11 +2153,9 @@ function App() {
             <div className="queue-list">
               {jobs.map((job) => (
                 <QueueItem
-                  disabled={isRunning}
                   job={job}
                   key={job.id}
                   now={clockNow}
-                  onEditStartTime={() => openStartTimeEditor(job)}
                   onOpen={() => openProcessingOutput(job, "open")}
                   onRemove={() => removeJob(job.id)}
                   onReveal={() => openProcessingOutput(job, "reveal")}
@@ -2266,7 +2331,8 @@ function CloudRepository({
   const activeStatusFilter = cloudRepositoryStatusFilterId;
   const visibleMediaFilters = useMemo(() => getCloudMediaFiltersForSpace(displaySpaceId), [displaySpaceId]);
   const visibleStatusFilters = useMemo(() => getCloudStatusFiltersForSpace(displaySpaceId), [displaySpaceId]);
-  const stats = useMemo(() => getCloudRepositoryStats(items), [items]);
+  const statsItems = repositoryState.statsItems || items;
+  const stats = useMemo(() => getCloudRepositoryStats(statsItems), [statsItems]);
   const filteredItems = useMemo(
     () => filterCloudRepositoryItems(items, activeMediaFilter, activeStatusFilter, cloudQuery),
     [activeMediaFilter, activeStatusFilter, cloudQuery, items]
@@ -4314,7 +4380,7 @@ function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }
   );
 }
 
-function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal, removeDisabled }) {
+function QueueItem({ job, now, onOpen, onRemove, onReveal, removeDisabled }) {
   const elapsedMs = getElapsedMs(job, now);
   const remainingMs = getEstimatedRemainingMs(job, elapsedMs);
   const durationMs = Math.max(0, Math.round((Number(job.duration) || 0) * 1000));
@@ -4333,11 +4399,11 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
             <h3 title={job.path}>{job.name}</h3>
             <div className="file-meta-row">
               <p>{job.sizeLabel || job.path}</p>
-              <button className="start-time-button" disabled={disabled} onClick={onEditStartTime} type="button">
+              <span className="start-time-info">
                 <CalendarClock size={12} />
                 <span className="start-time-label">开始时间</span>
                 <span className="start-time-value">{formatDateTime(startTimeMs)}</span>
-              </button>
+              </span>
               <span className="frame-rate-chip" title="源视频帧率">
                 <Gauge size={12} />
                 <span>{job.frameRateLabel || "fps --"}</span>

@@ -85,6 +85,7 @@ app.setName(APP_NAME);
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 let mainLogFilePath = null;
 let fileLoggerInitialized = false;
+let logSessionHeaderWritten = false;
 let lastLoggedBatchState = null;
 const lastLoggedJobStates = new Map();
 const lastLoggedUploadStates = new Map();
@@ -143,11 +144,30 @@ function rotateMainLogIfNeeded(filePath) {
   }
 }
 
+function writeLogSessionHeader(logPath) {
+  if (logSessionHeaderWritten) {
+    return;
+  }
+  logSessionHeaderWritten = true;
+  fs.appendFileSync(
+    logPath,
+    [
+      "",
+      "================================================================",
+      `[${new Date().toISOString()}] [SESSION] DL Studio log session started`,
+      `[SESSION] version=${app.getVersion()} platform=${process.platform} arch=${process.arch} pid=${process.pid}`,
+      "================================================================"
+    ].join("\n") + "\n",
+    "utf8"
+  );
+}
+
 function writeLog(level, args) {
   try {
     const logPath = getMainLogFilePath();
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     rotateMainLogIfNeeded(logPath);
+    writeLogSessionHeader(logPath);
     const message = args.map(formatLogArg).join(" ");
     fs.appendFileSync(logPath, `[${new Date().toISOString()}] [${level}] ${message}\n`, "utf8");
   } catch {
@@ -1749,7 +1769,6 @@ function getBundledBinary(name) {
 
 function runBinary(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    logInfo("Binary process started", { command: path.basename(command), argsCount: Array.isArray(args) ? args.length : 0 });
     const child = spawn(command, args, {
       windowsHide: true,
       ...options
@@ -1772,7 +1791,6 @@ function runBinary(command, args, options = {}) {
     });
     child.on("close", (code) => {
       if (code === 0) {
-        logInfo("Binary process completed", { command: path.basename(command) });
         resolve({ stdout, stderr });
       } else {
         const error = new Error(stderr.trim() || stdout.trim() || `进程退出，代码 ${code}`);
