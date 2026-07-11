@@ -5,6 +5,7 @@ import {
   CheckCheck,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleStop,
   Clock3,
@@ -33,15 +34,14 @@ import {
   Search,
   Settings2,
   Sparkles,
-  Square,
   SquareCheck,
   Sun,
   Timer,
+  Trash2,
   TriangleAlert,
   Upload,
   UserRound,
   Video,
-  X,
   Zap
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -53,17 +53,28 @@ const THEME_STORAGE_KEY = "dl-studio-theme";
 const LEGACY_THEME_STORAGE_KEY = "dl-editor-theme";
 const AUTH_STORAGE_KEY = "dl-studio-auth";
 const AUTOMATION_STORAGE_KEY = "dl-studio-editor-automation";
+const TRANSFER_QUEUE_STORAGE_KEY = "dl-studio-transfer-queue";
 const INFERA_API_BASE_URL = import.meta.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
 const DL_ENGINE_API_BASE_URL = import.meta.env.VITE_DL_ENGINE_API_BASE_URL || "http://127.0.0.1:8787";
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
 const RAW_DATA_LIST_PATH = "/memory/raw-data";
 const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const DELPHI_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const DELPHI_UPLOAD_FILE_NAME_PATTERN = /^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.mp4$/i;
+const DELPHI_UPLOAD_VALIDATION_MESSAGES = {
+  size: "文件需小于 2GB，请压制后上传。如需上传备份视频，请使用右侧按钮添加。",
+  name: "请检查是否为压制后视频，文件名需为 yyyy_mm_dd_hh_mm_ss.mp4"
+};
+const CLOUD_REPOSITORY_PAGE_SIZE = 100;
+const CLOUD_REPOSITORY_MAX_PAGES = 1000;
+const CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID = "all";
+const CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID = "all_status";
 const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine", "Research"];
 const ENGINE_PASSWORD = "111111";
 const DEFAULT_AUTOMATION_OPTIONS = {
-  autoUpload: false,
-  autoBackup: false,
-  autoClearLocal: false
+  autoUpload: true,
+  autoBackup: true,
+  autoClearLocal: true
 };
 const FPS_PRESETS = [1, 2, 4, 5, 10];
 const RESOLUTION_PRESETS = [
@@ -77,7 +88,7 @@ const STATUS_LABELS = {
   queued: "等待",
   processing: "处理中",
   done: "完成",
-  error: "失败",
+  error: "压制失败",
   canceled: "取消",
   paused: "暂停"
 };
@@ -86,11 +97,12 @@ const CLOUD_FILTERS = [
   { id: "all", label: "全部文件" },
   { id: "video", label: "视频" },
   { id: "audio", label: "音频" },
+  { id: "all_status", label: "全部状态" },
   { id: "parsed", label: "已解析" },
-  { id: "processing", label: "处理中" }
+  { id: "processing", label: "处理中" },
+  { id: "failed", label: "解析失败" }
 ];
 const CLOUD_VIEW_MODES = ["list", "grid"];
-const CLOUD_REPOSITORY_PAGE_SIZE = 50;
 const CLOUD_SPACES = [
   { id: "repository", label: "DL Repository" },
   { id: "rawdata", label: "DL Rawdata" }
@@ -105,7 +117,9 @@ const UPLOAD_STATUS_LABELS = {
   uploading: "上传中",
   processing: "服务器处理中",
   done: "完成",
-  error: "失败",
+  error: "传输失败",
+  upload_error: "上传失败",
+  backup_error: "备份失败",
   canceled: "已取消",
   canceling: "取消中",
   paused: "已暂停"
@@ -114,7 +128,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-06-23",
+  updatedAt: "2026-07-07",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -122,6 +136,7 @@ const APP_INFO = {
 const dlEditor = window.dlEditor || {
   platform: navigator.platform?.toLowerCase().includes("win") ? "win32" : navigator.platform?.toLowerCase().includes("mac") ? "darwin" : "browser",
   selectVideos: async () => [],
+  getVideoMetadata: async () => null,
   selectOutputDirectory: async () => null,
   getCapabilities: async () => ({
     cpuModel: "CPU",
@@ -142,6 +157,9 @@ const dlEditor = window.dlEditor || {
   pauseBatch: async () => ({ paused: true }),
   resumeBatch: async () => ({ paused: false }),
   cancelBatch: async () => ({ cancelRequested: true }),
+  getMainLogPath: async () => "",
+  writeLog: async () => ({ logged: false }),
+  revealMainLog: async () => ({ opened: false }),
   checkForUpdates: async () => ({ status: "latest", currentVersion: packageJson.version, latestVersion: packageJson.version }),
   getEngineMediaProxyUrl: async () => "",
   streamEngineQa: async () => ({ ok: false }),
@@ -168,6 +186,14 @@ const dlEditor = window.dlEditor || {
   onWindowFullscreenChange: () => () => undefined
 };
 
+function logRendererEvent(message, details = {}, level = "info") {
+  try {
+    void dlEditor.writeLog?.({ details, level, message });
+  } catch {
+    // Renderer logging must never block UI state updates.
+  }
+}
+
 const EMAIL_IDENTIFIER_PATTERN = /^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$/;
 const PHONE_IDENTIFIER_PATTERN = /^\+?\d{6,20}$/;
 
@@ -187,6 +213,58 @@ function readStoredAutomationOptions() {
   } catch {
     return DEFAULT_AUTOMATION_OPTIONS;
   }
+}
+
+function readStoredTransferQueue() {
+  try {
+    const stored = window.localStorage?.getItem(TRANSFER_QUEUE_STORAGE_KEY);
+    if (!stored) return [];
+    const parsed = JSON.parse(stored);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(normalizeStoredTransferTask).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredTransferQueue(queue) {
+  try {
+    const tasks = Array.isArray(queue) ? queue.map(normalizeStoredTransferTask).filter(Boolean) : [];
+    window.localStorage?.setItem(TRANSFER_QUEUE_STORAGE_KEY, JSON.stringify(tasks));
+  } catch {
+    // localStorage can be unavailable or full; the live queue should keep working.
+  }
+}
+
+function normalizeStoredTransferTask(task) {
+  if (!task || typeof task !== "object") return null;
+  if (task.kind !== "upload" && task.kind !== "backup") return null;
+  if (!task.id || !task.uploadPath) return null;
+  if (task.status === "done") return null;
+  if (task.status === "canceling") return null;
+  if (task.status === "canceled") return null;
+
+  const activeStatuses = new Set(["uploading", "processing", "paused"]);
+  const failedStatuses = new Set(["upload_error", "backup_error", "error"]);
+  const status = activeStatuses.has(task.status)
+    ? "queued"
+    : task.status === "queued" || failedStatuses.has(task.status)
+      ? task.status
+      : "queued";
+  const isQueuedFromActive = activeStatuses.has(task.status);
+
+  return {
+    ...task,
+    activeUploadId: "",
+    bytesUploaded: status === "queued" ? 0 : Number(task.bytesUploaded) || 0,
+    completedAt: status === "queued" ? null : task.completedAt || null,
+    elapsedMs: status === "queued" ? 0 : Number(task.elapsedMs) || 0,
+    message: isQueuedFromActive ? "等待上传" : task.message || (status === "queued" ? "等待上传" : ""),
+    percent: status === "queued" ? 0 : clampPercent(task.percent),
+    speedBytesPerSecond: 0,
+    status,
+    totalBytes: Number(task.totalBytes) || 0
+  };
 }
 
 function inferIdentifierType(identifier) {
@@ -517,75 +595,117 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
-function getCloudRepositoryPath(spaceId, { cursor = null, limit = CLOUD_REPOSITORY_PAGE_SIZE, offset = 0 } = {}) {
-  if (spaceId === "rawdata") {
-    return RAW_DATA_LIST_PATH;
-  }
-
-  const params = new URLSearchParams({
-    include_page: "true",
-    limit: String(limit)
-  });
-  if (cursor) {
-    params.set("cursor", cursor);
-  } else if (Number.isFinite(Number(offset)) && Number(offset) > 0) {
-    params.set("offset", String(Number(offset)));
-  }
-
-  return `/device/files?${params.toString()}`;
-}
-
-function getCloudRepositoryPageInfo(result) {
-  return result?.page || result?.pagination || result?.meta || {};
-}
-
-function getCloudRepositoryTotal(result, items) {
-  const pageInfo = getCloudRepositoryPageInfo(result);
-  const total = Number(result?.total ?? result?.count ?? pageInfo?.total ?? pageInfo?.count);
-  return Number.isFinite(total) ? total : items.length;
-}
-
-function getCloudRepositoryNextCursor(result) {
-  const pageInfo = getCloudRepositoryPageInfo(result);
-  return result?.next_cursor || result?.nextCursor || pageInfo?.next_cursor || pageInfo?.nextCursor || null;
-}
-
-function getCloudRepositoryHasMore(result) {
-  const pageInfo = getCloudRepositoryPageInfo(result);
-  return Boolean(result?.has_more || result?.hasMore || pageInfo?.has_more || pageInfo?.hasMore);
-}
-
 async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id, options = {}) {
-  const result = await requestInfera(getCloudRepositoryPath(spaceId, options), { token });
-  const items = normalizeCloudItems(result);
-  const offset = Number.isFinite(Number(options.offset)) ? Number(options.offset) : 0;
-  const total = getCloudRepositoryTotal(result, items);
-  const nextCursor = getCloudRepositoryNextCursor(result);
-  const nextOffset = offset + items.length;
+  const items = [];
+  let total = null;
+  let hasMore = true;
+  let cursor = null;
+  let offset = 0;
+  let pageCount = 0;
+  const endpoint = spaceId === "rawdata" ? RAW_DATA_LIST_PATH : "/device/files";
+  const dateKey = typeof options.dateKey === "string" && spaceId !== "rawdata" ? options.dateKey : "";
+  const filterId = typeof options.filterId === "string" && spaceId !== "rawdata" ? options.filterId : "all";
+
+  while (hasMore && pageCount < CLOUD_REPOSITORY_MAX_PAGES) {
+    const result = await requestInfera(buildCloudRepositoryPagePath(endpoint, { cursor, dateKey, filterId, offset }), { token });
+    const pageItems = normalizeCloudItems(result);
+    items.push(...pageItems);
+    total = Number.isFinite(Number(result?.total)) ? Number(result.total) : total;
+    hasMore = Boolean(result?.has_more);
+    cursor = result?.next_cursor || null;
+    offset = Number.isFinite(Number(result?.next_offset)) ? Number(result.next_offset) : offset + pageItems.length;
+
+    if (!hasMore || (!cursor && !Number.isFinite(Number(result?.next_offset)))) {
+      hasMore = false;
+    }
+
+    pageCount += 1;
+  }
 
   return {
     items,
-    total,
-    hasMore: getCloudRepositoryHasMore(result) || Boolean(nextCursor) || nextOffset < total,
-    nextCursor,
-    nextOffset
+    total: total ?? items.length,
+    hasMore,
+    nextCursor: cursor
   };
 }
 
-function mergeCloudRepositoryItems(currentItems, nextItems) {
-  const merged = [...currentItems];
-  const seen = new Set(currentItems.map(getRepositoryStableItemKey).filter(Boolean));
-  nextItems.forEach((item) => {
-    const key = getRepositoryStableItemKey(item);
-    if (key && seen.has(key)) {
-      return;
-    }
-    if (key) {
-      seen.add(key);
-    }
-    merged.push(item);
+function buildCloudRepositoryPagePath(endpoint, { cursor = null, dateKey = "", filterId = "all", offset = 0 } = {}) {
+  const params = new URLSearchParams({
+    include_page: "true",
+    limit: String(CLOUD_REPOSITORY_PAGE_SIZE),
+    page_mode: "cursor"
   });
-  return merged;
+
+  if (cursor) {
+    params.set("cursor", cursor);
+  } else if (offset > 0) {
+    params.set("offset", String(offset));
+  }
+
+  const dayRange = endpoint === "/device/files" ? getCloudRepositoryDateRange(dateKey) : null;
+  if (dayRange) {
+    params.set("start_timestamp_ms", String(dayRange.startTimestampMs));
+    params.set("end_timestamp_ms", String(dayRange.endTimestampMs));
+  }
+
+  const parseStatus = endpoint === "/device/files" ? getCloudRepositoryParseStatusParam(filterId) : "";
+  if (parseStatus) {
+    params.set("parse_status", parseStatus);
+  }
+
+  return `${endpoint}?${params.toString()}`;
+}
+
+function getCloudRepositoryParseStatusParam(filterId) {
+  if (filterId === "parsed") {
+    return "PARSED,FALLBACK_PARSED,PARTIAL_PARSED";
+  }
+  if (filterId === "processing") {
+    return "PENDING,QUEUED,PREVIEW_READY,POSTPROCESSING,SPLITTING,PROCESSING,PARSING,RUNNING,REINDEX_REQUIRED";
+  }
+  if (filterId === "failed") {
+    return "FAIL,FAILED,ERROR,PARSE_FAILED,PROCESSING_FAILED";
+  }
+  return "";
+}
+
+function getCloudRepositoryDateRange(dateKey) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+  if (!Number.isFinite(start.getTime()) || start.getFullYear() !== year || start.getMonth() !== month - 1 || start.getDate() !== day) {
+    return null;
+  }
+
+  return {
+    startTimestampMs: start.getTime(),
+    endTimestampMs: start.getTime() + 24 * 60 * 60 * 1000
+  };
+}
+
+function getLocalDateKey(date = new Date()) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function shiftLocalDateKey(dateKey, offsetDays) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return getLocalDateKey();
+  }
+
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + offsetDays);
+  return getLocalDateKey(date);
 }
 
 function normalizeCloudItems(result) {
@@ -650,8 +770,9 @@ function App() {
   const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
   const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
+  const [cloudRepositoryDateKey, setCloudRepositoryDateKey] = useState(() => getLocalDateKey());
+  const [cloudRepositoryMediaFilterId, setCloudRepositoryMediaFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID);
+  const [cloudRepositoryStatusFilterId, setCloudRepositoryStatusFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID);
   const [automationOptions, setAutomationOptions] = useState(readStoredAutomationOptions);
   const [uploadState, setUploadState] = useState({
     status: "idle",
@@ -659,26 +780,30 @@ function App() {
     expanded: false,
     uploadId: "",
     items: [],
-    message: ""
+    message: "",
+    retryJobs: [],
+    retryOptions: null
   });
-  const [autoUploadNotice, setAutoUploadNotice] = useState({
-    visible: false,
-    message: ""
-  });
+  const [transferQueue, setTransferQueue] = useState(readStoredTransferQueue);
+  const [transferDockExpanded, setTransferDockExpanded] = useState(false);
+  const [transferRunning, setTransferRunning] = useState(false);
   const uploadCancelRequestedRef = useRef(false);
-  const jobsRef = useRef(jobs);
+  const uploadPauseRequestedRef = useRef(false);
+  const uploadPauseWaitersRef = useRef([]);
   const uploadStateRef = useRef(uploadState);
+  const transferQueueRef = useRef(transferQueue);
+  const transferRunningRef = useRef(false);
   const authStateRef = useRef(authState);
   const automationOptionsRef = useRef(automationOptions);
-  const autoUploadQueueRef = useRef([]);
-  const autoQueuedJobIdsRef = useRef(new Set());
-  const autoUploadRunningRef = useRef(false);
-  const automationDrainTimerRef = useRef(null);
+  const automationEnqueueRunningRef = useRef(false);
   const autoLoginPromptedRef = useRef(false);
   const [repositoryState, setRepositoryState] = useState({
     status: "idle",
     spaceId: cloudSpaceId,
+    dateKey: cloudRepositoryDateKey,
+    filterId: cloudRepositoryStatusFilterId,
     items: [],
+    statsItems: [],
     total: 0,
     hasMore: false,
     nextCursor: null,
@@ -691,17 +816,14 @@ function App() {
 
   const isRunning = batchState.status === "started";
   const isPaused = isRunning && Boolean(batchState.paused);
-  const pendingJobs = jobs.filter((job) => job.status !== "done");
+  const pendingJobs = jobs.filter((job) => job.status === "queued" || job.status === "error" || job.status === "canceled");
   const hasProcessingJobs = jobs.some((job) => job.status === "processing" || job.status === "paused");
   const activeEncodingJob = getActiveEncodingJob(jobs);
-  const selectedJobs = useMemo(() => jobs.filter((job) => selectedJobIds.has(job.id)), [jobs, selectedJobIds]);
-  const allJobsSelected = jobs.length > 0 && selectedJobIds.size === jobs.length;
-  const canBackupSelection = selectedJobs.length > 0 && !isRunning && !isUploadActive(uploadState);
-  const canUploadSelection =
-    selectedJobs.length > 0 &&
-    selectedJobs.every(isJobUploadable) &&
-    !isRunning &&
-    !isUploadActive(uploadState);
+  const canClearFinished = jobs.some((job) => canClearFinishedJob(job));
+  const transferQueueSorted = useMemo(() => sortTransferQueue(transferQueue), [transferQueue]);
+  const canAddTransfer = !isUploadActive(uploadState) && !transferRunning;
+  const canStartTransfers = !isUploadActive(uploadState) && !transferRunning && transferQueue.some(isTransferStartable);
+  const canClearFinishedTransfers = transferQueue.some((item) => item.status === "done");
 
   useEffect(() => {
     dlEditor.getCapabilities().then((data) => {
@@ -712,25 +834,45 @@ function App() {
     dlEditor.getUsage().then(setSystemUsage).catch(() => undefined);
 
     const offJob = dlEditor.onJobUpdate((update) => {
-      setJobs((current) => current.map((job) => (job.id === update.id ? { ...job, ...update } : job)));
+      setJobs((current) =>
+        current.map((job) => {
+          if (job.id !== update.id) {
+            return job;
+          }
+
+          const completedNow = update.status === "done" && job.status !== "done";
+          return {
+            ...job,
+            ...update,
+            ...(completedNow
+              ? {
+                  autoBackupRequested: Boolean(automationOptionsRef.current.autoBackup),
+                  autoUploadRequested: Boolean(automationOptionsRef.current.autoUpload)
+                }
+              : {})
+          };
+        })
+      );
     });
 
     const offBatch = dlEditor.onBatchUpdate((update) => {
       setBatchState((current) => ({ ...current, ...update }));
       if (update.status === "finished") {
-        setNotice(`已完成 ${update.completed} 个视频，输出到 ${update.outputDirectory}`);
+        const failedCount = Number(update.failed) || 0;
+        const failedText = failedCount > 0 ? `，失败 ${failedCount} 个` : "";
+        setNotice(`已完成 ${update.completed} 个视频${failedText}，输出到 ${update.outputDirectory}`);
       } else if (update.status === "canceled") {
         setNotice("批量处理已取消");
       } else if (update.status === "error") {
         setNotice(update.message || "批量处理失败");
       } else if (update.status === "started" && update.paused) {
         setJobs((current) =>
-          current.map((job) => (job.status === "processing" ? { ...job, status: "paused", message: job.message || "Paused" } : job))
+          current.map((job) => (job.status === "processing" ? { ...job, status: "paused", message: job.message || "已暂停" } : job))
         );
         setNotice("处理已暂停");
       } else if (update.status === "started" && update.resumed) {
         setJobs((current) =>
-          current.map((job) => (job.status === "paused" ? { ...job, status: "processing", message: job.message || "Resumed" } : job))
+          current.map((job) => (job.status === "paused" ? { ...job, status: "processing", message: job.message || "已继续" } : job))
         );
         setNotice("处理已继续");
       } else if (update.status === "started") {
@@ -746,6 +888,11 @@ function App() {
     const offFullscreen = dlEditor.onWindowFullscreenChange(setIsFullscreen);
     const offUpload = dlEditor.onInferaUploadProgress((progress) => {
       setUploadState((current) => applyUploadProgress(current, progress));
+      setTransferQueue((current) => {
+        const next = applyTransferProgress(current, progress);
+        transferQueueRef.current = next;
+        return next;
+      });
     });
     dlEditor.isWindowFullscreen().then(setIsFullscreen).catch(() => undefined);
 
@@ -755,10 +902,6 @@ function App() {
       offUsage();
       offFullscreen();
       offUpload();
-      if (automationDrainTimerRef.current) {
-        window.clearTimeout(automationDrainTimerRef.current);
-        automationDrainTimerRef.current = null;
-      }
     };
   }, []);
 
@@ -776,7 +919,6 @@ function App() {
     authStateRef.current = authState;
     if (authState?.token) {
       autoLoginPromptedRef.current = false;
-      drainAutomationQueue();
     }
   }, [authState]);
 
@@ -787,54 +929,24 @@ function App() {
 
   useEffect(() => {
     uploadStateRef.current = uploadState;
-    if (!isUploadActive(uploadState)) {
-      drainAutomationQueue();
-    }
   }, [uploadState]);
 
   useEffect(() => {
-    jobsRef.current = jobs;
+    transferQueueRef.current = transferQueue;
+    writeStoredTransferQueue(transferQueue);
+  }, [transferQueue]);
 
-    if (!jobs.length) {
-      setSelectionMode(false);
-    }
-
-    const knownIds = new Set(jobs.map((job) => job.id));
-    for (const id of autoQueuedJobIdsRef.current) {
-      const job = jobs.find((item) => item.id === id);
-      if (!job || job.status !== "done") {
-        autoQueuedJobIdsRef.current.delete(id);
-      }
-    }
-    autoUploadQueueRef.current = autoUploadQueueRef.current.filter((job) => knownIds.has(job.id));
-
-    setSelectedJobIds((current) => {
-      const next = new Set([...current].filter((id) => knownIds.has(id)));
-      return next.size === current.size ? current : next;
-    });
+  useEffect(() => {
   }, [jobs]);
 
   useEffect(() => {
-    if (!automationOptions.autoUpload && !automationOptions.autoBackup) {
-      return;
-    }
-
-    const readyJobs = jobs.filter((job) => hasPendingAutomationActions(job, automationOptions) && !autoQueuedJobIdsRef.current.has(job.id));
+    const readyJobs = jobs.filter((job) => getPendingAutomationTransferKinds(job).length > 0);
     if (!readyJobs.length) {
       return;
     }
 
-    if (!authState?.token) {
-      if (!autoLoginPromptedRef.current) {
-        autoLoginPromptedRef.current = true;
-        setShowLogin(true);
-        setNotice("自动上传/备份需要先登录");
-      }
-      return;
-    }
-
-    enqueueAutomationJobs(readyJobs);
-  }, [automationOptions.autoUpload, automationOptions.autoBackup, authState?.token, jobs]);
+    void enqueueAutomationTransfers(readyJobs);
+  }, [jobs]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setShowSplash(false), 2400);
@@ -851,7 +963,10 @@ function App() {
       setRepositoryState({
         status: "auth",
         spaceId: cloudSpaceId,
+        dateKey: cloudSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+        filterId: getDefaultCloudStatusFilterIdForSpace(cloudSpaceId),
         items: [],
+        statsItems: [],
         total: 0,
         hasMore: false,
         nextCursor: null,
@@ -860,11 +975,11 @@ function App() {
       return;
     }
 
-    loadCloudRepository(authState, cloudSpaceId);
-  }, [activeNav, authState?.token, cloudSpaceId]);
+    loadCloudRepository(authState, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
+  }, [activeNav, authState?.token, cloudRepositoryDateKey, cloudRepositoryStatusFilterId, cloudSpaceId]);
 
   useEffect(() => {
-    if (!hasProcessingJobs && !isUploadActive(uploadState)) {
+    if (!hasProcessingJobs && !isUploadActive(uploadState) && !transferQueue.some((item) => item.status === "uploading")) {
       return undefined;
     }
 
@@ -873,7 +988,7 @@ function App() {
     }, 80);
 
     return () => window.clearInterval(timer);
-  }, [hasProcessingJobs, uploadState.status]);
+  }, [hasProcessingJobs, transferQueue, uploadState.status]);
 
   const selectedResolution = useMemo(() => {
     if (useSourceResolution) {
@@ -918,6 +1033,8 @@ function App() {
   }, [jobs]);
 
   async function addVideos() {
+    if (isRunning) return;
+
     const selected = await dlEditor.selectVideos();
     if (!selected.length) return;
 
@@ -926,57 +1043,8 @@ function App() {
       const fresh = selected.filter((job) => !known.has(job.path));
       return [...current, ...fresh];
     });
+    logRendererEvent("Processing jobs added", { count: selected.length });
     setNotice(`已加入 ${selected.length} 个视频`);
-  }
-
-  function toggleSelectionMode() {
-    if (!jobs.length) return;
-
-    setSelectionMode((current) => {
-      const next = !current;
-      if (!next) {
-        setSelectedJobIds(new Set());
-      }
-      return next;
-    });
-  }
-
-  function toggleJobSelection(jobId) {
-    setSelectedJobIds((current) => {
-      const next = new Set(current);
-      if (next.has(jobId)) {
-        next.delete(jobId);
-      } else {
-        next.add(jobId);
-      }
-      return next;
-    });
-  }
-
-  function toggleAllSelectedJobs() {
-    setSelectedJobIds((current) => {
-      if (jobs.length > 0 && current.size === jobs.length) {
-        return new Set();
-      }
-
-      return new Set(jobs.map((job) => job.id));
-    });
-  }
-
-  async function backupSelectedJobs() {
-    if (!canBackupSelection) return;
-
-    const jobsToBackup = selectedJobs.map(prepareBackupJob);
-
-    try {
-      await uploadJobsToRepository(jobsToBackup, {
-        destination: "DL Rawdata",
-        endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
-        mode: "backup"
-      });
-    } catch {
-      // Upload state and notice are already updated by uploadJobsToRepository.
-    }
   }
 
   function updateAutomationOption(key, value) {
@@ -986,49 +1054,254 @@ function App() {
     }
   }
 
-  function enqueueAutomationJobs(nextJobs) {
-    const freshJobs = nextJobs.filter((job) => {
-      if (!job?.id || autoQueuedJobIdsRef.current.has(job.id)) {
-        return false;
+  async function openProcessingOutput(job, action) {
+    const outputPath = getProcessingOutputActionPath(job);
+    if (!outputPath) {
+      setNotice(getProcessingDoneMessage(job));
+      return;
+    }
+
+    try {
+      const result = action === "reveal" ? await dlEditor.revealPath(outputPath) : await dlEditor.openPath(outputPath);
+      const errorMessage = getShellActionErrorMessage(result);
+      if (errorMessage) {
+        setNotice(errorMessage);
+      }
+    } catch (error) {
+      setNotice(error.message || "打开本地压制视频失败");
+    }
+  }
+
+  async function enqueueAutomationTransfers(nextJobs) {
+    if (automationEnqueueRunningRef.current) {
+      return;
+    }
+
+    automationEnqueueRunningRef.current = true;
+    const tasks = [];
+    const consumed = new Map();
+    try {
+      for (const job of nextJobs) {
+        for (const kind of getPendingAutomationTransferKinds(job)) {
+          if (hasExistingAutomationTransferTask(job, kind)) {
+            const entry = consumed.get(job.id) || { backup: false, upload: false };
+            entry[kind] = true;
+            consumed.set(job.id, entry);
+            continue;
+          }
+          const task = createTransferTask(await materializeAutomationTransferJob(job, kind), {
+            auto: true,
+            kind
+          });
+          if (task) {
+            tasks.push(task);
+            const entry = consumed.get(job.id) || { backup: false, upload: false };
+            entry[kind] = true;
+            consumed.set(job.id, entry);
+          }
+        }
+      }
+    } finally {
+      automationEnqueueRunningRef.current = false;
+    }
+
+    if (!tasks.length) {
+      return;
+    }
+
+    const nextQueue = [...transferQueueRef.current, ...tasks];
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+    logRendererEvent("Automation transfer tasks enqueued", {
+      backupCount: tasks.filter((task) => task.kind === "backup").length,
+      queueLength: nextQueue.length,
+      uploadCount: tasks.filter((task) => task.kind === "upload").length
+    });
+    setJobs((current) =>
+      current.map((job) => {
+        const entry = consumed.get(job.id);
+        if (!entry) {
+          return job;
+        }
+        return {
+          ...job,
+          ...(entry.upload ? { autoUploadRequested: false } : {}),
+          ...(entry.backup ? { autoBackupRequested: false } : {})
+        };
+      })
+    );
+    setTransferDockExpanded(true);
+    setNotice(`已加入 ${tasks.length} 个上传/备份任务`);
+    scheduleTransferQueueStart({ restartFailed: false });
+  }
+
+  function hasExistingAutomationTransferTask(job, kind) {
+    const sourceJobId = String(job?.id || "");
+    if (!sourceJobId) {
+      return false;
+    }
+
+    return transferQueueRef.current.some((item) => item.kind === kind && String(item.sourceJobId || "") === sourceJobId);
+  }
+
+  async function materializeAutomationTransferJob(job, kind) {
+    const uploadPath = getTransferUploadPath(job, kind);
+    if (!uploadPath || typeof dlEditor.getVideoMetadata !== "function") {
+      return { ...job, uploadPath };
+    }
+
+    try {
+      const metadata = await dlEditor.getVideoMetadata(uploadPath);
+      if (!metadata) {
+        return { ...job, uploadPath };
       }
 
-      autoQueuedJobIdsRef.current.add(job.id);
-      return true;
+      return {
+        ...job,
+        name: metadata.name || job.name,
+        outputPath: kind === "backup" ? job.outputPath : metadata.path || uploadPath,
+        path: kind === "backup" ? metadata.path || uploadPath : job.path,
+        size: metadata.size,
+        sizeLabel: metadata.sizeLabel,
+        uploadPath: metadata.path || uploadPath
+      };
+    } catch {
+      return { ...job, uploadPath };
+    }
+  }
+
+  async function addTransferFiles(kind) {
+    if (!canAddTransfer) return;
+
+    const selected = await dlEditor.selectVideos();
+    if (!selected.length) return;
+
+    const selection = selected.map((job) => ({
+      error: kind === "upload" ? getManualDelphiUploadValidationError(job) : "",
+      job
+    }));
+    const rejectedErrors = selection.map((entry) => entry.error).filter(Boolean);
+    const validSelection = selection
+      .filter((entry) => !entry.error)
+      .map((entry) => entry.job);
+    const rejectedCount = rejectedErrors.length;
+    const tasks = validSelection
+      .map((job) =>
+        createTransferTask(job, {
+          auto: false,
+          kind
+        })
+      )
+      .filter(Boolean);
+    if (!tasks.length) {
+      setNotice(kind === "upload" ? getManualDelphiUploadErrorMessage(rejectedErrors) : "没有可添加的备份视频");
+      return;
+    }
+    const nextQueue = [...transferQueueRef.current, ...tasks];
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+    setTransferDockExpanded(true);
+    logRendererEvent("Manual transfer tasks added", {
+      kind,
+      queueLength: nextQueue.length,
+      rejectedCount,
+      taskCount: tasks.length
     });
+    const rejectedText =
+      rejectedCount > 0
+        ? `，${rejectedCount} 个文件未加入：${getManualDelphiUploadErrorMessage(rejectedErrors)}`
+        : "";
+    setNotice(`已加入 ${tasks.length} 个${kind === "backup" ? "备份" : "上传"}任务${rejectedText}`);
+  }
 
-    if (!freshJobs.length) {
+  function clearFinishedTransfers() {
+    const nextQueue = transferQueueRef.current.filter((item) => item.status !== "done");
+    const clearedCount = transferQueueRef.current.length - nextQueue.length;
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+    logRendererEvent("Finished transfer tasks cleared", { clearedCount, queueLength: nextQueue.length });
+  }
+
+  function removeTransferTask(taskId) {
+    const before = transferQueueRef.current;
+    const nextQueue = transferQueueRef.current.filter(
+      (item) => item.id !== taskId || (item.status !== "queued" && !isTransferErrorStatus(item.status))
+    );
+    const removedTask = before.find((item) => item.id === taskId && !nextQueue.some((nextItem) => nextItem.id === item.id));
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+    if (removedTask) {
+      logRendererEvent("Transfer task removed", {
+        kind: removedTask.kind,
+        name: removedTask.name,
+        previousStatus: removedTask.status,
+        queueLength: nextQueue.length,
+        taskId
+      });
+    }
+  }
+
+  function retryTransferTask(taskId) {
+    const retryTask = transferQueueRef.current.find((item) => item.id === taskId);
+    const nextQueue = transferQueueRef.current.map((item) =>
+        item.id === taskId && isTransferErrorStatus(item.status)
+          ? {
+              ...item,
+              completedAt: null,
+              activeUploadId: "",
+              elapsedMs: 0,
+              message: "等待上传",
+              percent: 0,
+              speedBytesPerSecond: 0,
+              status: "queued"
+            }
+          : item
+    );
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+    if (retryTask) {
+      logRendererEvent("Transfer task retry requested", {
+        kind: retryTask.kind,
+        name: retryTask.name,
+        previousStatus: retryTask.status,
+        taskId
+      });
+    }
+    if (!transferRunningRef.current && !isUploadActive(uploadStateRef.current)) {
+      scheduleTransferQueueStart({ restartFailed: false });
+    }
+  }
+
+  function scheduleTransferQueueStart(options = {}) {
+    if (transferRunningRef.current || isUploadActive(uploadStateRef.current)) {
       return;
     }
 
-    autoUploadQueueRef.current.push(...freshJobs);
-    scheduleAutomationDrain();
+    window.setTimeout(() => {
+      startTransferQueue(options);
+    }, 0);
   }
 
-  function scheduleAutomationDrain(delay = 0) {
-    if (automationDrainTimerRef.current) {
-      return;
-    }
+  async function startTransferQueue({ restartFailed = true } = {}) {
+    if (transferRunningRef.current || isUploadActive(uploadStateRef.current)) return;
 
-    automationDrainTimerRef.current = window.setTimeout(() => {
-      automationDrainTimerRef.current = null;
-      drainAutomationQueue();
-    }, delay);
-  }
-
-  function getFreshAutomationJobs(queuedJobs) {
-    const options = automationOptionsRef.current;
-    return queuedJobs
-      .map((queuedJob) => jobsRef.current.find((job) => job.id === queuedJob.id) || queuedJob)
-      .filter((job) => hasPendingAutomationActions(job, options));
-  }
-
-  async function drainAutomationQueue() {
-    if (!autoUploadQueueRef.current.length) {
-      return;
-    }
-
-    if (autoUploadRunningRef.current || isUploadActive(uploadStateRef.current)) {
-      scheduleAutomationDrain(300);
+    const startableQueue = restartFailed
+      ? transferQueueRef.current.map((item) =>
+          isTransferRestartable(item)
+            ? {
+                ...item,
+                completedAt: null,
+                activeUploadId: "",
+                elapsedMs: 0,
+                message: "等待上传",
+                percent: 0,
+                speedBytesPerSecond: 0,
+                status: "queued"
+              }
+            : item
+        )
+      : transferQueueRef.current;
+    if (!startableQueue.some((item) => item.status === "queued")) {
       return;
     }
 
@@ -1037,71 +1310,134 @@ function App() {
       if (!autoLoginPromptedRef.current) {
         autoLoginPromptedRef.current = true;
         setShowLogin(true);
-        setNotice("自动上传/备份需要先登录");
       }
+      setNotice("上传/备份需要先登录");
+      logRendererEvent("Transfer queue start blocked", { reason: "missing_auth" }, "warn");
       return;
     }
 
-    autoUploadRunningRef.current = true;
+    transferQueueRef.current = startableQueue;
+    setTransferQueue(startableQueue);
+
+    transferRunningRef.current = true;
+    setTransferRunning(true);
+    setTransferDockExpanded(true);
+    logRendererEvent("Transfer queue started", {
+      backupQueued: startableQueue.filter((item) => item.kind === "backup" && item.status === "queued").length,
+      uploadQueued: startableQueue.filter((item) => item.kind === "upload" && item.status === "queued").length
+    });
     try {
-      while (autoUploadQueueRef.current.length > 0) {
-        if (isUploadActive(uploadStateRef.current)) {
+      while (true) {
+        const nextTask = getNextTransferTask(transferQueueRef.current);
+        if (!nextTask) {
           break;
         }
-
-        const queuedJobs = autoUploadQueueRef.current.splice(0, autoUploadQueueRef.current.length);
-        const jobsToProcess = getFreshAutomationJobs(queuedJobs);
-        try {
-          if (jobsToProcess.length > 0) {
-            await runAutomationTransfers(jobsToProcess);
-          }
-        } finally {
-          for (const job of queuedJobs) {
-            autoQueuedJobIdsRef.current.delete(job.id);
-          }
-        }
+        await runTransferTask(nextTask, auth.token);
       }
-    } catch {
-      // Upload state and notice are already updated by uploadJobsToRepository.
     } finally {
-      autoUploadRunningRef.current = false;
-      if (autoUploadQueueRef.current.length > 0) {
-        scheduleAutomationDrain(isUploadActive(uploadStateRef.current) ? 300 : 0);
-      }
+      transferRunningRef.current = false;
+      setTransferRunning(false);
+      setUploadState((current) =>
+        isUploadActive(current)
+          ? current
+          : {
+              ...current,
+              status: current.status === "idle" ? "idle" : "ready",
+              uploadId: "",
+              retryJobs: [],
+              retryOptions: null
+            }
+      );
     }
   }
 
-  async function runAutomationTransfers(candidateJobs) {
-    const options = automationOptionsRef.current;
-    const uploadJobs = options.autoUpload ? candidateJobs.filter((job) => shouldAutoUploadJob(job)) : [];
-    const backupJobs = options.autoBackup ? candidateJobs.filter((job) => shouldAutoBackupJob(job)).map(prepareBackupJob) : [];
+  async function runTransferTask(task, token) {
+    const taskJob = createJobFromTransferTask(task);
+    const taskUploadId = `${task.kind}-${task.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const options = getTransferTaskUploadOptions(task, () => Boolean(automationOptionsRef.current.autoClearLocal));
+    logRendererEvent("Transfer task started", { kind: task.kind, name: task.name, taskId: task.id });
 
-    if (uploadJobs.length > 0) {
-      try {
-        await uploadJobsToRepository(uploadJobs, {
-          autoClearLocal: options.autoClearLocal,
-          clearLocalTarget: "output",
-          destination: "Delphi Repository",
-          endpoint: WEB_VIDEO_UPLOAD_PATH,
-          mode: "auto-upload"
+    updateTransferTask(task.id, {
+      activeUploadId: taskUploadId,
+      completedAt: null,
+      message: "正在上传",
+      startedAt: Date.now(),
+      status: "uploading"
+    });
+
+    try {
+      const result = await uploadJobsToRepository([taskJob], { ...options, uploadId: taskUploadId });
+      const failed = Boolean(result?.failureSnapshot || result?.failed);
+      if (failed) {
+        updateTransferTask(task.id, {
+          activeUploadId: "",
+          completedAt: Date.now(),
+          message: result?.failureSnapshot?.message || (task.kind === "backup" ? "备份失败" : "上传失败"),
+          speedBytesPerSecond: 0,
+          status: task.kind === "backup" ? "backup_error" : "upload_error"
         });
-      } catch {
-        // Keep the automation worker alive so backup can still run for the same finished jobs.
+        logRendererEvent("Transfer task failed", {
+          kind: task.kind,
+          message: result?.failureSnapshot?.message || (task.kind === "backup" ? "备份失败" : "上传失败"),
+          name: task.name,
+          taskId: task.id
+        }, "warn");
+        setNotice(`${task.kind === "backup" ? "备份" : "上传"}失败：${task.name}`);
+        return;
       }
+
+      updateTransferTask(task.id, {
+        activeUploadId: "",
+        completedAt: Date.now(),
+        message: task.kind === "backup" ? "备份完成" : "上传完成",
+        percent: 100,
+        speedBytesPerSecond: 0,
+        status: "done"
+      });
+      logRendererEvent("Transfer task completed", { kind: task.kind, name: task.name, taskId: task.id });
+      setNotice(`${task.kind === "backup" ? "备份" : "上传"}完成：${task.name}`);
+    } catch (error) {
+      const message = error.message || "上传失败";
+      if (message.includes("取消")) {
+        updateTransferTask(task.id, {
+          activeUploadId: "",
+          completedAt: Date.now(),
+          message: "上传已取消",
+          speedBytesPerSecond: 0,
+          status: "canceled"
+        });
+        logRendererEvent("Transfer task canceled", { kind: task.kind, name: task.name, taskId: task.id }, "warn");
+        return;
+      }
+
+      updateTransferTask(task.id, {
+        activeUploadId: "",
+        completedAt: Date.now(),
+        message,
+        speedBytesPerSecond: 0,
+        status: task.kind === "backup" ? "backup_error" : "upload_error"
+      });
+      logRendererEvent("Transfer task failed", { kind: task.kind, message, name: task.name, taskId: task.id }, "warn");
+      setNotice(`${task.kind === "backup" ? "备份" : "上传"}失败：${task.name}`);
     }
+  }
 
-    if (backupJobs.length > 0) {
-      try {
-        await uploadJobsToRepository(backupJobs, {
-          autoClearLocal: options.autoClearLocal,
-          clearLocalTarget: "source",
-          destination: "DL Rawdata",
-          endpoint: RAW_DATA_VIDEO_UPLOAD_PATH,
-          mode: "auto-backup"
-        });
-      } catch {
-        // Errors are already reflected in the upload panel and job status.
-      }
+  function updateTransferTask(taskId, patch) {
+    const nextQueue = transferQueueRef.current.map((item) => (item.id === taskId ? { ...item, ...patch } : item));
+    transferQueueRef.current = nextQueue;
+    setTransferQueue(nextQueue);
+  }
+
+  function wakeUploadPauseWaiters() {
+    const waiters = uploadPauseWaitersRef.current.splice(0);
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  async function waitWhileUploadPaused() {
+    while (uploadPauseRequestedRef.current && !uploadCancelRequestedRef.current) {
+      await new Promise((resolve) => uploadPauseWaitersRef.current.push(resolve));
     }
   }
 
@@ -1112,15 +1448,15 @@ function App() {
       clearLocalTarget = "",
       destination = "Delphi Repository",
       endpoint = WEB_VIDEO_UPLOAD_PATH,
-      mode = "manual"
+      mode = "manual",
+      uploadId: providedUploadId = "",
+      shouldClearLocalOnComplete = null
     } = {}
   ) {
     const auth = authStateRef.current;
-    const isAutoUpload = mode === "auto" || mode === "auto-upload";
-    const isAutoBackup = mode === "auto-backup";
-    const isAutomatic = isAutoUpload || isAutoBackup;
-    const isBackup = mode === "backup" || isAutoBackup;
-    const actionLabel = isAutoBackup ? "自动备份" : isAutoUpload ? "自动上传" : isBackup ? "备份" : "上传";
+    const isBackup = mode === "backup";
+    const actionLabel = isBackup ? "备份" : "上传";
+    const transferErrorStatus = getTransferErrorStatus(mode);
 
     if (!auth?.token) {
       setShowLogin(true);
@@ -1144,25 +1480,12 @@ function App() {
       return { completed: 0 };
     }
 
-    const uploadKind = isAutoBackup ? "auto-backup" : isAutoUpload ? "auto-upload" : isBackup ? "backup" : "upload";
-    const uploadId = `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const uploadKind = isBackup ? "backup" : "upload";
+    const uploadId = providedUploadId || `${uploadKind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const retryOptions = { autoClearLocal, clearLocalTarget, destination, endpoint, mode };
     uploadCancelRequestedRef.current = false;
-    if (isAutomatic) {
-      const attemptedAt = new Date().toISOString();
-      setJobs((current) =>
-        current.map((job) =>
-          jobsToUpload.some((item) => item.id === job.id)
-            ? {
-                ...job,
-                ...(isAutoBackup
-                  ? { autoBackupAttemptedAt: attemptedAt, autoBackupStatus: "queued" }
-                  : { autoUploadAttemptedAt: attemptedAt, autoUploadStatus: "queued" }),
-                message: isAutoBackup ? "等待自动备份" : "等待自动上传"
-              }
-            : job
-        )
-      );
-    }
+    uploadPauseRequestedRef.current = false;
+    wakeUploadPauseWaiters();
 
     setUploadState({
       status: "uploading",
@@ -1172,21 +1495,19 @@ function App() {
       destination,
       mode,
       items: createUploadItems(jobsToUpload),
-      message: `${isAutomatic ? actionLabel : `准备${actionLabel}`} ${jobsToUpload.length} 个视频`
+      retryJobs: jobsToUpload,
+      retryOptions,
+      message: `准备${actionLabel} ${jobsToUpload.length} 个视频`
     });
-    setNotice(`${isAutomatic ? actionLabel : `正在${actionLabel}`} ${jobsToUpload.length} 个视频到 ${destination}`);
-    if (isAutomatic) {
-      setAutoUploadNotice({
-        visible: true,
-        message: `${actionLabel} ${jobsToUpload.length} 个视频到 ${destination}`
-      });
-    }
-
+    setNotice(`正在${actionLabel} ${jobsToUpload.length} 个视频到 ${destination}`);
     let completed = 0;
-    let activeJobId = "";
+    const failedJobs = [];
     try {
       for (const job of jobsToUpload) {
-        activeJobId = job.id;
+        if (uploadCancelRequestedRef.current) {
+          throw new Error("上传已取消");
+        }
+        await waitWhileUploadPaused();
         if (uploadCancelRequestedRef.current) {
           throw new Error("上传已取消");
         }
@@ -1201,18 +1522,43 @@ function App() {
             status: "uploading"
           })
         );
-        const result = await dlEditor.uploadInferaVideo({
-          durationSeconds: job.duration,
-          jobId: job.id,
-          path: job.uploadPath,
-          fileName: job.uploadName,
-          startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
-          token: auth.token,
-          uploadId,
-          uploadPath: endpoint
-        });
-        const cleared =
-          isAutomatic && autoClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isAutoBackup ? "source" : "output")) : { deleted: false };
+        let result = null;
+        try {
+          result = await dlEditor.uploadInferaVideo({
+            durationSeconds: job.duration,
+            durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
+            jobId: job.id,
+            path: job.uploadPath,
+            fileName: job.uploadName,
+            startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
+            token: auth.token,
+            uploadId,
+            uploadPath: endpoint
+          });
+        } catch (error) {
+          const message = error.message || "上传失败";
+          const canceled = message.includes("取消");
+          if (canceled) {
+            throw error;
+          }
+          failedJobs.push(job);
+          setUploadState((current) => {
+            const now = Date.now();
+            const currentItem = current.items.find((item) => item.jobId === job.id);
+            return markUploadItem(current, job.id, {
+              completedAt: currentItem?.startedAt ? now : currentItem?.completedAt,
+              elapsedMs: currentItem?.startedAt ? getUploadItemElapsedMs(currentItem, now) : currentItem?.elapsedMs,
+              estimatedRemainingMs: null,
+              message,
+              speedBytesPerSecond: 0,
+              status: transferErrorStatus
+            });
+          });
+          continue;
+        }
+        const shouldClearLocal =
+          typeof shouldClearLocalOnComplete === "function" ? Boolean(shouldClearLocalOnComplete(job)) : Boolean(autoClearLocal);
+        const cleared = shouldClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isBackup ? "source" : "output")) : { deleted: false };
         completed += 1;
         const uploadedAt = new Date().toISOString();
         const doneMessage = getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
@@ -1226,49 +1572,80 @@ function App() {
             estimatedRemainingMs: 0,
             message: doneMessage,
             percent: 100,
+            speedBytesPerSecond: 0,
             status: "done"
           });
         });
         setJobs((current) =>
-          current.map((item) =>
-            item.id === job.id
-              ? {
-                  ...item,
-                  ...getTransferSuccessPatch({
-                    clearTarget: clearLocalTarget || (isAutoBackup ? "source" : "output"),
-                    cleared,
-                    isAutoBackup,
-                    isAutoUpload,
-                    isBackup,
-                    result,
-                    timestamp: uploadedAt,
-                    uploadPath: job.uploadPath
-                  }),
-                  message: doneMessage,
-                }
-              : item
-          )
+          current.map((item) => {
+            const isUploadJob = item.id === job.id;
+            const isSourceJob = job.sourceJobId && item.id === job.sourceJobId;
+            if (!isUploadJob && !isSourceJob) {
+              return item;
+            }
+
+            const patch = getTransferSuccessPatch({
+              clearTarget: clearLocalTarget || (isBackup ? "source" : "output"),
+              cleared,
+              isBackup,
+              result,
+              timestamp: uploadedAt,
+              uploadPath: job.uploadPath
+            });
+            return {
+              ...item,
+              ...patch,
+              message: isSourceJob ? getProcessingDoneMessage({ ...item, ...patch }) : doneMessage
+            };
+          })
         );
+      }
+
+      if (failedJobs.length > 0) {
+        const message = `${actionLabel}失败 ${failedJobs.length} 个，已完成 ${completed} 个`;
+        const failureSnapshot = createTransferFailureSnapshot({
+          destination,
+          jobs: failedJobs,
+          message,
+          mode,
+          retryOptions,
+          status: transferErrorStatus
+        });
+        setUploadState((current) => ({
+          ...current,
+          status: transferErrorStatus,
+          visible: current.visible,
+          retryJobs: failedJobs,
+          retryOptions,
+          message
+        }));
+        setNotice(message);
+        return { completed, failed: failedJobs.length, failureSnapshot };
       }
 
       setUploadState((current) => ({
         ...current,
         status: "ready",
         visible: current.visible,
-        message: `${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频`
+        retryJobs: [],
+        retryOptions: null,
+        message: `已${actionLabel} ${completed} 个视频`
       }));
-      setNotice(`${isAutomatic ? `${actionLabel}完成` : `已${actionLabel}`} ${completed} 个视频到 ${destination}`);
+      setNotice(`已${actionLabel} ${completed} 个视频到 ${destination}`);
       return { completed };
     } catch (error) {
       const message = error.message || "上传失败";
       const canceled = message.includes("取消");
-      const doneField = isAutoBackup ? "backedUpAt" : "uploadedAt";
+      const retryJobs = canceled ? [] : jobsToUpload.slice(completed);
+      const retryOptionsForError = canceled ? null : retryOptions;
       setUploadState((current) => {
         const now = Date.now();
         return {
           ...current,
-          status: canceled ? "canceled" : "error",
+          status: canceled ? "canceled" : transferErrorStatus,
           visible: current.visible,
+          retryJobs,
+          retryOptions: retryOptionsForError,
           message,
           items: current.items.map((item) =>
             item.status === "done"
@@ -1279,25 +1656,21 @@ function App() {
                   elapsedMs: item.startedAt ? getUploadItemElapsedMs(item, now) : item.elapsedMs,
                   estimatedRemainingMs: null,
                   message: item.status === "uploading" || item.status === "processing" ? message : item.message,
-                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : "error"
+                  speedBytesPerSecond: 0,
+                  status: canceled ? "canceled" : item.status === "queued" ? "queued" : transferErrorStatus
                 }
           )
         };
       });
-      if (isAutomatic) {
-        setJobs((current) =>
-          current.map((job) =>
-            jobsToUpload.some((item) => item.id === job.id) && (!activeJobId || job.id === activeJobId || !job[doneField])
-              ? {
-                  ...job,
-                  ...(isAutoBackup
-                    ? { autoBackupStatus: canceled ? "canceled" : "error" }
-                    : { autoUploadStatus: canceled ? "canceled" : "error" }),
-                  message
-                }
-              : job
-          )
-        );
+      if (!canceled && retryJobs.length > 0 && error && typeof error === "object") {
+        error.transferFailureSnapshot = createTransferFailureSnapshot({
+          destination,
+          jobs: retryJobs,
+          message,
+          mode,
+          retryOptions,
+          status: transferErrorStatus
+        });
       }
       setNotice(message);
       throw error;
@@ -1318,31 +1691,25 @@ function App() {
     }
   }
 
-  async function uploadSelectedJobs() {
-    if (!canUploadSelection) return;
-
-    try {
-      await uploadJobsToRepository(selectedJobs);
-    } catch {
-      // Upload state and notice are already updated by uploadJobsToRepository.
-    }
-  }
-
   async function toggleCurrentUploadPaused() {
     if (!isUploadPausable(uploadState) || !uploadState.uploadId) return;
     const uploadId = uploadState.uploadId;
     const shouldResume = uploadState.status === "paused";
+    uploadPauseRequestedRef.current = !shouldResume;
+    if (shouldResume) {
+      wakeUploadPauseWaiters();
+    }
     setUploadState((current) => ({
       ...current,
       status: shouldResume ? "uploading" : "paused",
       visible: true,
-      message: shouldResume ? "继续上传" : "上传已暂停",
+      message: shouldResume ? "正在上传" : "上传已暂停",
       items: current.items.map((item) =>
         item.status === "uploading" || item.status === "processing" || item.status === "paused"
           ? {
               ...item,
-              message: shouldResume ? "继续上传" : "上传已暂停",
-              speedBytesPerSecond: shouldResume ? item.speedBytesPerSecond : 0,
+              message: shouldResume ? "正在上传" : "上传已暂停",
+              speedBytesPerSecond: 0,
               status: shouldResume ? "uploading" : "paused"
             }
           : item
@@ -1356,6 +1723,25 @@ function App() {
         await dlEditor.pauseInferaUpload(uploadId);
       }
     } catch (error) {
+      uploadPauseRequestedRef.current = shouldResume;
+      if (!uploadPauseRequestedRef.current) {
+        wakeUploadPauseWaiters();
+      }
+      setUploadState((current) => ({
+        ...current,
+        status: shouldResume ? "paused" : "uploading",
+        message: shouldResume ? "上传已暂停" : "正在上传",
+        items: current.items.map((item) =>
+          item.status === "uploading" || item.status === "paused"
+            ? {
+                ...item,
+                message: shouldResume ? "上传已暂停" : "正在上传",
+                speedBytesPerSecond: 0,
+                status: shouldResume ? "paused" : "uploading"
+              }
+            : item
+        )
+      }));
       setNotice(error.message || (shouldResume ? "继续上传失败" : "暂停上传失败"));
     }
   }
@@ -1364,6 +1750,8 @@ function App() {
     if (!isUploadActive(uploadState) || !uploadState.uploadId) return;
     const uploadId = uploadState.uploadId;
     uploadCancelRequestedRef.current = true;
+    uploadPauseRequestedRef.current = false;
+    wakeUploadPauseWaiters();
     setUploadState((current) => ({
       ...current,
       status: "canceling",
@@ -1371,7 +1759,7 @@ function App() {
       message: "正在取消上传",
       items: current.items.map((item) =>
         item.status === "uploading" || item.status === "processing" || item.status === "paused"
-          ? { ...item, status: "canceling", message: "正在取消" }
+          ? { ...item, status: "canceling", message: "正在取消", speedBytesPerSecond: 0 }
           : item
       )
     }));
@@ -1380,19 +1768,6 @@ function App() {
     } catch (error) {
       setNotice(error.message || "取消上传失败");
     }
-  }
-
-  async function closeUploadPanel() {
-    if (isUploadActive(uploadState)) {
-      await cancelCurrentUpload({ hide: true });
-      return;
-    }
-
-    setUploadState((current) => ({ ...current, visible: false }));
-  }
-
-  function toggleUploadDetails() {
-    setUploadState((current) => ({ ...current, expanded: !current.expanded, visible: true }));
   }
 
   async function chooseOutputDirectory() {
@@ -1421,10 +1796,6 @@ function App() {
         autoClearStatus: job.status === "done" ? job.autoClearStatus : undefined,
         autoClearedAt: job.status === "done" ? job.autoClearedAt : undefined,
         autoClearedOriginalAt: job.status === "done" ? job.autoClearedOriginalAt : undefined,
-        autoBackupAttemptedAt: job.status === "done" ? job.autoBackupAttemptedAt : undefined,
-        autoBackupStatus: job.status === "done" ? job.autoBackupStatus : undefined,
-        autoUploadAttemptedAt: job.status === "done" ? job.autoUploadAttemptedAt : undefined,
-        autoUploadStatus: job.status === "done" ? job.autoUploadStatus : undefined,
         backedUpAt: job.status === "done" ? job.backedUpAt : undefined,
         backupResult: job.status === "done" ? job.backupResult : undefined,
         deletedOriginalPath: job.status === "done" ? job.deletedOriginalPath : undefined,
@@ -1464,11 +1835,11 @@ function App() {
     setJobs((current) =>
       current.map((job) => {
         if (shouldResume && job.status === "paused") {
-          return { ...job, status: "processing", message: "Resumed" };
+          return { ...job, status: "processing", message: "已继续" };
         }
 
         if (!shouldResume && job.status === "processing") {
-          return { ...job, status: "paused", message: "Paused" };
+          return { ...job, status: "paused", message: "已暂停" };
         }
 
         return job;
@@ -1503,11 +1874,11 @@ function App() {
   }
 
   function clearFinished() {
-    setJobs((current) => current.filter((job) => job.status !== "done"));
+    setJobs((current) => current.filter((job) => !canClearFinishedJob(job)));
   }
 
   function removeJob(id) {
-    setJobs((current) => current.filter((job) => job.id !== id));
+    setJobs((current) => current.filter((job) => job.id !== id || !canRemoveJob(job)));
   }
 
   function openStartTimeEditor(job) {
@@ -1576,11 +1947,26 @@ function App() {
     }
   }
 
+  async function revealMainLog() {
+    try {
+      const result = await dlEditor.revealMainLog();
+      setNotice(result?.opened ? "已打开日志文件位置" : "无法打开日志文件位置");
+    } catch (error) {
+      setNotice(error.message || "无法打开日志文件位置");
+    }
+  }
+
   function changeCloudSpace(nextSpaceId) {
+    const nextMediaFilterId = getDefaultCloudMediaFilterIdForSpace(nextSpaceId);
+    const nextStatusFilterId = getDefaultCloudStatusFilterIdForSpace(nextSpaceId);
     setCloudSpaceId(nextSpaceId);
+    setCloudRepositoryMediaFilterId(nextMediaFilterId);
+    setCloudRepositoryStatusFilterId(nextStatusFilterId);
     setRepositoryState({
       status: authStateRef.current?.token ? "loading" : "auth",
       spaceId: nextSpaceId,
+      dateKey: nextSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+      filterId: nextStatusFilterId,
       items: [],
       total: 0,
       hasMore: false,
@@ -1617,7 +2003,7 @@ function App() {
       setShowLogin(false);
 
       if (activeNav === "Cloud") {
-        loadCloudRepository(nextAuth, cloudSpaceId);
+        loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
       }
     } catch (error) {
       setLoginStatus({
@@ -1634,6 +2020,8 @@ function App() {
     setRepositoryState({
       status: "auth",
       spaceId: cloudSpaceId,
+      dateKey: cloudSpaceId === "rawdata" ? "" : cloudRepositoryDateKey,
+      filterId: getDefaultCloudStatusFilterIdForSpace(cloudSpaceId),
       items: [],
       total: 0,
       hasMore: false,
@@ -1643,13 +2031,23 @@ function App() {
     });
   }
 
-  async function loadCloudRepository(authOverride = authState, spaceIdOverride = cloudSpaceId, options = {}) {
+  async function loadCloudRepository(
+    authOverride = authState,
+    spaceIdOverride = cloudSpaceId,
+    dateKeyOverride = cloudRepositoryDateKey,
+    filterIdOverride = cloudRepositoryStatusFilterId
+  ) {
     const token = authOverride?.token;
+    const effectiveDateKey = spaceIdOverride === "rawdata" ? "" : dateKeyOverride;
+    const effectiveFilterId = getCloudStatusFilterIdForSpace(spaceIdOverride, filterIdOverride);
     if (!token) {
       setRepositoryState({
         status: "auth",
         spaceId: spaceIdOverride,
+        dateKey: effectiveDateKey,
+        filterId: effectiveFilterId,
         items: [],
+        statsItems: [],
         total: 0,
         hasMore: false,
         nextCursor: null,
@@ -1659,53 +2057,59 @@ function App() {
       return;
     }
 
-    const append = Boolean(options.append);
-    const isSameSpace = repositoryState.spaceId === spaceIdOverride;
-    const currentItems = isSameSpace ? repositoryState.items || [] : [];
-    const currentNextCursor = isSameSpace ? repositoryState.nextCursor : null;
-    const currentNextOffset = isSameSpace ? repositoryState.nextOffset || currentItems.length : 0;
-    if (append && (!isSameSpace || repositoryState.status === "loading" || repositoryState.status === "loading-more" || !repositoryState.hasMore)) {
-      return;
-    }
-
     setRepositoryState((current) => ({
       ...current,
-      items: current.spaceId === spaceIdOverride ? current.items : [],
+      items:
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
+          ? current.items
+          : [],
+      statsItems:
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey
+          ? current.statsItems || []
+          : [],
       spaceId: spaceIdOverride,
-      status: append ? "loading-more" : "loading",
+      dateKey: effectiveDateKey,
+      filterId: effectiveFilterId,
+      status: "loading",
       message: ""
     }));
 
     try {
       const repository = await fetchCloudRepository(token, spaceIdOverride, {
-        cursor: append ? currentNextCursor : null,
-        limit: CLOUD_REPOSITORY_PAGE_SIZE,
-        offset: append && !currentNextCursor ? currentNextOffset : 0
+        dateKey: effectiveDateKey,
+        filterId: effectiveFilterId
       });
+      const statsRepository =
+        spaceIdOverride !== "rawdata" && effectiveFilterId !== CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID
+          ? await fetchCloudRepository(token, spaceIdOverride, {
+              dateKey: effectiveDateKey,
+              filterId: CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID
+            })
+          : repository;
       setRepositoryState((current) =>
-        current.spaceId === spaceIdOverride
-          ? (() => {
-              const mergedItems = append ? mergeCloudRepositoryItems(current.items || [], repository.items) : repository.items;
-              const hasNewItems = mergedItems.length > (current.items || []).length;
-              return {
-                status: "ready",
-                spaceId: spaceIdOverride,
-                items: mergedItems,
-                total: Math.max(repository.total, mergedItems.length),
-                hasMore: Boolean(repository.hasMore && (!append || hasNewItems || repository.nextCursor)),
-                nextCursor: repository.nextCursor,
-                nextOffset: repository.nextOffset || mergedItems.length,
-                message: ""
-              };
-            })()
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
+          ? {
+              status: "ready",
+              spaceId: spaceIdOverride,
+              dateKey: effectiveDateKey,
+              filterId: effectiveFilterId,
+              items: repository.items,
+              statsItems: statsRepository.items,
+              total: repository.total,
+              hasMore: repository.hasMore,
+              nextCursor: repository.nextCursor,
+              message: ""
+            }
           : current
       );
     } catch (error) {
       setRepositoryState((current) =>
-        current.spaceId === spaceIdOverride
+        current.spaceId === spaceIdOverride && current.dateKey === effectiveDateKey && current.filterId === effectiveFilterId
           ? {
               ...current,
               spaceId: spaceIdOverride,
+              dateKey: effectiveDateKey,
+              filterId: effectiveFilterId,
               status: "error",
               message: error.message || "无法读取 Cloud repository"
             }
@@ -1727,15 +2131,17 @@ function App() {
     }
 
     const title = getRepositoryTitle(item);
-    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, status: "loading", message: "" }));
+    setRepositoryState((current) => ({ ...current, spaceId: spaceIdOverride, dateKey: "", filterId: "all", status: "loading", message: "" }));
     try {
       await deleteRawDataArchive(authState.token, item);
       setNotice(`已删除 ${title}`);
-      await loadCloudRepository(authState, spaceIdOverride);
+      await loadCloudRepository(authState, spaceIdOverride, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
     } catch (error) {
       setRepositoryState((current) => ({
         ...current,
         spaceId: spaceIdOverride,
+        dateKey: "",
+        filterId: "all",
         status: "error",
         message: error.message || "删除 Rawdata 失败"
       }));
@@ -1956,32 +2362,7 @@ function App() {
               <h2>处理队列</h2>
             </div>
             <div className="toolbar-actions">
-              {selectionMode && (
-                <>
-                  <button className="icon-button" disabled={!jobs.length} onClick={toggleAllSelectedJobs} title={allJobsSelected ? "取消全选" : "全选视频"} type="button">
-                    <CheckCheck size={18} />
-                  </button>
-                  <span className="selection-count">
-                    {selectedJobs.length}/{jobs.length}
-                  </span>
-                </>
-              )}
-              <button
-                className={selectionMode ? "icon-button active" : "icon-button"}
-                disabled={!jobs.length}
-                onClick={toggleSelectionMode}
-                title="选择视频"
-                type="button"
-              >
-                <SquareCheck size={18} />
-              </button>
-              <button className="icon-button" disabled={!canBackupSelection} onClick={backupSelectedJobs} title="备份所选视频" type="button">
-                <Archive size={18} />
-              </button>
-              <button className="icon-button" disabled={!canUploadSelection} onClick={uploadSelectedJobs} title="上传到 Delphi Repository" type="button">
-                <Upload size={18} />
-              </button>
-              <button className="icon-button" disabled={isRunning} onClick={clearFinished} title="清除已完成" type="button">
+              <button className="icon-button" disabled={isRunning || !canClearFinished} onClick={clearFinished} title="清除已完成" type="button">
                 <RotateCcw size={18} />
               </button>
               <button className="secondary-button" disabled={isRunning} onClick={addVideos} type="button">
@@ -1995,7 +2376,7 @@ function App() {
             <Metric icon={<ListVideo size={16} />} label="总数" value={totals.total} />
             <Metric icon={<Clock3 size={16} />} label="处理中" value={totals.active} />
             <Metric icon={<CheckCircle2 size={16} />} label="完成" value={totals.done} />
-            <Metric icon={<TriangleAlert size={16} />} label="失败" value={totals.errors} />
+            <Metric icon={<TriangleAlert size={16} />} label="压制失败" value={totals.errors} />
           </div>
 
           {notice && (
@@ -2003,23 +2384,6 @@ function App() {
               <Sparkles size={16} />
               <span>{notice}</span>
             </div>
-          )}
-
-          {autoUploadNotice.visible && (
-            <AutoUploadNotice
-              message={autoUploadNotice.message}
-              onClose={() => setAutoUploadNotice((current) => ({ ...current, visible: false }))}
-            />
-          )}
-
-          {uploadState.visible && (
-            <UploadProgressPanel
-              now={clockNow}
-              onClose={closeUploadPanel}
-              onPauseToggle={toggleCurrentUploadPaused}
-              onToggleDetails={toggleUploadDetails}
-              state={uploadState}
-            />
           )}
 
           {jobs.length === 0 ? (
@@ -2031,31 +2395,49 @@ function App() {
             <div className="queue-list">
               {jobs.map((job) => (
                 <QueueItem
-                  disabled={isRunning}
                   job={job}
                   key={job.id}
                   now={clockNow}
-                  onEditStartTime={() => openStartTimeEditor(job)}
-                  onOpen={() => job.outputPath && dlEditor.openPath(job.outputPath)}
+                  onOpen={() => openProcessingOutput(job, "open")}
                   onRemove={() => removeJob(job.id)}
-                  onReveal={() => job.outputPath && dlEditor.revealPath(job.outputPath)}
-                  onToggleSelection={() => toggleJobSelection(job.id)}
-                  selected={selectedJobIds.has(job.id)}
-                  selectionMode={selectionMode}
+                  onReveal={() => openProcessingOutput(job, "reveal")}
+                  removeDisabled={isRunning || !canRemoveJob(job)}
                 />
               ))}
             </div>
           )}
         </section>
+        <UploadQueueDock
+          canAdd={canAddTransfer}
+          canClearFinished={canClearFinishedTransfers}
+          canStart={canStartTransfers}
+          expanded={transferDockExpanded}
+          items={transferQueueSorted}
+          now={clockNow}
+          onAddBackup={() => addTransferFiles("backup")}
+          onAddUpload={() => addTransferFiles("upload")}
+          onCancel={cancelCurrentUpload}
+          onClearFinished={clearFinishedTransfers}
+          onPauseToggle={toggleCurrentUploadPaused}
+          onRemove={removeTransferTask}
+          onRetry={retryTransferTask}
+          onStart={startTransferQueue}
+          onToggle={() => setTransferDockExpanded((current) => !current)}
+        />
         </section>
       ) : activeNav === "Cloud" ? (
         <CloudRepository
           authState={authState}
           cloudSpaceId={cloudSpaceId}
+          cloudRepositoryDateKey={cloudRepositoryDateKey}
+          cloudRepositoryMediaFilterId={cloudRepositoryMediaFilterId}
+          cloudRepositoryStatusFilterId={cloudRepositoryStatusFilterId}
           onDeleteItem={deleteCloudRepositoryItem}
-          onLoadMore={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId, { append: true })}
+          onMediaFilterChange={setCloudRepositoryMediaFilterId}
+          onStatusFilterChange={setCloudRepositoryStatusFilterId}
+          onRepositoryDateChange={setCloudRepositoryDateKey}
           onLogin={() => setShowLogin(true)}
-          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId)}
+          onRefresh={(spaceId = cloudSpaceId) => loadCloudRepository(authState, spaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId)}
           onSpaceChange={changeCloudSpace}
           repositoryState={repositoryState}
         />
@@ -2109,6 +2491,7 @@ function App() {
           onCheckUpdates={checkForUpdates}
           onClose={() => setShowAppInfo(false)}
           onOpenUpdate={openUpdateLink}
+          onRevealLog={revealMainLog}
           outputDirectory={outputDirectory}
           updateState={updateState}
         />
@@ -4003,48 +4386,49 @@ function ResearchParsedTimelineItem({ text, timeMs }) {
   );
 }
 
-function AutoUploadNotice({ message, onClose }) {
-  return (
-    <div className="auto-upload-notice">
-      <div>
-        <Upload size={16} />
-        <span>{message}</span>
-      </div>
-      <button onClick={onClose} title="关闭卡片" type="button">
-        <X size={15} />
-      </button>
-    </div>
-  );
-}
-
-function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, onLogin, onRefresh, onSpaceChange, repositoryState }) {
+function CloudRepository({
+  authState,
+  cloudRepositoryDateKey,
+  cloudRepositoryMediaFilterId,
+  cloudRepositoryStatusFilterId,
+  cloudSpaceId,
+  onDeleteItem,
+  onLogin,
+  onMediaFilterChange,
+  onRefresh,
+  onRepositoryDateChange,
+  onSpaceChange,
+  onStatusFilterChange,
+  repositoryState
+}) {
   const items = repositoryState.items || [];
   const isLoading = repositoryState.status === "loading";
-  const isLoadingMore = repositoryState.status === "loading-more";
   const [cloudQuery, setCloudQuery] = useState("");
   const [cloudViewMode, setCloudViewMode] = useState("list");
-  const [activeCloudFilter, setActiveCloudFilter] = useState("all");
   const [isCloudSpaceMenuOpen, setCloudSpaceMenuOpen] = useState(false);
   const [openMenuId, setOpenMenuId] = useState("");
   const [repositoryMenuPosition, setRepositoryMenuPosition] = useState(null);
-  const loadMoreRef = useRef(null);
   const displaySpaceId = repositoryState.spaceId || cloudSpaceId;
   const isRawDataSpace = displaySpaceId === "rawdata";
-  const visibleFilters = useMemo(() => getCloudFiltersForSpace(displaySpaceId), [displaySpaceId]);
-  const stats = useMemo(() => getCloudRepositoryStats(items), [items]);
+  const activeMediaFilter = cloudRepositoryMediaFilterId;
+  const activeStatusFilter = cloudRepositoryStatusFilterId;
+  const visibleMediaFilters = useMemo(() => getCloudMediaFiltersForSpace(displaySpaceId), [displaySpaceId]);
+  const visibleStatusFilters = useMemo(() => getCloudStatusFiltersForSpace(displaySpaceId), [displaySpaceId]);
+  const statsItems = repositoryState.statsItems || items;
+  const stats = useMemo(() => getCloudRepositoryStats(statsItems), [statsItems]);
   const filteredItems = useMemo(
-    () => filterCloudRepositoryItems(items, activeCloudFilter, cloudQuery),
-    [activeCloudFilter, cloudQuery, items]
+    () => filterCloudRepositoryItems(items, activeMediaFilter, activeStatusFilter, cloudQuery),
+    [activeMediaFilter, activeStatusFilter, cloudQuery, items]
   );
   const openMenuItem = useMemo(
     () => filteredItems.find((item) => getRepositoryItemKey(item) === openMenuId) || null,
     [filteredItems, openMenuId]
   );
-  const activeFilterLabel = visibleFilters.find((filter) => filter.id === activeCloudFilter)?.label || visibleFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeMediaFilterLabel = visibleMediaFilters.find((filter) => filter.id === activeMediaFilter)?.label || visibleMediaFilters[0]?.label || CLOUD_FILTERS[0].label;
+  const activeStatusFilterLabel = visibleStatusFilters.find((filter) => filter.id === activeStatusFilter)?.label || "";
+  const activeFilterLabel = activeStatusFilterLabel ? `${activeMediaFilterLabel} / ${activeStatusFilterLabel}` : activeMediaFilterLabel;
   const activeCloudSpace = CLOUD_SPACES.find((space) => space.id === displaySpaceId) || CLOUD_SPACES[0];
   const storagePercent = Math.min(92, Math.max(4, Math.round((stats.totalBytes / (5 * 1024 * 1024 * 1024)) * 100)));
-  const canLoadMoreRepository = Boolean(authState?.token && repositoryState.hasMore && !isLoading && !isLoadingMore && typeof onLoadMore === "function");
-  const showLoadMoreRepository = Boolean(authState?.token && (repositoryState.hasMore || isLoadingMore));
 
   function closeRepositoryMenu() {
     setOpenMenuId("");
@@ -4064,11 +4448,14 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
   }
 
   useEffect(() => {
-    if (!visibleFilters.some((filter) => filter.id === activeCloudFilter)) {
-      setActiveCloudFilter("all");
+    if (!visibleMediaFilters.some((filter) => filter.id === activeMediaFilter)) {
+      onMediaFilterChange(getDefaultCloudMediaFilterIdForSpace(displaySpaceId));
+    }
+    if (!visibleStatusFilters.some((filter) => filter.id === activeStatusFilter)) {
+      onStatusFilterChange(getDefaultCloudStatusFilterIdForSpace(displaySpaceId));
     }
     closeRepositoryMenu();
-  }, [activeCloudFilter, displaySpaceId, visibleFilters]);
+  }, [activeMediaFilter, activeStatusFilter, displaySpaceId, onMediaFilterChange, onStatusFilterChange, visibleMediaFilters, visibleStatusFilters]);
 
   useEffect(() => {
     if (!openMenuId) {
@@ -4082,24 +4469,6 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
       window.removeEventListener("scroll", closeRepositoryMenu, true);
     };
   }, [openMenuId]);
-
-  useEffect(() => {
-    const sentinel = loadMoreRef.current;
-    if (!sentinel || !canLoadMoreRepository || typeof IntersectionObserver === "undefined") {
-      return undefined;
-    }
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry?.isIntersecting) {
-          onLoadMore(displaySpaceId);
-        }
-      },
-      { root: null, rootMargin: "220px 0px", threshold: 0.01 }
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [canLoadMoreRepository, displaySpaceId, filteredItems.length, onLoadMore]);
 
   return (
     <section className="cloud-page">
@@ -4143,18 +4512,38 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
           </div>
 
           <nav aria-label="Cloud files" className="cloud-nav">
-            {visibleFilters.map((filter) => (
-              <button
-                className={activeCloudFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
-                key={filter.id}
-                onClick={() => setActiveCloudFilter(filter.id)}
-                type="button"
-              >
-                <CloudFilterIcon id={filter.id} />
-                <span>{filter.label}</span>
-                <b>{getCloudFilterCount(stats, filter.id)}</b>
-              </button>
-            ))}
+            <div className="cloud-nav-group">
+              <span className="cloud-nav-label">文件类型</span>
+              {visibleMediaFilters.map((filter) => (
+                <button
+                  className={activeMediaFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
+                  key={filter.id}
+                  onClick={() => onMediaFilterChange(filter.id)}
+                  type="button"
+                >
+                  <CloudFilterIcon id={filter.id} />
+                  <span>{filter.label}</span>
+                  <b>{getCloudFilterCount(stats, filter.id)}</b>
+                </button>
+              ))}
+            </div>
+            {visibleStatusFilters.length > 0 && (
+              <div className="cloud-nav-group">
+                <span className="cloud-nav-label">解析状态</span>
+                {visibleStatusFilters.map((filter) => (
+                  <button
+                    className={activeStatusFilter === filter.id ? "cloud-nav-item active" : "cloud-nav-item"}
+                    key={filter.id}
+                    onClick={() => onStatusFilterChange(filter.id)}
+                    type="button"
+                  >
+                    <CloudFilterIcon id={filter.id} />
+                    <span>{filter.label}</span>
+                    <b>{getCloudFilterCount(stats, filter.id)}</b>
+                  </button>
+                ))}
+              </div>
+            )}
           </nav>
 
           <div className="cloud-storage">
@@ -4199,7 +4588,35 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
                     value={cloudQuery}
                   />
                 </label>
-                <button className="secondary-button cloud-refresh" disabled={isLoading || isLoadingMore} onClick={() => onRefresh(displaySpaceId)} type="button">
+                {!isRawDataSpace && (
+                  <div className="cloud-date-filter">
+                    <button
+                      className="cloud-date-step"
+                      onClick={() => onRepositoryDateChange(shiftLocalDateKey(cloudRepositoryDateKey, -1))}
+                      title="前一天"
+                      type="button"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <label>
+                      <span>Date</span>
+                      <input
+                        onChange={(event) => onRepositoryDateChange(event.currentTarget.value || getLocalDateKey())}
+                        type="date"
+                        value={cloudRepositoryDateKey}
+                      />
+                    </label>
+                    <button
+                      className="cloud-date-step"
+                      onClick={() => onRepositoryDateChange(shiftLocalDateKey(cloudRepositoryDateKey, 1))}
+                      title="后一天"
+                      type="button"
+                    >
+                      <ChevronRight size={14} />
+                    </button>
+                  </div>
+                )}
+                <button className="secondary-button cloud-refresh" disabled={isLoading} onClick={() => onRefresh(displaySpaceId)} type="button">
                   <RotateCcw size={16} />
                   <span>{isLoading ? "同步中" : "刷新"}</span>
                 </button>
@@ -4252,16 +4669,6 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
                 ) : filteredItems.length === 0 ? (
                   <div className="repository-empty">
                     <span>没有匹配的文件</span>
-                    {showLoadMoreRepository && (
-                      <RepositoryLoadMore
-                        canLoadMore={canLoadMoreRepository}
-                        isLoadingMore={isLoadingMore}
-                        loadedCount={items.length}
-                        onLoadMore={() => onLoadMore(displaySpaceId)}
-                        sentinelRef={loadMoreRef}
-                        total={repositoryState.total || items.length}
-                      />
-                    )}
                   </div>
                 ) : cloudViewMode === "grid" ? (
                   <div className="cloud-file-grid">
@@ -4274,16 +4681,6 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
                           onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
                         />
                       ))}
-                      {showLoadMoreRepository && (
-                        <RepositoryLoadMore
-                          canLoadMore={canLoadMoreRepository}
-                          isLoadingMore={isLoadingMore}
-                          loadedCount={items.length}
-                          onLoadMore={() => onLoadMore(displaySpaceId)}
-                          sentinelRef={loadMoreRef}
-                          total={repositoryState.total || items.length}
-                        />
-                      )}
                     </div>
                   </div>
                 ) : (
@@ -4316,16 +4713,6 @@ function CloudRepository({ authState, cloudSpaceId, onDeleteItem, onLoadMore, on
                           onToggleMenu={(event) => toggleRepositoryMenu(item, event)}
                         />
                       ))}
-                      {showLoadMoreRepository && (
-                        <RepositoryLoadMore
-                          canLoadMore={canLoadMoreRepository}
-                          isLoadingMore={isLoadingMore}
-                          loadedCount={items.length}
-                          onLoadMore={() => onLoadMore(displaySpaceId)}
-                          sentinelRef={loadMoreRef}
-                          total={repositoryState.total || items.length}
-                        />
-                      )}
                     </div>
                   </div>
                 )}
@@ -4364,6 +4751,7 @@ function CloudFilterIcon({ id }) {
   if (id === "audio") return <FileAudio size={15} />;
   if (id === "parsed") return <CheckCircle2 size={15} />;
   if (id === "processing") return <Clock3 size={15} />;
+  if (id === "failed") return <TriangleAlert size={15} />;
   return <Folder size={15} />;
 }
 
@@ -4373,19 +4761,6 @@ function CloudMetric({ icon, label, value }) {
       {icon}
       <span>{label}</span>
       <strong>{value}</strong>
-    </div>
-  );
-}
-
-function RepositoryLoadMore({ canLoadMore, isLoadingMore, loadedCount, onLoadMore, sentinelRef, total }) {
-  const loadedLabel = total > loadedCount ? `${loadedCount} / ${total}` : `${loadedCount}`;
-  return (
-    <div className="repository-load-more" ref={sentinelRef}>
-      <button className="secondary-button" disabled={!canLoadMore || isLoadingMore} onClick={onLoadMore} type="button">
-        <Download size={15} />
-        <span>{isLoadingMore ? "Loading..." : "Load more files"}</span>
-      </button>
-      <span>{loadedLabel}</span>
     </div>
   );
 }
@@ -4655,7 +5030,17 @@ function AppChrome({
   );
 }
 
-function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onClose, onOpenUpdate, outputDirectory, updateState }) {
+function AppInfoDialog({
+  activeEncoder,
+  capabilities,
+  info,
+  onCheckUpdates,
+  onClose,
+  onOpenUpdate,
+  onRevealLog,
+  outputDirectory,
+  updateState
+}) {
   const gpuNames = capabilities?.gpuNames?.length ? capabilities.gpuNames.join(", ") : "未检测到";
   const isCheckingUpdate = updateState?.status === "checking";
   const canOpenUpdate =
@@ -4699,6 +5084,10 @@ function AppInfoDialog({ activeEncoder, capabilities, info, onCheckUpdates, onCl
           <span>{updateState?.message || "检查最新安装包"}</span>
         </div>
         <div className="dialog-actions app-info-actions">
+          <button className="ghost-button" onClick={onRevealLog} type="button">
+            <FolderOpen size={14} />
+            定位日志
+          </button>
           <button className="ghost-button" disabled={isCheckingUpdate} onClick={onCheckUpdates} type="button">
             <RotateCcw size={14} />
             {isCheckingUpdate ? "检查中" : "检查更新"}
@@ -4807,7 +5196,7 @@ function UsageCard({ activeEncodingJob, device, usage }) {
                   : "总利用率与编码引擎"}
           </span>
         </div>
-        <b>{hasActiveHardwareEncoding ? "编码中" : percentLabel(total)}</b>
+        <b>{percentLabel(total)}</b>
       </div>
       <div className="meter-track">
         <div className="meter-fill" style={{ width: `${clampPercent(total)}%` }} />
@@ -4870,90 +5259,152 @@ function AutomationOptions({ onChange, options }) {
   );
 }
 
-function UploadProgressPanel({ now, onClose, onPauseToggle, onToggleDetails, state }) {
-  const total = state.items.length;
-  const completed = state.items.filter((item) => item.status === "done").length;
-  const active = isUploadActive(state);
-  const paused = state.status === "paused";
-  const canPause = isUploadPausable(state);
-  const overallPercent = getUploadOverallPercent(state);
-  const statusLabel = UPLOAD_STATUS_LABELS[state.status] || (state.status === "ready" ? "完成" : "上传");
-  const destination = state.destination || "Delphi Repository";
-  const title =
-    state.mode === "auto-backup"
-      ? `自动备份到 ${destination}`
-      : state.mode === "auto" || state.mode === "auto-upload"
-        ? `自动上传到 ${destination}`
-        : state.mode === "backup"
-          ? `${destination} 备份`
-          : `${destination} 上传`;
+function UploadQueueDock({
+  canAdd,
+  canClearFinished,
+  canStart,
+  expanded,
+  items,
+  now,
+  onAddBackup,
+  onAddUpload,
+  onCancel,
+  onClearFinished,
+  onPauseToggle,
+  onRemove,
+  onRetry,
+  onStart,
+  onToggle
+}) {
+  const active = items.find((item) => item.status === "uploading" || item.status === "processing" || item.status === "paused");
+  const queued = items.filter((item) => item.status === "queued").length;
+  const failed = items.filter((item) => isTransferErrorStatus(item.status)).length;
+  const done = items.filter((item) => item.status === "done").length;
 
   return (
-    <section className={`upload-panel ${state.status}`}>
-      <div className="upload-panel-main">
-        <div className="upload-icon">
-          <Upload size={16} />
-        </div>
-        <div className="upload-panel-body">
-          <div className="upload-title-row">
-            <strong>{title}</strong>
-            <span>
-              {completed}/{total || 0} · {Math.round(overallPercent)}% · {formatUploadSpeed(getUploadCurrentSpeed(state))}
-            </span>
-          </div>
-          <div className="upload-progress-track">
-            <div className="upload-progress-fill" style={{ width: `${overallPercent}%` }} />
-          </div>
-          <p>{state.message || statusLabel}</p>
-        </div>
-        <div className="upload-actions">
-          <button disabled={!canPause} onClick={onPauseToggle} title={paused ? "继续上传" : "暂停上传"} type="button">
-            {paused ? <Play size={15} /> : <Pause size={15} />}
-          </button>
-          <button onClick={onClose} title={active ? "关闭并取消上传" : "关闭卡片"} type="button">
-            <X size={15} />
-          </button>
-          <button
-            aria-expanded={state.expanded}
-            className={state.expanded ? "expanded" : ""}
-            onClick={onToggleDetails}
-            title={state.expanded ? "收起视频进度" : "展开视频进度"}
-            type="button"
-          >
-            <ChevronDown size={15} />
-          </button>
-        </div>
-      </div>
-      {state.expanded && (
-        <div className="upload-detail-list">
-          {state.items.map((item) => (
-            <div className="upload-detail-item" key={item.jobId}>
-              <div className="upload-detail-top">
-                <span title={item.path}>{item.name}</span>
-                <strong>{UPLOAD_STATUS_LABELS[item.status] || item.status}</strong>
-              </div>
-              <div className="upload-progress-track">
-                <div className="upload-progress-fill" style={{ width: `${clampPercent(item.percent)}%` }} />
-              </div>
-              <div className="upload-detail-meta">
-                <span>{item.message || UPLOAD_STATUS_LABELS[item.status] || ""}</span>
-                <span>
-                  {formatUploadBytes(item)} · {formatUploadSpeed(item.speedBytesPerSecond)}
-                </span>
-              </div>
-              <div className="upload-detail-time">
-                <span>
-                  耗时 <DurationValue value={getUploadItemElapsedMs(item, now)} />
-                </span>
-                <span>
-                  预计剩余 <DurationValue value={getUploadItemRemainingMs(item, now)} />
-                </span>
-              </div>
+    <aside className={expanded ? "transfer-dock expanded" : "transfer-dock"}>
+      {!expanded ? (
+        <button className="transfer-fab" onClick={onToggle} title="上传队列" type="button">
+          <Upload size={20} />
+          {items.length > 0 && <span>{items.length}</span>}
+        </button>
+      ) : (
+        <div className="transfer-dock-panel">
+          <div className="transfer-dock-header">
+            <div>
+              <p className="eyebrow">Transfer</p>
+              <h3>上传队列</h3>
             </div>
-          ))}
+            <button className="icon-button" onClick={onToggle} title="收起上传队列" type="button">
+              <ChevronDown size={17} />
+            </button>
+          </div>
+
+          <div className="transfer-dock-actions">
+            <button disabled={!canAdd} onClick={onAddUpload} title="添加上传到 Delphi 的视频" type="button">
+              <Upload size={16} />
+            </button>
+            <button disabled={!canAdd} onClick={onAddBackup} title="添加备份视频" type="button">
+              <Archive size={16} />
+            </button>
+            <button disabled={!canClearFinished} onClick={onClearFinished} title="清除已完成上传/备份" type="button">
+              <RotateCcw size={16} />
+            </button>
+            <button disabled={!canStart} onClick={() => onStart()} title="开始上传" type="button">
+              <Play size={16} />
+            </button>
+          </div>
+
+          <div className="transfer-dock-summary">
+            <span>{active ? "进行中 1" : "进行中 0"}</span>
+            <span>等待 {queued}</span>
+            <span>完成 {done}</span>
+            <span>失败 {failed}</span>
+          </div>
+
+          <div className="transfer-list">
+            {items.length === 0 ? (
+              <div className="transfer-empty">暂无上传或备份任务</div>
+            ) : (
+              items.map((item) => (
+                <TransferQueueItem
+                  item={item}
+                  key={item.id}
+                  now={now}
+                  onCancel={onCancel}
+                  onPauseToggle={onPauseToggle}
+                  onRemove={() => onRemove(item.id)}
+                  onRetry={() => onRetry(item.id)}
+                />
+              ))
+            )}
+          </div>
         </div>
       )}
-    </section>
+    </aside>
+  );
+}
+
+function TransferQueueItem({ item, now, onCancel, onPauseToggle, onRemove, onRetry }) {
+  const isFailed = isTransferErrorStatus(item.status);
+  const canRemove = item.status === "queued" || isFailed;
+  const canControlActiveUpload = item.status === "uploading" || item.status === "paused";
+  const isPaused = item.status === "paused";
+  const label = item.kind === "backup" ? "备份" : "上传";
+
+  return (
+    <div className={`transfer-item ${item.status}`}>
+      <div className="transfer-item-main">
+        <div className="transfer-kind-icon">{item.kind === "backup" ? <Archive size={15} /> : <Upload size={15} />}</div>
+        <div>
+          <div className="transfer-item-title">
+            <strong title={item.uploadPath}>{item.name}</strong>
+            <span>{formatJobTransferStatusLabel(item.kind, item.status)}</span>
+          </div>
+          <div className="upload-progress-track">
+            <div className="upload-progress-fill" style={{ width: `${clampPercent(item.percent)}%` }} />
+          </div>
+          <div className="transfer-item-meta">
+            <span>{item.message || `${label}等待`}</span>
+            <span>
+              {formatUploadBytes(item)} · {formatUploadSpeed(item.speedBytesPerSecond)}
+            </span>
+          </div>
+          <div className="transfer-item-meta">
+            <span>
+              耗时 <DurationValue value={getUploadItemElapsedMs(item, now)} />
+            </span>
+            <span>
+              预计剩余 <DurationValue value={getUploadItemRemainingMs(item, now)} />
+            </span>
+          </div>
+        </div>
+      </div>
+      {(canControlActiveUpload || isFailed || canRemove) && (
+        <div className="transfer-item-actions">
+          {canControlActiveUpload && (
+            <>
+              <button onClick={onPauseToggle} title={isPaused ? "继续上传" : "暂停上传"} type="button">
+                {isPaused ? <Play size={15} /> : <Pause size={15} />}
+              </button>
+              <button className="danger" onClick={() => onCancel()} title="取消当前上传" type="button">
+                <CircleStop size={15} />
+              </button>
+            </>
+          )}
+          {isFailed && (
+            <button className="transfer-retry-button" onClick={onRetry} title="重试此任务" type="button">
+              <RotateCcw size={15} />
+            </button>
+          )}
+          {canRemove && (
+            <button className="danger" onClick={onRemove} title="移除任务" type="button">
+              <Trash2 size={15} />
+            </button>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -4971,6 +5422,209 @@ function createUploadItems(jobs) {
   }));
 }
 
+function createTransferTask(job, { auto = false, autoClearLocal = false, kind = "upload" } = {}) {
+  const isBackup = kind === "backup";
+  const uploadPath = getTransferUploadPath(job, kind);
+  if (!uploadPath) {
+    return null;
+  }
+
+  const createdAt = Date.now();
+  const displayName = job.name || job.outputName || getFileNameFromPath(uploadPath);
+  const totalBytes = Number(job.sizeBytes || job.size || job.outputSize || 0) || 0;
+  return {
+    auto,
+    autoClearLocal,
+    bytesUploaded: 0,
+    clearLocalTarget: isBackup ? "source" : "output",
+    completedAt: null,
+    createdAt,
+    destination: isBackup ? "DL Rawdata" : "Delphi Repository",
+    duration: job.duration,
+    elapsedMs: 0,
+    endpoint: isBackup ? RAW_DATA_VIDEO_UPLOAD_PATH : WEB_VIDEO_UPLOAD_PATH,
+    id: `${kind}-${job.id || createdAt}-${createdAt}-${Math.random().toString(16).slice(2)}`,
+    kind,
+    message: "等待上传",
+    name: displayName,
+    outputPath: isBackup ? "" : uploadPath,
+    path: isBackup ? uploadPath : job.path || uploadPath,
+    percent: 0,
+    sourceJobId: job.id || "",
+    speedBytesPerSecond: 0,
+    startTimeMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
+    status: "queued",
+    totalBytes,
+    uploadName: isBackup ? getProcessedStyleFileName(job) : getUploadFileName({ ...job, uploadPath }),
+    uploadPath
+  };
+}
+
+function getTransferUploadPath(job, kind = "upload") {
+  return kind === "backup" ? job.path : job.uploadPath || getJobUploadPath(job) || job.path;
+}
+
+function getManualDelphiUploadValidationError(job) {
+  const uploadPath = getTransferUploadPath(job, "upload");
+  const fileName = getFileNameFromPath(uploadPath || job?.name);
+  const sizeBytes = Number(job?.sizeBytes || job?.size || job?.outputSize || 0);
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes >= DELPHI_UPLOAD_MAX_BYTES) {
+    return DELPHI_UPLOAD_VALIDATION_MESSAGES.size;
+  }
+
+  if (!DELPHI_UPLOAD_FILE_NAME_PATTERN.test(fileName)) {
+    return DELPHI_UPLOAD_VALIDATION_MESSAGES.name;
+  }
+
+  return "";
+}
+
+function getManualDelphiUploadErrorMessage(errors) {
+  return errors.includes(DELPHI_UPLOAD_VALIDATION_MESSAGES.size)
+    ? DELPHI_UPLOAD_VALIDATION_MESSAGES.size
+    : DELPHI_UPLOAD_VALIDATION_MESSAGES.name;
+}
+
+function createJobFromTransferTask(task) {
+  return {
+    duration: task.duration,
+    id: task.id,
+    modifiedAtMs: task.startTimeMs,
+    name: task.name,
+    outputPath: task.kind === "backup" ? "" : task.uploadPath,
+    path: task.path,
+    size: task.totalBytes,
+    sizeBytes: task.totalBytes,
+    sourceJobId: task.sourceJobId,
+    startTimeMs: task.startTimeMs,
+    totalBytes: task.totalBytes,
+    uploadName: task.uploadName,
+    uploadPath: task.uploadPath
+  };
+}
+
+function getTransferTaskUploadOptions(task, shouldClearLocalOnComplete = null) {
+  return {
+    autoClearLocal: Boolean(task.autoClearLocal),
+    clearLocalTarget: task.clearLocalTarget,
+    destination: task.destination,
+    endpoint: task.endpoint,
+    mode: task.kind === "backup" ? "backup" : "manual",
+    shouldClearLocalOnComplete
+  };
+}
+
+function getPendingAutomationTransferKinds(job) {
+  if (job?.status !== "done") {
+    return [];
+  }
+
+  const kinds = [];
+  if (job.autoUploadRequested && !job.uploadedAt && !job.deletedOutputPath) {
+    kinds.push("upload");
+  }
+  if (job.autoBackupRequested && !job.backedUpAt && !job.deletedOriginalPath) {
+    kinds.push("backup");
+  }
+  return kinds;
+}
+
+function getNextTransferTask(queue) {
+  return sortTransferQueue(queue).find((item) => item.status === "queued") || null;
+}
+
+function isTransferStartable(item) {
+  return item?.status === "queued" || isTransferRestartable(item);
+}
+
+function isTransferRestartable(item) {
+  return item?.status === "canceled" || isTransferErrorStatus(item?.status);
+}
+
+function sortTransferQueue(queue) {
+  const priority = {
+    uploading: 0,
+    processing: 0,
+    paused: 0,
+    queued: 1,
+    upload_error: 3,
+    backup_error: 3,
+    canceled: 3,
+    done: 4
+  };
+
+  return [...queue].sort((a, b) => {
+    const aPriority = priority[a.status] ?? 2;
+    const bPriority = priority[b.status] ?? 2;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    if (a.status === "queued" && b.status === "queued" && a.kind !== b.kind) {
+      return a.kind === "upload" ? -1 : 1;
+    }
+    return (a.createdAt || 0) - (b.createdAt || 0);
+  });
+}
+
+function applyTransferProgress(queue, progress) {
+  if (!progress?.jobId || !progress?.uploadId) {
+    return queue;
+  }
+
+  const status = progress.status || "uploading";
+  return queue.map((item) => {
+    if (item.id !== progress.jobId) {
+      return item;
+    }
+    if (!item.activeUploadId || item.activeUploadId !== progress.uploadId) {
+      return item;
+    }
+    if (item.status !== "uploading" && item.status !== "processing" && item.status !== "paused") {
+      return item;
+    }
+
+    const bytesUploaded = Number(progress.bytesUploaded) || item.bytesUploaded;
+    const totalBytes = Number(progress.totalBytes) || item.totalBytes;
+    return {
+      ...item,
+      bytesUploaded,
+      elapsedMs: status === "paused" ? item.elapsedMs : item.startedAt ? Math.max(Number(item.elapsedMs) || 0, Date.now() - item.startedAt) : item.elapsedMs,
+      message: normalizeUploadProgressMessage(progress.message, status) || item.message,
+      percent: clampPercent(progress.percent),
+      speedBytesPerSecond: status === "uploading" ? Number(progress.speedBytesPerSecond) || 0 : 0,
+      status,
+      totalBytes
+    };
+  });
+}
+
+function getFileNameFromPath(value) {
+  return String(value || "")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop() || "video";
+}
+
+function createTransferFailureSnapshot({ destination, jobs, message, mode, retryOptions, status }) {
+  const retryJobs = Array.isArray(jobs) ? jobs : [];
+  const now = Date.now();
+  return {
+    destination,
+    items: createUploadItems(retryJobs).map((item) => ({
+      ...item,
+      completedAt: now,
+      elapsedMs: 0,
+      estimatedRemainingMs: null,
+      message,
+      startedAt: now,
+      status
+    })),
+    message,
+    mode,
+    retryJobs,
+    retryOptions,
+    status
+  };
+}
+
 function getUploadDoneMessage(clearResult, operation = "upload") {
   if (clearResult?.deleted) {
     return clearResult.target === "source" ? "备份完成，本地原视频已清除" : "上传完成，本地降帧文件已清除";
@@ -4983,7 +5637,7 @@ function getUploadDoneMessage(clearResult, operation = "upload") {
   return operation === "backup" ? "备份完成" : "上传完成";
 }
 
-function getTransferSuccessPatch({ clearTarget, cleared, isAutoBackup, isAutoUpload, isBackup, result, timestamp, uploadPath }) {
+function getTransferSuccessPatch({ clearTarget, cleared, isBackup, result, timestamp, uploadPath }) {
   const patch = isBackup
     ? {
         backedUpAt: timestamp,
@@ -4993,13 +5647,6 @@ function getTransferSuccessPatch({ clearTarget, cleared, isAutoBackup, isAutoUpl
         uploadedAt: timestamp,
         uploadResult: result
       };
-
-  if (isAutoUpload) {
-    patch.autoUploadStatus = "done";
-  }
-  if (isAutoBackup) {
-    patch.autoBackupStatus = "done";
-  }
 
   if (cleared?.error) {
     if (clearTarget === "source") {
@@ -5035,11 +5682,19 @@ function getTransferSuccessPatch({ clearTarget, cleared, isAutoBackup, isAutoUpl
 }
 
 function isUploadActive(state) {
-  return state?.status === "uploading" || state?.status === "paused" || state?.status === "canceling";
+  return state?.status === "uploading" || state?.status === "processing" || state?.status === "paused" || state?.status === "canceling";
 }
 
 function isUploadPausable(state) {
   return state?.status === "uploading" || state?.status === "paused";
+}
+
+function getTransferErrorStatus(mode) {
+  return mode === "backup" ? "backup_error" : "upload_error";
+}
+
+function isTransferErrorStatus(status) {
+  return status === "error" || status === "upload_error" || status === "backup_error";
 }
 
 function markUploadItem(state, jobId, patch) {
@@ -5053,20 +5708,29 @@ function applyUploadProgress(state, progress) {
   if (!progress?.uploadId || progress.uploadId !== state.uploadId) {
     return state;
   }
+  if (!isUploadActive(state)) {
+    return state;
+  }
 
-  const status = progress.status || "uploading";
-  const message = progress.message || (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
+  const incomingStatus = progress.status || "uploading";
+  const status = state.status === "paused" && incomingStatus === "uploading" ? "paused" : incomingStatus;
+  const message =
+    normalizeUploadProgressMessage(progress.message, status) ||
+    (status === "processing" ? "文件已发送，等待服务器处理" : UPLOAD_STATUS_LABELS[status]);
   const now = Date.now();
   const nextItems = state.items.map((item) => {
     const matches = progress.jobId ? item.jobId === progress.jobId : item.path === progress.filePath;
     if (!matches) {
       return item;
     }
+    if (item.status !== "queued" && item.status !== "uploading" && item.status !== "processing" && item.status !== "paused") {
+      return item;
+    }
 
     const startedAt = item.startedAt || now;
     const bytesUploaded = Number(progress.bytesUploaded) || item.bytesUploaded;
     const totalBytes = Number(progress.totalBytes) || item.totalBytes;
-    const speedBytesPerSecond = Number(progress.speedBytesPerSecond) || 0;
+    const speedBytesPerSecond = status === "uploading" ? Number(progress.speedBytesPerSecond) || 0 : 0;
     const elapsedMs = status === "paused" ? getUploadItemElapsedMs(item, now) : Math.max(getUploadItemElapsedMs(item, now), now - startedAt);
 
     return {
@@ -5093,22 +5757,38 @@ function applyUploadProgress(state, progress) {
   return {
     ...state,
     message,
-    status: getNextUploadPanelStatus(state.status, status),
+    status: getNextUploadStatus(state.status, status),
     visible: state.visible,
     items: nextItems
   };
 }
 
-function getNextUploadPanelStatus(currentStatus, progressStatus) {
+function getNextUploadStatus(currentStatus, progressStatus) {
   if (progressStatus === "canceled") {
     return "canceling";
   }
 
-  if (progressStatus === "paused" || progressStatus === "uploading") {
+  if (currentStatus === "paused" && progressStatus === "uploading") {
+    return "paused";
+  }
+
+  if (progressStatus === "paused" || progressStatus === "uploading" || progressStatus === "processing") {
     return progressStatus;
   }
 
   return currentStatus;
+}
+
+function normalizeUploadProgressMessage(message, status) {
+  if (status === "paused") {
+    return "上传已暂停";
+  }
+
+  if (status === "uploading" && message === "继续上传") {
+    return "正在上传";
+  }
+
+  return message;
 }
 
 function getUploadOverallPercent(state) {
@@ -5135,7 +5815,7 @@ function getUploadItemElapsedMs(item, now = Date.now()) {
     return Number(item.elapsedMs) || 0;
   }
 
-  if (item.status === "done" || item.status === "error" || item.status === "canceled") {
+  if (item.status === "done" || item.status === "canceled" || isTransferErrorStatus(item.status)) {
     return Number(item.elapsedMs) || Math.max(0, Number(item.completedAt || now) - Number(item.startedAt));
   }
 
@@ -5149,6 +5829,9 @@ function getUploadItemElapsedMs(item, now = Date.now()) {
 function getUploadEstimatedRemainingMs({ bytesUploaded, elapsedMs, percent, speedBytesPerSecond, status, totalBytes }) {
   if (status === "done") {
     return 0;
+  }
+  if (status === "canceled" || isTransferErrorStatus(status)) {
+    return null;
   }
 
   const uploaded = Number(bytesUploaded);
@@ -5192,15 +5875,11 @@ function getUploadItemRemainingMs(item, now = Date.now()) {
 }
 
 function getUploadCurrentSpeed(state) {
-  if (state.status === "paused") {
+  if (state.status === "paused" || state.status === "canceled" || state.status === "ready" || isTransferErrorStatus(state.status)) {
     return 0;
   }
 
-  const activeItem =
-    state.items.find(
-      (item) => item.status === "uploading" || item.status === "processing" || item.status === "paused" || item.status === "canceling"
-    ) ||
-    [...state.items].reverse().find((item) => item.speedBytesPerSecond > 0);
+  const activeItem = state.items.find((item) => item.status === "uploading" && item.speedBytesPerSecond > 0);
   return activeItem?.speedBytesPerSecond || 0;
 }
 
@@ -5249,28 +5928,49 @@ function getJobUploadPath(job) {
   return isLowFrameRateJob(job) ? job.path : "";
 }
 
-function isJobUploadable(job) {
-  return Boolean(getJobUploadPath(job));
+function canClearFinishedJob(job) {
+  return job?.status === "done";
 }
 
-function shouldAutoUploadJob(job) {
-  return job?.status === "done" && Boolean(job.outputPath) && !job.uploadedAt && !job.autoUploadAttemptedAt;
+function canRemoveJob(job) {
+  return job?.status !== "processing" && job?.status !== "paused";
 }
 
-function shouldAutoBackupJob(job) {
-  return job?.status === "done" && Boolean(job.path) && !job.backedUpAt && !job.autoBackupAttemptedAt && !job.deletedOriginalPath;
+function getProcessingOutputActionPath(job) {
+  if (job?.status !== "done" || job?.deletedOutputPath) {
+    return "";
+  }
+  return job.outputPath || "";
 }
 
-function hasPendingAutomationActions(job, options) {
-  return Boolean((options?.autoUpload && shouldAutoUploadJob(job)) || (options?.autoBackup && shouldAutoBackupJob(job)));
+function getProcessingDoneMessage(job = {}) {
+  const outputDeleted = Boolean(job.deletedOutputPath);
+  const sourceDeleted = Boolean(job.deletedOriginalPath);
+  if (outputDeleted && sourceDeleted) {
+    return "处理完成，本地压制视频和原视频已清除";
+  }
+  if (outputDeleted) {
+    return "处理完成，本地压制视频已清除";
+  }
+  if (sourceDeleted) {
+    return "处理完成，原视频已清除";
+  }
+  return "处理完成";
 }
 
-function prepareBackupJob(job) {
-  return {
-    ...job,
-    uploadPath: job.path,
-    uploadName: getProcessedStyleFileName(job)
-  };
+function getQueueItemFooterMessage(job) {
+  if (job?.status === "done") {
+    return job.message || getProcessingDoneMessage(job);
+  }
+  return job.message || (job.outputPath ? job.outputPath : job.path);
+}
+
+function getShellActionErrorMessage(result) {
+  const message = typeof result === "string" ? result : result?.opened === false ? result.message : "";
+  if (!message) {
+    return "";
+  }
+  return message === "Path does not exist." ? "本地压制视频不存在，可能已被清理" : message;
 }
 
 function getUploadFileName(job) {
@@ -5310,12 +6010,32 @@ function isSamePath(left, right) {
   return String(left || "") === String(right || "");
 }
 
-function getCloudFiltersForSpace(spaceId) {
+function getCloudMediaFiltersForSpace() {
+  return CLOUD_FILTERS.filter((filter) => ["all", "video", "audio"].includes(filter.id));
+}
+
+function getCloudStatusFiltersForSpace(spaceId) {
   if (spaceId === "rawdata") {
-    return CLOUD_FILTERS.filter((filter) => filter.id !== "parsed" && filter.id !== "processing");
+    return [];
   }
 
-  return CLOUD_FILTERS;
+  return CLOUD_FILTERS.filter((filter) => ["all_status", "parsed", "processing", "failed"].includes(filter.id));
+}
+
+function getDefaultCloudMediaFilterIdForSpace() {
+  return CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID;
+}
+
+function getDefaultCloudStatusFilterIdForSpace() {
+  return CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID;
+}
+
+function getCloudStatusFilterIdForSpace(spaceId, filterId) {
+  const visibleFilters = getCloudStatusFiltersForSpace(spaceId);
+  if (visibleFilters.length === 0) {
+    return getDefaultCloudStatusFilterIdForSpace(spaceId);
+  }
+  return visibleFilters.some((filter) => filter.id === filterId) ? filterId : getDefaultCloudStatusFilterIdForSpace(spaceId);
 }
 
 function getRepositoryItemKey(item) {
@@ -5393,12 +6113,21 @@ function getRepositoryType(item) {
 }
 
 function isRepositoryParsed(item) {
-  return String(item.parse_status || "").toUpperCase() === "PARSED";
+  return ["PARSED", "FALLBACK_PARSED", "PARTIAL_PARSED"].includes(getRepositoryParseStatus(item));
 }
 
 function isRepositoryProcessing(item) {
-  const status = String(item.parse_status || "").toUpperCase();
-  return ["PENDING", "PROCESSING", "PREVIEW_READY"].includes(status);
+  return ["PENDING", "QUEUED", "PREVIEW_READY", "POSTPROCESSING", "SPLITTING", "PROCESSING", "PARSING", "RUNNING", "REINDEX_REQUIRED"].includes(
+    getRepositoryParseStatus(item)
+  );
+}
+
+function isRepositoryParseFailed(item) {
+  return ["FAIL", "FAILED", "ERROR", "PARSE_FAILED", "PROCESSING_FAILED"].includes(getRepositoryParseStatus(item));
+}
+
+function getRepositoryParseStatus(item) {
+  return String(item.parse_status || item.parseStatus || item.job_status || item.jobStatus || "").trim().toUpperCase() || "UNKNOWN";
 }
 
 function getCloudRepositoryStats(items) {
@@ -5416,11 +6145,12 @@ function getCloudRepositoryStats(items) {
         audio: stats.audio + (type === "audio" ? 1 : 0),
         parsed: stats.parsed + (isRepositoryParsed(item) ? 1 : 0),
         processing: stats.processing + (isRepositoryProcessing(item) ? 1 : 0),
+        failed: stats.failed + (isRepositoryParseFailed(item) ? 1 : 0),
         totalBytes: stats.totalBytes + (Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : 0),
         totalDurationSeconds: stats.totalDurationSeconds + (Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 0)
       };
     },
-    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, totalBytes: 0, totalDurationSeconds: 0 }
+    { total: 0, video: 0, audio: 0, parsed: 0, processing: 0, failed: 0, totalBytes: 0, totalDurationSeconds: 0 }
   );
 }
 
@@ -5429,6 +6159,7 @@ function getCloudFilterCount(stats, filterId) {
   if (filterId === "audio") return stats.audio;
   if (filterId === "parsed") return stats.parsed;
   if (filterId === "processing") return stats.processing;
+  if (filterId === "failed") return stats.failed;
   return stats.total;
 }
 
@@ -5522,20 +6253,23 @@ function base64ToBlob(base64, contentType = "application/zip") {
   return new Blob([bytes], { type: contentType });
 }
 
-function filterCloudRepositoryItems(items, filterId, query) {
+function filterCloudRepositoryItems(items, mediaFilterId, statusFilterId, query) {
   const normalizedQuery = String(query || "").trim().toLowerCase();
   const safeItems = Array.isArray(items) ? items : [];
 
   return safeItems.filter((item) => {
     const type = getRepositoryType(item);
-    const matchesFilter =
-      filterId === "all" ||
-      (filterId === "video" && type === "video") ||
-      (filterId === "audio" && type === "audio") ||
-      (filterId === "parsed" && isRepositoryParsed(item)) ||
-      (filterId === "processing" && isRepositoryProcessing(item));
+    const matchesMedia =
+      mediaFilterId === "all" ||
+      (mediaFilterId === "video" && type === "video") ||
+      (mediaFilterId === "audio" && type === "audio");
+    const matchesStatus =
+      statusFilterId === "all_status" ||
+      (statusFilterId === "parsed" && isRepositoryParsed(item)) ||
+      (statusFilterId === "processing" && isRepositoryProcessing(item)) ||
+      (statusFilterId === "failed" && isRepositoryParseFailed(item));
 
-    if (!matchesFilter) return false;
+    if (!matchesMedia || !matchesStatus) return false;
     if (!normalizedQuery) return true;
 
     return [
@@ -5825,26 +6559,16 @@ function StartTimeDialog({ editor, onCancel, onChange, onParseFileName, onSave }
   );
 }
 
-function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onReveal, onToggleSelection, selected, selectionMode }) {
+function QueueItem({ job, now, onOpen, onRemove, onReveal, removeDisabled }) {
   const elapsedMs = getElapsedMs(job, now);
   const remainingMs = getEstimatedRemainingMs(job, elapsedMs);
   const durationMs = Math.max(0, Math.round((Number(job.duration) || 0) * 1000));
   const currentVideoMs = Math.max(0, Math.round((Number(job.currentTime) || 0) * 1000));
   const startTimeMs = normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs);
+  const outputActionPath = getProcessingOutputActionPath(job);
 
   return (
-    <article className={`queue-item ${job.status}${selectionMode ? " selection-open" : ""}`}>
-      {selectionMode && (
-        <button
-          aria-pressed={selected}
-          className="queue-select-box"
-          onClick={onToggleSelection}
-          title={selected ? "取消选择" : "选择视频"}
-          type="button"
-        >
-          {selected ? <SquareCheck size={17} /> : <Square size={17} />}
-        </button>
-      )}
+    <article className={`queue-item ${job.status}`}>
       <div className="file-icon">
         <Video size={18} />
       </div>
@@ -5854,12 +6578,12 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
             <h3 title={job.path}>{job.name}</h3>
             <div className="file-meta-row">
               <p>{job.sizeLabel || job.path}</p>
-              <button className="start-time-button" disabled={disabled} onClick={onEditStartTime} type="button">
+              <span className="start-time-info">
                 <CalendarClock size={12} />
                 <span className="start-time-label">开始时间</span>
                 <span className="start-time-value">{formatDateTime(startTimeMs)}</span>
-              </button>
-              <span className="frame-rate-chip" title="当前帧率">
+              </span>
+              <span className="frame-rate-chip" title="源视频帧率">
                 <Gauge size={12} />
                 <span>{job.frameRateLabel || "fps --"}</span>
               </span>
@@ -5890,9 +6614,9 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
           </span>
         </div>
         <div className="file-footer">
-          <span>{job.message || (job.outputPath ? job.outputPath : job.path)}</span>
+          <span>{getQueueItemFooterMessage(job)}</span>
           <div className="item-actions">
-            {job.outputPath && job.status === "done" && (
+            {outputActionPath && (
               <>
                 <button onClick={onOpen} type="button">
                   打开
@@ -5902,7 +6626,7 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
                 </button>
               </>
             )}
-            <button disabled={disabled} onClick={onRemove} type="button">
+            <button disabled={removeDisabled} onClick={onRemove} type="button">
               移除
             </button>
           </div>
@@ -5910,6 +6634,20 @@ function QueueItem({ disabled, job, now, onEditStartTime, onOpen, onRemove, onRe
       </div>
     </article>
   );
+}
+
+function formatJobTransferStatusLabel(kind, status) {
+  if (status === "uploading" || status === "processing") {
+    return kind === "backup" ? "备份中" : "上传中";
+  }
+  const action = kind === "backup" ? "备份" : "上传";
+  if (status === "done") return `${action}完成`;
+  if (status === "queued") return `${action}排队`;
+  if (status === "paused") return `${action}暂停`;
+  if (status === "canceling") return `${action}取消中`;
+  if (status === "canceled") return `${action}取消`;
+  if (status === "error" || status === "upload_error" || status === "backup_error") return `${action}失败`;
+  return `${action}${status}`;
 }
 
 function DurationValue({ value, referenceValue = value }) {

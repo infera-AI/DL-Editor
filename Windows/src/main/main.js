@@ -53,6 +53,35 @@ const activeEngineQaStreams = new Map();
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
+const WEB_VIDEO_RESUMABLE_UPLOAD_PATH = "/memory/assets/web-video/resumable";
+const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
+const RAW_DATA_RESUMABLE_UPLOAD_PATH = "/memory/raw-data/videos/resumable";
+const RAW_DATA_DEDUPLICATE_PATH = "/memory/raw-data/videos/deduplicate";
+const RAW_DATA_RESUMABLE_SESSION_FILE = "raw-data-upload-sessions.json";
+const RESUMABLE_UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+const DEFAULT_RESUMABLE_PART_SIZE_BYTES = 8 * 1024 * 1024;
+const UPLOAD_CONTROL_IDLE_TIMEOUT_MS = 120000;
+const UPLOAD_TRANSFER_IDLE_TIMEOUT_MS = 180000;
+const UPLOAD_COMPLETE_IDLE_TIMEOUT_MS = 600000;
+const RETRYABLE_UPLOAD_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_UPLOAD_ERROR_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ERR_HTTP2_STREAM_CANCEL",
+  "ERR_SOCKET_CLOSED",
+  "ERR_STREAM_PREMATURE_CLOSE",
+  "ESOCKETTIMEDOUT",
+  "ETIMEDOUT"
+]);
 const VIDEO_MIME_TYPES = {
   avi: "video/x-msvideo",
   m4v: "video/x-m4v",
@@ -64,6 +93,155 @@ const VIDEO_MIME_TYPES = {
 };
 
 app.setName(APP_NAME);
+
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+let mainLogFilePath = null;
+let fileLoggerInitialized = false;
+let logSessionHeaderWritten = false;
+let lastLoggedBatchState = null;
+const lastLoggedJobStates = new Map();
+const lastLoggedUploadStates = new Map();
+const originalConsole = {
+  debug: console.debug.bind(console),
+  error: console.error.bind(console),
+  info: console.info.bind(console),
+  log: console.log.bind(console),
+  warn: console.warn.bind(console)
+};
+
+function getMainLogFilePath() {
+  if (!mainLogFilePath) {
+    mainLogFilePath = path.join(app.getPath("userData"), "logs", "main.log");
+  }
+  return mainLogFilePath;
+}
+
+function formatLogArg(value) {
+  if (value instanceof Error) {
+    return value.stack || value.message;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeError(error) {
+  return {
+    code: error?.code,
+    message: error?.message || String(error),
+    name: error?.name,
+    stack: error?.stack,
+    statusCode: error?.statusCode
+  };
+}
+
+function rotateMainLogIfNeeded(filePath) {
+  try {
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= LOG_MAX_BYTES) {
+      return;
+    }
+
+    const oldLogPath = path.join(path.dirname(filePath), "main.old.log");
+    if (fs.existsSync(oldLogPath)) {
+      fs.unlinkSync(oldLogPath);
+    }
+    fs.renameSync(filePath, oldLogPath);
+  } catch (error) {
+    originalConsole.warn("Failed to rotate log file", error);
+  }
+}
+
+function writeLogSessionHeader(logPath) {
+  if (logSessionHeaderWritten) {
+    return;
+  }
+  logSessionHeaderWritten = true;
+  fs.appendFileSync(
+    logPath,
+    [
+      "",
+      "================================================================",
+      `[${new Date().toISOString()}] [SESSION] DL Studio log session started`,
+      `[SESSION] version=${app.getVersion()} platform=${process.platform} arch=${process.arch} pid=${process.pid}`,
+      "================================================================"
+    ].join("\n") + "\n",
+    "utf8"
+  );
+}
+
+function writeLog(level, args) {
+  try {
+    const logPath = getMainLogFilePath();
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    rotateMainLogIfNeeded(logPath);
+    writeLogSessionHeader(logPath);
+    const message = args.map(formatLogArg).join(" ");
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] [${level}] ${message}\n`, "utf8");
+  } catch {
+    // Logging must never break app behavior.
+  }
+}
+
+function logInfo(...args) {
+  writeLog("INFO", args);
+}
+
+function logWarn(...args) {
+  writeLog("WARN", args);
+}
+
+function logError(...args) {
+  writeLog("ERROR", args);
+}
+
+function initializeFileLogger() {
+  if (fileLoggerInitialized) {
+    return;
+  }
+  fileLoggerInitialized = true;
+
+  console.debug = (...args) => {
+    originalConsole.debug(...args);
+    writeLog("DEBUG", args);
+  };
+  console.error = (...args) => {
+    originalConsole.error(...args);
+    writeLog("ERROR", args);
+  };
+  console.info = (...args) => {
+    originalConsole.info(...args);
+    writeLog("INFO", args);
+  };
+  console.log = (...args) => {
+    originalConsole.log(...args);
+    writeLog("INFO", args);
+  };
+  console.warn = (...args) => {
+    originalConsole.warn(...args);
+    writeLog("WARN", args);
+  };
+
+  process.on("uncaughtException", (error) => {
+    logError("Uncaught exception", summarizeError(error));
+  });
+  process.on("unhandledRejection", (reason) => {
+    logError("Unhandled rejection", reason instanceof Error ? summarizeError(reason) : reason);
+  });
+
+  logInfo("File logger initialized", {
+    arch: process.arch,
+    logFilePath: getMainLogFilePath(),
+    platform: process.platform,
+    version: app.getVersion()
+  });
+}
+
+initializeFileLogger();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -167,7 +345,7 @@ print(json.dumps({"db_path": str(db_path), "tables": tables, "counts": counts, "
 
 function resolveInferaUrl(value) {
   if (!value) {
-    throw new Error("Missing infera request path.");
+    throw new Error("缺少 Infera 请求路径");
   }
 
   const rawPath = String(value);
@@ -736,6 +914,175 @@ function getUploadHttpErrorMessage(statusCode, responseText) {
   return normalizedDetail || `上传失败 (${statusCode})`;
 }
 
+function createUploadError(message, { retryable, statusCode } = {}) {
+  const error = new Error(message || "上传失败");
+  if (statusCode !== undefined && statusCode !== null && Number.isFinite(Number(statusCode))) {
+    error.statusCode = Number(statusCode);
+  }
+  if (retryable !== undefined) {
+    error.retryable = Boolean(retryable);
+  }
+  return error;
+}
+
+function isRetryableUploadStatus(statusCode) {
+  return RETRYABLE_UPLOAD_STATUS_CODES.has(Number(statusCode));
+}
+
+function getUploadErrorCode(error) {
+  return String(error?.code || error?.cause?.code || "").trim().toUpperCase();
+}
+
+function isUploadCanceledError(error) {
+  return String(error?.message || "").includes("上传已取消");
+}
+
+function isRetryableUploadError(error) {
+  if (!error || isUploadCanceledError(error)) {
+    return false;
+  }
+  if (error.retryable === true) {
+    return true;
+  }
+  if (error.retryable === false) {
+    return false;
+  }
+  if (isRetryableUploadStatus(error.statusCode)) {
+    return true;
+  }
+
+  const code = getUploadErrorCode(error);
+  if (code && RETRYABLE_UPLOAD_ERROR_CODES.has(code)) {
+    return true;
+  }
+
+  return /(getaddrinfo|socket hang up|network socket|network error|connection reset|connection refused|timed?\s*out|timeout|tls handshake|dns|eai_again|enotfound|econnreset|etimedout|epipe)/i.test(
+    String(error.message || "")
+  );
+}
+
+function getUploadRetryReason(error) {
+  if (error?.statusCode) {
+    return `服务器暂时不可用 (${error.statusCode})`;
+  }
+
+  const code = getUploadErrorCode(error);
+  if (code === "ENOTFOUND") return "网络解析失败";
+  if (code === "EAI_AGAIN") return "DNS 临时异常";
+  if (code === "ECONNRESET" || code === "ERR_SOCKET_CLOSED" || code === "ERR_STREAM_PREMATURE_CLOSE") return "上传连接中断";
+  if (code === "ECONNREFUSED") return "服务器连接被拒绝";
+  if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT") return "上传连接超时";
+  if (code === "EPIPE") return "上传连接已断开";
+
+  const message = String(error?.message || "");
+  if (/getaddrinfo|enotfound/i.test(message)) return "网络解析失败";
+  if (/timeout|timed?\s*out|超时/i.test(message)) return "上传连接超时";
+  if (/socket hang up|connection reset|network socket/i.test(message)) return "上传连接中断";
+  return "网络异常";
+}
+
+function createUploadTimeoutError(message = "上传连接超时，请重试") {
+  return createUploadError(message, { retryable: true });
+}
+
+function createUploadIdleWatchdog({ getStream, message, request, stream, timeoutMs, uploadRecord }) {
+  let stopped = false;
+  let timeoutId = null;
+  const timeoutMessage = message || "上传连接超时，请重试";
+
+  const stop = () => {
+    stopped = true;
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  };
+
+  const refresh = () => {
+    if (stopped) {
+      return;
+    }
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+    timeoutId = setTimeout(() => {
+      if (stopped) {
+        return;
+      }
+      if (uploadRecord?.canceled) {
+        stop();
+        return;
+      }
+      if (uploadRecord?.paused) {
+        refresh();
+        return;
+      }
+
+      const error = createUploadTimeoutError(timeoutMessage);
+      const activeStream = typeof getStream === "function" ? getStream() : stream;
+      activeStream?.destroy?.(error);
+      request?.destroy?.(error);
+    }, timeoutMs);
+  };
+
+  refresh();
+  return { refresh, stop };
+}
+
+async function waitUploadRetryDelay(delayMs, uploadRecord) {
+  const deadline = Date.now() + delayMs;
+  while (Date.now() < deadline) {
+    if (uploadRecord?.canceled) {
+      throw new Error("上传已取消");
+    }
+    if (uploadRecord?.paused) {
+      await waitUntilUploadCanSend(uploadRecord);
+    }
+    await sleep(Math.min(250, Math.max(0, deadline - Date.now())));
+  }
+}
+
+async function runUploadOperationWithRetry(operation, { getBytesUploaded, retry = true, sendProgress, uploadRecord } = {}) {
+  if (!retry) {
+    return operation(0);
+  }
+
+  let lastError = null;
+  for (let attempt = 0; attempt <= RESUMABLE_UPLOAD_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (uploadRecord?.canceled) {
+      throw new Error("上传已取消");
+    }
+    if (uploadRecord) {
+      await waitUntilUploadCanSend(uploadRecord);
+    }
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (uploadRecord?.canceled || attempt >= RESUMABLE_UPLOAD_RETRY_DELAYS_MS.length || !isRetryableUploadError(error)) {
+        throw error;
+      }
+
+      const retryNumber = attempt + 1;
+      const progressStatus = uploadRecord?.phase === "completing" ? "processing" : "uploading";
+      logWarn("Upload retry scheduled", {
+        attempt: retryNumber,
+        delayMs: RESUMABLE_UPLOAD_RETRY_DELAYS_MS[attempt],
+        error: summarizeError(error),
+        phase: uploadRecord?.phase,
+        uploadId: uploadRecord?.uploadId
+      });
+      sendProgress?.(progressStatus, {
+        bytesUploaded: typeof getBytesUploaded === "function" ? getBytesUploaded() : uploadRecord?.bytesUploaded,
+        message: `${getUploadRetryReason(error)}，正在重试 ${retryNumber}/${RESUMABLE_UPLOAD_RETRY_DELAYS_MS.length}`
+      });
+      await waitUploadRetryDelay(RESUMABLE_UPLOAD_RETRY_DELAYS_MS[attempt], uploadRecord);
+    }
+  }
+
+  throw lastError || new Error("上传失败");
+}
+
 function parseRawSseEventBlock(block) {
   let eventName = "message";
   const dataLines = [];
@@ -763,7 +1110,11 @@ function parseInferaUploadEvents(responseText) {
   const parsedJson = parseJsonSafely(responseText);
   if (parsedJson && typeof parsedJson === "object" && "success" in parsedJson) {
     if (parsedJson.success === false) {
-      throw new Error(parsedJson.message || "上传失败");
+      const statusCode = Number(parsedJson.code) || undefined;
+      throw createUploadError(parsedJson.message || "上传失败", {
+        retryable: isRetryableUploadStatus(statusCode),
+        statusCode
+      });
     }
 
     return parsedJson.result ?? parsedJson;
@@ -781,14 +1132,22 @@ function parseInferaUploadEvents(responseText) {
     lastPayload = parsed.payload;
     if (parsed.event === "error") {
       const detail = parsed.payload?.message || parsed.payload?.detail || parsed.payload;
-      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      const statusCode = Number(parsed.payload?.code) || undefined;
+      throw createUploadError(typeof detail === "string" ? detail : JSON.stringify(detail), {
+        retryable: isRetryableUploadStatus(statusCode),
+        statusCode
+      });
     }
 
     if (parsed.event === "preview_ready" || parsed.event === "done") {
       const envelope = parsed.payload;
       if (envelope && typeof envelope === "object" && "success" in envelope) {
         if (envelope.success === false) {
-          throw new Error(envelope.message || "上传失败");
+          const statusCode = Number(envelope.code) || undefined;
+          throw createUploadError(envelope.message || "上传失败", {
+            retryable: isRetryableUploadStatus(statusCode),
+            statusCode
+          });
         }
 
         return envelope.result ?? {};
@@ -829,12 +1188,331 @@ function normalizeUploadDuration(value) {
   return Number.isFinite(duration) && duration > 0 ? Math.round(duration * 1000) / 1000 : "";
 }
 
+function normalizeUploadDurationMs(value) {
+  const durationMs = Number(value);
+  return Number.isFinite(durationMs) && durationMs > 0 ? Math.round(durationMs) : null;
+}
+
 function emitUploadProgress(sender, payload) {
+  const uploadId = payload?.uploadId || payload?.jobId;
+  if (uploadId) {
+    const previous = lastLoggedUploadStates.get(uploadId) || {};
+    const current = {
+      message: payload?.message || "",
+      status: payload?.status || "",
+      uploadId
+    };
+    const shouldLog =
+      previous.status !== current.status ||
+      previous.message !== current.message ||
+      current.status === "completed" ||
+      current.status === "error" ||
+      current.status === "canceled";
+    if (shouldLog) {
+      lastLoggedUploadStates.set(uploadId, current);
+      logInfo("Upload state changed", {
+        bytesUploaded: payload?.bytesUploaded,
+        fileName: payload?.filePath ? path.basename(payload.filePath) : undefined,
+        jobId: payload?.jobId,
+        message: current.message,
+        percent: payload?.percent,
+        status: current.status,
+        totalBytes: payload?.totalBytes,
+        uploadId
+      });
+    }
+  }
+
   if (!sender || sender.isDestroyed?.()) {
     return;
   }
 
   sender.send("infera:upload-progress", payload);
+}
+
+const TRANSFER_SPEED_SAMPLE_INTERVAL_MS = 1000;
+
+function createTransferSpeedMeter(initialBytes = 0) {
+  let lastSampleAt = Date.now();
+  let lastSampleBytes = Math.max(0, Number(initialBytes) || 0);
+  let previousIntervalSpeed = null;
+  let speedBytesPerSecond = 0;
+
+  return {
+    reset(bytes = lastSampleBytes) {
+      lastSampleAt = Date.now();
+      lastSampleBytes = Math.max(0, Number(bytes) || 0);
+      previousIntervalSpeed = null;
+      speedBytesPerSecond = 0;
+    },
+    sample(bytes) {
+      const currentBytes = Math.max(0, Number(bytes) || 0);
+      const now = Date.now();
+
+      if (currentBytes < lastSampleBytes) {
+        lastSampleAt = now;
+        lastSampleBytes = currentBytes;
+        previousIntervalSpeed = null;
+        speedBytesPerSecond = 0;
+        return speedBytesPerSecond;
+      }
+
+      const elapsedMs = now - lastSampleAt;
+      if (elapsedMs < TRANSFER_SPEED_SAMPLE_INTERVAL_MS) {
+        return speedBytesPerSecond;
+      }
+
+      const deltaBytes = currentBytes - lastSampleBytes;
+      const intervalSpeed = elapsedMs > 0 && deltaBytes > 0 ? deltaBytes / (elapsedMs / 1000) : 0;
+      speedBytesPerSecond =
+        previousIntervalSpeed === null ? Math.round(intervalSpeed) : Math.round((previousIntervalSpeed + intervalSpeed) / 2);
+      previousIntervalSpeed = intervalSpeed;
+      lastSampleAt = now;
+      lastSampleBytes = currentBytes;
+
+      return speedBytesPerSecond;
+    }
+  };
+}
+
+function isRawDataVideoUploadPath(value) {
+  try {
+    const target = new URL(resolveInferaUrl(value || RAW_DATA_VIDEO_UPLOAD_PATH));
+    return /\/memory\/raw[-_]data\/videos\/?$/.test(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isWebVideoUploadPath(value) {
+  try {
+    const target = new URL(resolveInferaUrl(value || WEB_VIDEO_UPLOAD_PATH));
+    return /\/memory\/assets\/web-video(?:\/events)?\/?$/.test(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function getResumableVideoUploadConfig(uploadPath) {
+  if (isRawDataVideoUploadPath(uploadPath)) {
+    return {
+      deduplicatePath: RAW_DATA_DEDUPLICATE_PATH,
+      kind: "raw-data",
+      resumablePath: RAW_DATA_RESUMABLE_UPLOAD_PATH
+    };
+  }
+  if (isWebVideoUploadPath(uploadPath)) {
+    return {
+      deduplicatePath: "",
+      kind: "web-video",
+      resumablePath: WEB_VIDEO_RESUMABLE_UPLOAD_PATH
+    };
+  }
+  return null;
+}
+
+function getRawDataUploadSessionStorePath() {
+  return path.join(app.getPath("userData"), RAW_DATA_RESUMABLE_SESSION_FILE);
+}
+
+function readRawDataUploadSessions() {
+  try {
+    const storePath = getRawDataUploadSessionStorePath();
+    if (!fs.existsSync(storePath)) {
+      return {};
+    }
+    const parsed = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRawDataUploadSessions(sessions) {
+  const storePath = getRawDataUploadSessionStorePath();
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  fs.writeFileSync(storePath, JSON.stringify(sessions, null, 2));
+}
+
+function getRawDataUploadSessionKey({ fileName, filePath, kind = "raw-data", stats }) {
+  return crypto
+    .createHash("sha256")
+    .update(`${kind}\n${path.resolve(filePath)}\n${fileName}\n${stats.size}\n${Math.round(stats.mtimeMs)}`)
+    .digest("hex");
+}
+
+function saveRawDataUploadSession(sessionKey, session) {
+  const sessions = readRawDataUploadSessions();
+  sessions[sessionKey] = {
+    ...session,
+    savedAt: new Date().toISOString()
+  };
+  writeRawDataUploadSessions(sessions);
+}
+
+function removeRawDataUploadSession(sessionKey) {
+  const sessions = readRawDataUploadSessions();
+  if (sessions[sessionKey]) {
+    delete sessions[sessionKey];
+    writeRawDataUploadSessions(sessions);
+  }
+}
+
+function requestUploadJsonOnce({ body, method = "POST", timeoutMs = UPLOAD_CONTROL_IDLE_TIMEOUT_MS, token, uploadRecord, url }) {
+  return new Promise((resolve, reject) => {
+    if (uploadRecord?.canceled) {
+      reject(new Error("上传已取消"));
+      return;
+    }
+    const payload = body === undefined ? "" : JSON.stringify(body);
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? https : http;
+    const request = transport.request(
+      target,
+      {
+        method,
+        headers: {
+          Accept: "application/json",
+          ...(payload ? { "Content-Length": Buffer.byteLength(payload), "Content-Type": "application/json" } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => {
+          chunks.push(Buffer.from(chunk));
+          watchdog.refresh();
+        });
+        response.on("end", () => {
+          watchdog.stop();
+          if (uploadRecord?.request === request) {
+            uploadRecord.request = null;
+          }
+          if (uploadRecord?.canceled) {
+            reject(new Error("上传已取消"));
+            return;
+          }
+          const text = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(
+              createUploadError(getUploadHttpErrorMessage(response.statusCode, text), {
+                retryable: isRetryableUploadStatus(response.statusCode),
+                statusCode: response.statusCode
+              })
+            );
+            return;
+          }
+          try {
+            const parsed = text ? JSON.parse(text) : {};
+            resolve(parsed?.result ?? parsed);
+          } catch {
+            reject(new Error("上传服务返回了无效数据"));
+          }
+        });
+      }
+    );
+    const watchdog = createUploadIdleWatchdog({
+      message: "上传请求超时，请重试",
+      request,
+      timeoutMs,
+      uploadRecord
+    });
+    if (uploadRecord) {
+      uploadRecord.request = request;
+    }
+    request.on("error", (error) => {
+      watchdog.stop();
+      if (uploadRecord?.request === request) {
+        uploadRecord.request = null;
+      }
+      reject(uploadRecord?.canceled ? new Error("上传已取消") : error);
+    });
+    if (payload) {
+      request.write(payload);
+    }
+    request.end();
+  });
+}
+
+function requestUploadJson({ body, method = "POST", retry = true, timeoutMs = UPLOAD_CONTROL_IDLE_TIMEOUT_MS, token, uploadRecord, url }) {
+  return runUploadOperationWithRetry(
+    () => requestUploadJsonOnce({ body, method, timeoutMs, token, uploadRecord, url }),
+    {
+      getBytesUploaded: () => uploadRecord?.bytesUploaded || 0,
+      retry,
+      sendProgress: uploadRecord?.sendProgress,
+      uploadRecord
+    }
+  );
+}
+
+function waitUntilUploadCanSend(uploadRecord) {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (uploadRecord.canceled) {
+        reject(new Error("上传已取消"));
+        return;
+      }
+      if (!uploadRecord.paused) {
+        resolve();
+        return;
+      }
+      uploadRecord.pauseWaiters.push(check);
+    };
+    check();
+  });
+}
+
+function wakeUploadPauseWaiters(uploadRecord) {
+  const waiters = uploadRecord.pauseWaiters.splice(0);
+  for (const waiter of waiters) {
+    waiter();
+  }
+}
+
+function pauseUploadStreamIfNeeded(uploadRecord, stream) {
+  if (!uploadRecord?.paused || !stream) {
+    return;
+  }
+
+  stream.pause();
+  waitUntilUploadCanSend(uploadRecord)
+    .then(() => {
+      if (!uploadRecord.canceled) {
+        stream.resume();
+      }
+    })
+    .catch((error) => {
+      stream.destroy(error);
+    });
+}
+
+function hashFileSha256({ filePath, uploadRecord }) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    uploadRecord.stream = stream;
+    stream.on("data", (chunk) => {
+      if (uploadRecord.canceled) {
+        stream.destroy(new Error("上传已取消"));
+        return;
+      }
+      hash.update(chunk);
+      pauseUploadStreamIfNeeded(uploadRecord, stream);
+    });
+    stream.on("error", (error) => {
+      uploadRecord.stream = null;
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.on("end", () => {
+      uploadRecord.stream = null;
+      if (uploadRecord.canceled) {
+        reject(new Error("上传已取消"));
+        return;
+      }
+      resolve(hash.digest("hex"));
+    });
+  });
 }
 
 function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, uploadId, url }) {
@@ -852,15 +1530,18 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     const transport = target.protocol === "https:" ? https : http;
     let settled = false;
     let bytesUploaded = 0;
-    const uploadStartedAt = Date.now();
+    const speedMeter = createTransferSpeedMeter();
+    let watchdog = null;
     const uploadRecord = {
       canceled: false,
       paused: false,
       pausedAt: null,
       pausedMs: 0,
+      pauseWaiters: [],
       request: null,
       sendProgress: null,
       stream: null,
+      uploadId,
       cancel: null
     };
 
@@ -870,6 +1551,7 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       }
 
       settled = true;
+      watchdog?.stop();
       if (uploadId) {
         activeUploadRequests.delete(uploadId);
       }
@@ -877,18 +1559,43 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     };
 
     const sendProgress = (status, extra = {}) => {
-      const currentPausedMs = uploadRecord.paused && uploadRecord.pausedAt ? Date.now() - uploadRecord.pausedAt : 0;
-      const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartedAt - uploadRecord.pausedMs - currentPausedMs) / 1000);
+      const {
+        bytesUploaded: extraBytesUploaded,
+        message: extraMessage,
+        percent: extraPercent,
+        speedBytesPerSecond: extraSpeedBytesPerSecond,
+        ...rest
+      } = extra;
+      const progressStatus = uploadRecord.paused && status === "uploading" ? "paused" : status;
+      const progressBytes = Math.max(0, Number(extraBytesUploaded ?? bytesUploaded) || 0);
+      const explicitSpeed = Number(extraSpeedBytesPerSecond);
+      const speedBytesPerSecond =
+        progressStatus === "uploading"
+          ? Number.isFinite(explicitSpeed) && explicitSpeed > 0
+            ? Math.round(explicitSpeed)
+            : speedMeter.sample(progressBytes)
+          : 0;
+
+      if (progressStatus !== "uploading") {
+        speedMeter.reset(progressBytes);
+      }
+
       emitUploadProgress(sender, {
-        bytesUploaded,
+        ...rest,
+        bytesUploaded: progressBytes,
         filePath,
         jobId,
-        percent: stats.size > 0 ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100)) : 100,
-        speedBytesPerSecond: status === "paused" ? 0 : Math.round(bytesUploaded / elapsedSeconds),
-        status,
+        message: progressStatus === "paused" ? "上传已暂停" : extraMessage,
+        percent:
+          Number.isFinite(Number(extraPercent)) && Number(extraPercent) >= 0
+            ? Math.min(100, Math.round(Number(extraPercent)))
+            : stats.size > 0
+              ? Math.min(100, Math.round((progressBytes / stats.size) * 100))
+              : 100,
+        speedBytesPerSecond,
+        status: progressStatus,
         totalBytes: stats.size,
-        uploadId,
-        ...extra
+        uploadId
       });
     };
     uploadRecord.sendProgress = sendProgress;
@@ -906,11 +1613,17 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       },
       (response) => {
         const chunks = [];
-        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("data", (chunk) => {
+          chunks.push(Buffer.from(chunk));
+          watchdog?.refresh();
+        });
         response.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8");
           if (response.statusCode < 200 || response.statusCode >= 300) {
-            const error = new Error(getUploadHttpErrorMessage(response.statusCode, text));
+            const error = createUploadError(getUploadHttpErrorMessage(response.statusCode, text), {
+              retryable: isRetryableUploadStatus(response.statusCode),
+              statusCode: response.statusCode
+            });
             settle(reject, error);
             uploadRecord.stream?.destroy();
             request.destroy();
@@ -925,6 +1638,13 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
         });
       }
     );
+    watchdog = createUploadIdleWatchdog({
+      getStream: () => uploadRecord.stream,
+      message: "上传连接超时，请重试",
+      request,
+      timeoutMs: UPLOAD_TRANSFER_IDLE_TIMEOUT_MS,
+      uploadRecord
+    });
 
     uploadRecord.request = request;
     uploadRecord.cancel = () => {
@@ -936,6 +1656,7 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       sendProgress("canceled", { message: "上传已取消" });
       uploadRecord.stream?.destroy(new Error("上传已取消"));
       request.destroy(new Error("上传已取消"));
+      wakeUploadPauseWaiters(uploadRecord);
     };
     uploadRecord.pause = () => {
       if (uploadRecord.canceled || uploadRecord.paused) {
@@ -958,7 +1679,8 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       }
       uploadRecord.pausedAt = null;
       uploadRecord.stream?.resume();
-      sendProgress("uploading", { message: "继续上传" });
+      wakeUploadPauseWaiters(uploadRecord);
+      sendProgress("uploading", { message: "正在上传" });
     };
 
     if (uploadId) {
@@ -978,7 +1700,9 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
     uploadRecord.stream
       .on("data", (chunk) => {
         bytesUploaded += chunk.length;
+        watchdog?.refresh();
         sendProgress("uploading");
+        pauseUploadStreamIfNeeded(uploadRecord, uploadRecord.stream);
       })
       .on("error", (error) => {
         request.destroy(error);
@@ -986,11 +1710,374 @@ function uploadMultipart({ fields, filePath, fileName, jobId, sender, token, upl
       })
       .on("end", () => {
         bytesUploaded = stats.size;
+        watchdog?.refresh();
         sendProgress("processing", { percent: 100 });
         request.end(footer);
       })
       .pipe(request, { end: false });
   });
+}
+
+function uploadResumableVideoPart({ filePath, jobId, partNumber, sender, token, uploadRecord, uploadToken, url, start, end, stats, uploadedBeforePart }) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? https : http;
+    const partBytes = end - start + 1;
+    let bytesSent = 0;
+    let watchdog = null;
+    const request = transport.request(
+      target,
+      {
+        method: "PUT",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+          "Content-Length": partBytes,
+          "Content-Type": "application/octet-stream",
+          "X-Upload-Token": uploadToken
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => {
+          chunks.push(Buffer.from(chunk));
+          watchdog?.refresh();
+        });
+        response.on("end", () => {
+          watchdog?.stop();
+          const text = Buffer.concat(chunks).toString("utf8");
+          uploadRecord.stream = null;
+          uploadRecord.request = null;
+          if (uploadRecord.canceled) {
+            reject(new Error("上传已取消"));
+            return;
+          }
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(
+              createUploadError(getUploadHttpErrorMessage(response.statusCode, text), {
+                retryable: isRetryableUploadStatus(response.statusCode),
+                statusCode: response.statusCode
+              })
+            );
+            return;
+          }
+          try {
+            const parsed = text ? JSON.parse(text) : {};
+            resolve(parsed?.result ?? parsed);
+          } catch {
+            reject(new Error("上传服务返回了无效数据"));
+          }
+        });
+      }
+    );
+    const stream = fs.createReadStream(filePath, { start, end });
+    uploadRecord.request = request;
+    uploadRecord.stream = stream;
+    watchdog = createUploadIdleWatchdog({
+      getStream: () => uploadRecord.stream,
+      message: "上传连接超时，请重试",
+      request,
+      timeoutMs: UPLOAD_TRANSFER_IDLE_TIMEOUT_MS,
+      uploadRecord
+    });
+    request.on("error", (error) => {
+      watchdog?.stop();
+      uploadRecord.stream = null;
+      uploadRecord.request = null;
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.on("data", (chunk) => {
+      bytesSent += chunk.length;
+      uploadRecord.bytesUploaded = uploadedBeforePart + bytesSent;
+      watchdog?.refresh();
+      uploadRecord.sendProgress?.("uploading", {
+        bytesUploaded: uploadRecord.bytesUploaded,
+        message: "正在上传"
+      });
+      pauseUploadStreamIfNeeded(uploadRecord, stream);
+    });
+    stream.on("error", (error) => {
+      watchdog?.stop();
+      request.destroy(error);
+      reject(uploadRecord.canceled ? new Error("上传已取消") : error);
+    });
+    stream.pipe(request);
+  });
+}
+
+function abortResumableUploadSession(uploadRecord) {
+  if (!uploadRecord?.abortUrl || !uploadRecord.uploadToken || uploadRecord.remoteAbortStarted) {
+    return;
+  }
+  if (uploadRecord.phase === "completing" || uploadRecord.phase === "completed") {
+    return;
+  }
+  uploadRecord.remoteAbortStarted = true;
+  requestUploadJson({
+    body: { uploadToken: uploadRecord.uploadToken },
+    retry: false,
+    token: uploadRecord.token,
+    url: uploadRecord.abortUrl
+  }).catch(() => undefined);
+  if (uploadRecord.sessionKey) {
+    removeRawDataUploadSession(uploadRecord.sessionKey);
+  }
+}
+
+async function uploadResumableVideo({ config, fields, filePath, fileName, jobId, sender, token, uploadId }) {
+  const stats = fs.statSync(filePath);
+  const sessionKey = getRawDataUploadSessionKey({ fileName, filePath, kind: config.kind, stats });
+  const speedMeter = createTransferSpeedMeter();
+  const uploadRecord = {
+    abortUrl: null,
+    bytesUploaded: 0,
+    canceled: false,
+    paused: false,
+    pausedAt: null,
+    pausedMs: 0,
+    phase: "hashing",
+    pauseWaiters: [],
+    remoteAbortStarted: false,
+    request: null,
+    sendProgress: null,
+    sessionKey,
+    stream: null,
+    token,
+    uploadId,
+    uploadToken: null
+  };
+  const sendProgress = (status, extra = {}) => {
+    const {
+      bytesUploaded: extraBytesUploaded,
+      message: extraMessage,
+      percent: extraPercent,
+      speedBytesPerSecond: extraSpeedBytesPerSecond,
+      ...rest
+    } = extra;
+    const progressStatus = uploadRecord.paused && status === "uploading" ? "paused" : status;
+    const bytesUploaded = Math.max(0, Number(extraBytesUploaded ?? uploadRecord.bytesUploaded) || 0);
+    const explicitSpeed = Number(extraSpeedBytesPerSecond);
+    const speedBytesPerSecond =
+      progressStatus === "uploading"
+        ? Number.isFinite(explicitSpeed) && explicitSpeed > 0
+          ? Math.round(explicitSpeed)
+          : speedMeter.sample(bytesUploaded)
+        : 0;
+
+    if (progressStatus !== "uploading") {
+      speedMeter.reset(bytesUploaded);
+    }
+
+    emitUploadProgress(sender, {
+      ...rest,
+      bytesUploaded,
+      filePath,
+      jobId,
+      message: progressStatus === "paused" ? "上传已暂停" : extraMessage,
+      percent:
+        Number.isFinite(Number(extraPercent)) && Number(extraPercent) >= 0
+          ? Math.min(100, Math.round(Number(extraPercent)))
+          : stats.size > 0
+            ? Math.min(100, Math.round((bytesUploaded / stats.size) * 100))
+            : 100,
+      speedBytesPerSecond,
+      status: progressStatus,
+      totalBytes: stats.size,
+      uploadId
+    });
+  };
+  uploadRecord.sendProgress = sendProgress;
+  uploadRecord.cancel = () => {
+    if (uploadRecord.canceled) {
+      return;
+    }
+    uploadRecord.canceled = true;
+    abortResumableUploadSession(uploadRecord);
+    sendProgress("canceled", { message: "上传已取消", speedBytesPerSecond: 0 });
+    uploadRecord.stream?.destroy(new Error("上传已取消"));
+    uploadRecord.request?.destroy(new Error("上传已取消"));
+    wakeUploadPauseWaiters(uploadRecord);
+  };
+  uploadRecord.pause = () => {
+    if (uploadRecord.canceled || uploadRecord.paused) {
+      return;
+    }
+    uploadRecord.paused = true;
+    uploadRecord.pausedAt = Date.now();
+    uploadRecord.stream?.pause();
+    sendProgress("paused", { message: "上传已暂停", speedBytesPerSecond: 0 });
+  };
+  uploadRecord.resume = () => {
+    if (uploadRecord.canceled || !uploadRecord.paused) {
+      return;
+    }
+    uploadRecord.paused = false;
+    if (uploadRecord.pausedAt) {
+      uploadRecord.pausedMs += Date.now() - uploadRecord.pausedAt;
+    }
+    uploadRecord.pausedAt = null;
+    uploadRecord.stream?.resume();
+    wakeUploadPauseWaiters(uploadRecord);
+    sendProgress("uploading", { message: "正在上传" });
+  };
+  activeUploadRequests.set(uploadId, uploadRecord);
+
+  try {
+    const sessions = readRawDataUploadSessions();
+    if (sessions[sessionKey]?.uploadToken && sessions[sessionKey]?.resumablePath === config.resumablePath) {
+      uploadRecord.abortUrl = resolveInferaUrl(`${config.resumablePath}/abort`);
+      uploadRecord.uploadToken = sessions[sessionKey].uploadToken;
+    }
+    sendProgress("uploading", { bytesUploaded: 0, message: "正在校验文件" });
+    const sha256 = await hashFileSha256({ filePath, uploadRecord });
+    await waitUntilUploadCanSend(uploadRecord);
+    if (config.deduplicatePath) {
+      uploadRecord.phase = "checking";
+      sendProgress("uploading", { bytesUploaded: 0, message: "正在检查重复文件" });
+      await waitUntilUploadCanSend(uploadRecord);
+      const duplicate = await requestUploadJson({
+        body: { sha256, sizeBytes: stats.size },
+        token,
+        uploadRecord,
+        url: resolveInferaUrl(config.deduplicatePath)
+      });
+      if (duplicate?.duplicate && duplicate.archive) {
+        if (sessions[sessionKey]?.uploadToken) {
+          await requestUploadJson({
+            body: { uploadToken: sessions[sessionKey].uploadToken },
+            retry: false,
+            token,
+            uploadRecord,
+            url: resolveInferaUrl(`${config.resumablePath}/abort`)
+          }).catch(() => undefined);
+          removeRawDataUploadSession(sessionKey);
+        }
+        uploadRecord.bytesUploaded = stats.size;
+        sendProgress("processing", {
+          bytesUploaded: stats.size,
+          message: "文件已存在，跳过上传",
+          percent: 100
+        });
+        return duplicate.archive;
+      }
+    } else {
+      uploadRecord.phase = "initializing";
+      sendProgress("uploading", { bytesUploaded: 0, message: "正在准备分片上传" });
+    }
+
+    await waitUntilUploadCanSend(uploadRecord);
+    let session = sessions[sessionKey]?.uploadToken
+      ? await requestUploadJson({
+          body: { uploadToken: sessions[sessionKey].uploadToken },
+          token,
+          uploadRecord,
+          url: resolveInferaUrl(`${config.resumablePath}/status`)
+        }).catch(() => null)
+      : null;
+
+    if (!session) {
+      const initBody = {
+        fileName,
+        mime: getVideoMimeType(filePath),
+        sha256,
+        sizeBytes: stats.size
+      };
+      if (fields.duration_ms) {
+        initBody.durationMs = fields.duration_ms;
+      }
+      if (config.kind === "raw-data") {
+        initBody.capturedAtMs = fields.captured_at_ms;
+        initBody.durationMs = fields.duration_ms;
+      } else {
+        initBody.startTimestampMs = fields.start_timestamp_ms;
+      }
+      await waitUntilUploadCanSend(uploadRecord);
+      session = await requestUploadJson({
+        body: initBody,
+        token,
+        uploadRecord,
+        url: resolveInferaUrl(`${config.resumablePath}/init`)
+      });
+    }
+
+    uploadRecord.abortUrl = resolveInferaUrl(`${config.resumablePath}/abort`);
+    uploadRecord.uploadToken = session.uploadToken;
+    saveRawDataUploadSession(sessionKey, {
+      uploadToken: session.uploadToken,
+      fileName,
+      filePath,
+      kind: config.kind,
+      resumablePath: config.resumablePath,
+      sha256,
+      sizeBytes: stats.size
+    });
+
+    let uploadedBytes = Number(session.uploadedBytes) || 0;
+    uploadRecord.phase = "uploading";
+    uploadRecord.bytesUploaded = uploadedBytes;
+    sendProgress("uploading", { bytesUploaded: uploadedBytes, message: "正在上传" });
+
+    while (uploadedBytes < stats.size) {
+      if (uploadRecord.canceled) {
+        throw new Error("上传已取消");
+      }
+      await waitUntilUploadCanSend(uploadRecord);
+
+      const partSize = Number(session.partSizeBytes) || DEFAULT_RESUMABLE_PART_SIZE_BYTES;
+      const partNumber = Number(session.nextPartNumber) || Math.floor(uploadedBytes / partSize) + 1;
+      const start = (partNumber - 1) * partSize;
+      const end = Math.min(stats.size - 1, start + partSize - 1);
+      session = await runUploadOperationWithRetry(
+        () =>
+          uploadResumableVideoPart({
+            end,
+            filePath,
+            jobId,
+            partNumber,
+            sender,
+            start,
+            stats,
+            token,
+            uploadRecord,
+            uploadToken: session.uploadToken,
+            uploadedBeforePart: uploadedBytes,
+            url: resolveInferaUrl(`${config.resumablePath}/parts/${partNumber}`)
+          }),
+        {
+          getBytesUploaded: () => uploadRecord.bytesUploaded,
+          sendProgress,
+          uploadRecord
+        }
+      );
+      uploadedBytes = Number(session.uploadedBytes) || end + 1;
+      uploadRecord.bytesUploaded = uploadedBytes;
+      saveRawDataUploadSession(sessionKey, {
+        uploadToken: session.uploadToken,
+        fileName,
+        filePath,
+        kind: config.kind,
+        resumablePath: config.resumablePath,
+        sha256,
+        sizeBytes: stats.size
+      });
+    }
+
+    await waitUntilUploadCanSend(uploadRecord);
+    sendProgress("processing", { bytesUploaded: stats.size, percent: 100, message: "文件已发送，等待服务器处理" });
+    uploadRecord.phase = "completing";
+    const result = await requestUploadJson({
+      body: { uploadToken: session.uploadToken },
+      timeoutMs: UPLOAD_COMPLETE_IDLE_TIMEOUT_MS,
+      token,
+      uploadRecord,
+      url: resolveInferaUrl(`${config.resumablePath}/complete`)
+    });
+    uploadRecord.phase = "completed";
+    removeRawDataUploadSession(sessionKey);
+    return result;
+  } finally {
+    activeUploadRequests.delete(uploadId);
+  }
 }
 
 async function uploadInferaVideo(payload = {}, sender) {
@@ -1009,33 +2096,83 @@ async function uploadInferaVideo(payload = {}, sender) {
   }
 
   const uploadId = String(payload.uploadId || crypto.randomUUID());
-  const fields = {
-    start_timestamp_ms: normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms)
-  };
+  const uploadPath = payload.uploadPath || WEB_VIDEO_UPLOAD_PATH;
+  const resumableConfig = getResumableVideoUploadConfig(uploadPath);
+  const isRawDataUpload = resumableConfig?.kind === "raw-data";
+  logInfo("Upload started", {
+    fileName: payload.fileName || path.basename(filePath),
+    sizeBytes: stats.size,
+    uploadId,
+    uploadPath,
+    uploadType: resumableConfig?.kind || "multipart"
+  });
+  const uploadTimestampMs = normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms ?? payload.capturedAtMs ?? payload.captured_at_ms);
+  const fields = isRawDataUpload
+    ? { captured_at_ms: uploadTimestampMs }
+    : { start_timestamp_ms: uploadTimestampMs };
   const durationSeconds = normalizeUploadDuration(payload.durationSeconds ?? payload.duration_seconds);
-  if (durationSeconds) {
+  const durationMs = normalizeUploadDurationMs(
+    payload.durationMs ?? payload.duration_ms ?? (durationSeconds ? Number(durationSeconds) * 1000 : null)
+  );
+  if (durationMs) {
+    fields.duration_ms = durationMs;
+  }
+  if (durationSeconds && !resumableConfig) {
     fields.duration_seconds = durationSeconds;
   }
 
-  return uploadMultipart({
-    fields,
-    fileName: payload.fileName || path.basename(filePath),
-    filePath,
-    jobId: payload.jobId,
-    sender,
-    token: payload.token,
-    uploadId,
-    url: resolveInferaUrl(payload.uploadPath || WEB_VIDEO_UPLOAD_PATH)
-  });
+  try {
+    const result = resumableConfig
+      ? await uploadResumableVideo({
+          config: resumableConfig,
+          fields,
+          fileName: payload.fileName || path.basename(filePath),
+          filePath,
+          jobId: payload.jobId,
+          sender,
+          token: payload.token,
+          uploadId
+        })
+      : await runUploadOperationWithRetry(() =>
+          uploadMultipart({
+            fields,
+            fileName: payload.fileName || path.basename(filePath),
+            filePath,
+            jobId: payload.jobId,
+            sender,
+            token: payload.token,
+            uploadId,
+            url: resolveInferaUrl(uploadPath)
+          })
+        );
+    logInfo("Upload completed", {
+      fileName: payload.fileName || path.basename(filePath),
+      sizeBytes: stats.size,
+      uploadId,
+      uploadPath
+    });
+    return result;
+  } catch (error) {
+    logError("Upload failed", {
+      error: summarizeError(error),
+      fileName: payload.fileName || path.basename(filePath),
+      sizeBytes: stats.size,
+      uploadId,
+      uploadPath
+    });
+    throw error;
+  }
 }
 
 function cancelInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload cancel requested but upload is not active", { uploadId: id });
     return { canceled: false };
   }
 
+  logInfo("Upload cancel requested", { uploadId: id });
   upload.cancel?.();
   return { canceled: true };
 }
@@ -1044,9 +2181,11 @@ function pauseInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload pause requested but upload is not active", { uploadId: id });
     return { paused: false };
   }
 
+  logInfo("Upload pause requested", { uploadId: id });
   upload.pause?.();
   return { paused: true };
 }
@@ -1055,9 +2194,11 @@ function resumeInferaUpload(uploadId) {
   const id = String(uploadId || "");
   const upload = activeUploadRequests.get(id);
   if (!upload) {
+    logWarn("Upload resume requested but upload is not active", { uploadId: id });
     return { resumed: false };
   }
 
+  logInfo("Upload resume requested", { uploadId: id });
   upload.resume?.();
   return { resumed: true };
 }
@@ -1176,6 +2317,23 @@ function createWindow() {
   });
 
   registerWindowShortcuts(mainWindow);
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    if (Number(level) >= 2) {
+      logWarn("Renderer console message", { level, line, message, sourceId });
+    }
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedUrl) => {
+    logError("Renderer failed to load", { errorCode, errorDescription, validatedUrl });
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    logError("Renderer process gone", details);
+  });
+  mainWindow.on("unresponsive", () => {
+    logWarn("Main window became unresponsive");
+  });
+  mainWindow.on("responsive", () => {
+    logInfo("Main window became responsive");
+  });
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -1223,16 +2381,23 @@ function runBinary(command, args, options = {}) {
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("Binary process error", { command: path.basename(command), error: summarizeError(error) });
       reject(error);
     });
     child.on("close", (code) => {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        const error = new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code}`);
+        const error = new Error(stderr.trim() || stdout.trim() || `进程退出，代码 ${code}`);
         error.code = code;
         error.stdout = stdout;
         error.stderr = stderr;
+        logError("Binary process exited with error", {
+          code,
+          command: path.basename(command),
+          stderr: stderr.trim().slice(-2000),
+          stdout: stdout.trim().slice(-1000)
+        });
         reject(error);
       }
     });
@@ -1892,22 +3057,37 @@ function parseEncodingProgressLine(line) {
     return null;
   }
 
+  if (key === "frame") {
+    return { encodedFrames: roundEncodingMetric(value, 0) };
+  }
+
   if (key === "fps") {
-    return { encodingFps: roundEncodingMetric(value) };
+    return { reportedEncodingFps: roundEncodingMetric(value) };
   }
 
   if (key === "speed") {
-    return { encodingSpeed: roundEncodingMetric(String(value).replace(/x$/i, ""), 2) };
+    return { reportedEncodingSpeed: roundEncodingMetric(String(value).replace(/x$/i, ""), 2) };
   }
 
   return null;
 }
 
 function getEncodingPayload(encoder, stats = {}) {
+  const encodingFps = Number.isFinite(Number(stats.encodingFps))
+    ? Number(stats.encodingFps)
+    : Number.isFinite(Number(stats.reportedEncodingFps))
+      ? Number(stats.reportedEncodingFps)
+      : null;
+  const encodingSpeed = Number.isFinite(Number(stats.encodingSpeed))
+    ? Number(stats.encodingSpeed)
+    : Number.isFinite(Number(stats.reportedEncodingSpeed))
+      ? Number(stats.reportedEncodingSpeed)
+      : null;
+
   return {
     encoder,
-    encodingFps: Number.isFinite(Number(stats.encodingFps)) ? Number(stats.encodingFps) : null,
-    encodingSpeed: Number.isFinite(Number(stats.encodingSpeed)) ? Number(stats.encodingSpeed) : null,
+    encodingFps,
+    encodingSpeed,
     hardwareEncoding: encoder !== "libx264"
   };
 }
@@ -1932,7 +3112,51 @@ function buildTimingPayload(startedAt, duration, currentTime) {
   };
 }
 
+function getEncodingStatsFromProgress({ currentTime, encodedFrames, outputFps, startedAt }) {
+  const elapsedMs = Math.max(0, Date.now() - startedAt - getPausedMsSince(startedAt));
+  const elapsedSeconds = elapsedMs / 1000;
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) {
+    return {};
+  }
+
+  const targetFps = Number(outputFps);
+  const processedSeconds = Math.max(0, Number(currentTime) || 0);
+  const processedFrames =
+    Number.isFinite(Number(encodedFrames)) && Number(encodedFrames) > 0
+      ? Number(encodedFrames)
+      : Number.isFinite(targetFps) && targetFps > 0
+        ? processedSeconds * targetFps
+        : null;
+
+  return {
+    encodingFps:
+      Number.isFinite(Number(processedFrames)) && Number(processedFrames) > 0
+        ? roundEncodingMetric(Number(processedFrames) / elapsedSeconds)
+        : null,
+    encodingSpeed: processedSeconds > 0 ? roundEncodingMetric(processedSeconds / elapsedSeconds, 2) : null
+  };
+}
+
 function emitJobUpdate(payload) {
+  const previous = payload?.id ? lastLoggedJobStates.get(payload.id) : null;
+  if (payload?.id) {
+    const current = {
+      message: payload?.message || "",
+      status: payload?.status || ""
+    };
+    if (previous?.status !== current.status || previous?.message !== current.message) {
+      lastLoggedJobStates.set(payload.id, current);
+      logInfo("Transcode job state changed", {
+        fileName: payload?.fileName || (payload?.path ? path.basename(payload.path) : undefined),
+        id: payload.id,
+        message: current.message,
+        outputPath: payload?.outputPath,
+        progress: payload?.progress,
+        status: current.status
+      });
+    }
+  }
+
   if (payload?.id) {
     jobSnapshots.set(payload.id, { ...(jobSnapshots.get(payload.id) || {}), ...payload });
   }
@@ -1940,6 +3164,30 @@ function emitJobUpdate(payload) {
 }
 
 function emitBatchUpdate(payload) {
+  const current = {
+    message: payload?.message || "",
+    paused: Boolean(payload?.paused),
+    status: payload?.status || ""
+  };
+  if (
+    !lastLoggedBatchState ||
+    lastLoggedBatchState.status !== current.status ||
+    lastLoggedBatchState.paused !== current.paused ||
+    lastLoggedBatchState.message !== current.message
+  ) {
+    lastLoggedBatchState = current;
+    logInfo("Transcode batch state changed", {
+      completed: payload?.completed,
+      failed: payload?.failed,
+      message: current.message,
+      outputDirectory: payload?.outputDirectory,
+      paused: current.paused,
+      processingDevice: payload?.processingDevice,
+      status: current.status,
+      total: payload?.total
+    });
+  }
+
   mainWindow?.webContents.send("transcode:batch-update", payload);
 }
 
@@ -1968,7 +3216,7 @@ function getActiveJobStatus() {
 }
 
 function getActiveJobMessage(message) {
-  return pauseRequested ? "Paused" : message;
+  return pauseRequested ? "已暂停" : message;
 }
 
 async function runFfmpegJob(job, options, outputPath, duration, capabilities, encoder, startedAt, mediaInfo) {
@@ -2002,6 +3250,12 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
+    logInfo("FFmpeg process started", {
+      encoder,
+      inputFile: path.basename(job.path),
+      jobId: job.id,
+      outputPath
+    });
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
@@ -2021,6 +3275,12 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
         const progressInfo = parseProgressLine(line, duration);
         if (progressInfo !== null) {
           const timing = buildTimingPayload(startedAt, duration, progressInfo.currentTime);
+          const currentEncodingStats = getEncodingStatsFromProgress({
+            currentTime: progressInfo.currentTime,
+            encodedFrames: encodingStats.encodedFrames,
+            outputFps: options.fps,
+            startedAt
+          });
 
           emitJobUpdate({
             id: job.id,
@@ -2031,7 +3291,7 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
             ...timing,
             startedAt,
             outputPath,
-            ...getEncodingPayload(encoder, encodingStats),
+            ...getEncodingPayload(encoder, { ...encodingStats, ...currentEncodingStats }),
             message: getActiveJobMessage(`Using ${encoder}`)
           });
         }
@@ -2042,21 +3302,47 @@ async function runFfmpegJob(job, options, outputPath, duration, capabilities, en
       stderr += chunk.toString();
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      logError("FFmpeg process error", {
+        error: summarizeError(error),
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath
+      });
+      reject(error);
+    });
     child.on("close", (code) => {
       activeProcesses.delete(child);
 
       if (cancelRequested) {
-        reject(new Error("Canceled by user."));
+        logWarn("FFmpeg process canceled", {
+          code,
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath
+        });
+        reject(new Error("用户已取消"));
         return;
       }
 
       if (code === 0) {
+        logInfo("FFmpeg process completed", {
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath
+        });
         resolve();
         return;
       }
 
-      reject(new Error(stderr.trim() || `FFmpeg exited with code ${code}`));
+      logError("FFmpeg process exited with error", {
+        code,
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath,
+        stderr: stderr.trim().slice(-2000)
+      });
+      reject(new Error(stderr.trim() || `FFmpeg 退出，代码 ${code}`));
     });
   });
 }
@@ -2096,7 +3382,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
       ...buildTimingPayload(startedAt, duration, 0),
       estimatedRemainingMs: null,
       ...getEncodingPayload("libx264"),
-      message: `${encoder} unavailable, retrying CPU`
+      message: `${encoder} 不可用，改用 CPU 重试`
     });
 
     completedEncoder = "libx264";
@@ -2113,7 +3399,7 @@ async function transcodeJob(job, options, outputDirectory, capabilities, reserve
     estimatedRemainingMs: 0,
     outputPath,
     ...getEncodingPayload(completedEncoder),
-    message: "Complete"
+    message: "处理完成"
   });
 }
 
@@ -2123,6 +3409,7 @@ function escapeConcatPath(filePath) {
 
 function runTrackedProcess(command, args) {
   return new Promise((resolve, reject) => {
+    logInfo("Tracked process started", { command: path.basename(command), argsCount: Array.isArray(args) ? args.length : 0 });
     const child = spawn(command, args, { windowsHide: true });
     trackProcess(child);
     let stdout = "";
@@ -2138,6 +3425,7 @@ function runTrackedProcess(command, args) {
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("Tracked process error", { command: path.basename(command), error: summarizeError(error) });
       reject(error);
     });
 
@@ -2145,11 +3433,19 @@ function runTrackedProcess(command, args) {
       activeProcesses.delete(child);
 
       if (cancelRequested) {
-        reject(new Error("Canceled by user."));
+        logWarn("Tracked process canceled", { code, command: path.basename(command) });
+        reject(new Error("用户已取消"));
       } else if (code === 0) {
+        logInfo("Tracked process completed", { command: path.basename(command) });
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code}`));
+        logError("Tracked process exited with error", {
+          code,
+          command: path.basename(command),
+          stderr: stderr.trim().slice(-2000),
+          stdout: stdout.trim().slice(-1000)
+        });
+        reject(new Error(stderr.trim() || stdout.trim() || `进程退出，代码 ${code}`));
       }
     });
   });
@@ -2176,6 +3472,13 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 
   await new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
+    logInfo("FFmpeg segment process started", {
+      encoder,
+      inputFile: path.basename(job.path),
+      jobId: job.id,
+      outputPath: segment.outputPath,
+      segmentIndex: segment.index
+    });
     trackProcess(child);
     let stdoutBuffer = "";
     let stderr = "";
@@ -2205,6 +3508,13 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
 
     child.on("error", (error) => {
       activeProcesses.delete(child);
+      logError("FFmpeg segment process error", {
+        error: summarizeError(error),
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath: segment.outputPath,
+        segmentIndex: segment.index
+      });
       reject(error);
     });
 
@@ -2212,17 +3522,38 @@ async function runFfmpegSegment({ job, options, segment, capabilities, encoder, 
       activeProcesses.delete(child);
 
       if (cancelRequested) {
-        reject(new Error("Canceled by user."));
+        logWarn("FFmpeg segment process canceled", {
+          code,
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath: segment.outputPath,
+          segmentIndex: segment.index
+        });
+        reject(new Error("用户已取消"));
         return;
       }
 
       if (code === 0) {
+        logInfo("FFmpeg segment process completed", {
+          inputFile: path.basename(job.path),
+          jobId: job.id,
+          outputPath: segment.outputPath,
+          segmentIndex: segment.index
+        });
         onProgress(segment.index, segment.duration, startedAt, encodingStats);
         resolve();
         return;
       }
 
-      reject(new Error(stderr.trim() || `FFmpeg segment exited with code ${code}`));
+      logError("FFmpeg segment process exited with error", {
+        code,
+        inputFile: path.basename(job.path),
+        jobId: job.id,
+        outputPath: segment.outputPath,
+        segmentIndex: segment.index,
+        stderr: stderr.trim().slice(-2000)
+      });
+      reject(new Error(stderr.trim() || `FFmpeg 分段任务退出，代码 ${code}`));
     });
   });
 }
@@ -2295,14 +3626,12 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
   let nextIndex = 0;
   let completedSegments = 0;
 
-  function getAggregateEncodingStats() {
-    const stats = [...encodingStatsBySegment.values()].filter(Boolean);
-    const encodingFps = stats.reduce((sum, item) => sum + (Number(item.encodingFps) || 0), 0);
-    const encodingSpeed = stats.reduce((sum, item) => sum + (Number(item.encodingSpeed) || 0), 0);
-    return {
-      encodingFps: roundEncodingMetric(encodingFps),
-      encodingSpeed: roundEncodingMetric(encodingSpeed, 2)
-    };
+  function getAggregateEncodingStats(currentTime) {
+    return getEncodingStatsFromProgress({
+      currentTime,
+      outputFps: options.fps,
+      startedAt
+    });
   }
 
   function emitAggregate(message) {
@@ -2321,7 +3650,7 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
       ...timing,
       startedAt,
       outputPath,
-      ...getEncodingPayload(encoder, getAggregateEncodingStats()),
+      ...getEncodingPayload(encoder, getAggregateEncodingStats(currentTime)),
       message: getActiveJobMessage(message)
     });
   }
@@ -2369,13 +3698,13 @@ async function transcodeSegmentedJob(job, options, outputPath, duration, capabil
     await Promise.all(Array.from({ length: Math.min(concurrency, segmentCount) }, () => worker()));
 
     if (cancelRequested) {
-      throw new Error("Canceled by user.");
+      throw new Error("用户已取消");
     }
 
     const mergedVideoPath = path.join(tempDir, "merged-video.mp4");
-    emitAggregate("Merging GPU video segments");
+    emitAggregate("正在合并 GPU 分段视频");
     await concatSegments(segments, mergedVideoPath);
-    emitAggregate("Muxing audio");
+    emitAggregate("正在合成音频");
     await muxOriginalAudio(mergedVideoPath, job.path, outputPath);
     return true;
   } finally {
@@ -2447,14 +3776,14 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
       } catch (error) {
         settledJobs.add(job.id);
         if (cancelRequested) {
-          emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "Canceled" });
+          emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "已取消" });
         } else {
           failed += 1;
           emitJobUpdate({
             id: job.id,
             status: "error",
             progress: 0,
-            message: error.message || "Failed to process video"
+            message: error.message || "处理失败"
           });
         }
       }
@@ -2466,7 +3795,7 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
   if (cancelRequested) {
     for (const job of jobs) {
       if (!settledJobs.has(job.id)) {
-        emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "Canceled" });
+        emitJobUpdate({ id: job.id, status: "canceled", progress: 0, message: "已取消" });
       }
     }
   }
@@ -2491,6 +3820,7 @@ async function processBatch(jobs, rawOptions, rawOutputDirectory) {
 }
 
 app.whenReady().then(async () => {
+  logInfo("App ready");
   Menu.setApplicationMenu(null);
   await startEngineMediaProxy().catch((error) => {
     console.error(`Failed to start DL Engine media proxy: ${error.message || error}`);
@@ -2512,6 +3842,7 @@ app.on("before-quit", () => {
 });
 
 app.on("window-all-closed", () => {
+  logInfo("All windows closed");
   if (usageMonitor) {
     clearInterval(usageMonitor);
     usageMonitor = null;
@@ -2560,6 +3891,15 @@ ipcMain.handle("videos:select", async () => {
   return Promise.all(result.filePaths.map(getFileMetadata));
 });
 
+ipcMain.handle("videos:get-metadata", async (_event, filePath) => {
+  const normalizedPath = String(filePath || "").trim();
+  if (!normalizedPath) {
+    return null;
+  }
+
+  return getFileMetadata(normalizedPath);
+});
+
 ipcMain.handle("output:select-directory", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "Choose output folder",
@@ -2573,12 +3913,50 @@ ipcMain.handle("output:select-directory", async () => {
 ipcMain.handle("system:get-capabilities", async () => getCapabilities());
 ipcMain.handle("system:get-usage", async () => latestUsage || buildUsageSnapshot());
 
-ipcMain.handle("updates:check", async () =>
-  checkForUpdate({
+ipcMain.handle("logs:get-main-log-path", async () => getMainLogFilePath());
+ipcMain.handle("logs:write", async (_event, payload = {}) => {
+  const level = String(payload.level || "info").toLowerCase();
+  const message = String(payload.message || "Renderer event");
+  const details = payload.details && typeof payload.details === "object" ? payload.details : {};
+  if (level === "error") {
+    logError(message, details);
+  } else if (level === "warn") {
+    logWarn(message, details);
+  } else {
+    logInfo(message, details);
+  }
+  return { logged: true };
+});
+ipcMain.handle("logs:reveal-main-log", async () => {
+  const logPath = getMainLogFilePath();
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  if (!fs.existsSync(logPath)) {
+    fs.writeFileSync(logPath, "", "utf8");
+  }
+  shell.showItemInFolder(logPath);
+  logInfo("Main log revealed", { logPath });
+  return { opened: true, path: logPath };
+});
+
+ipcMain.handle("updates:check", async () => {
+  logInfo("Update check started", {
+    arch: process.arch,
     currentVersion: app.getVersion(),
     platform: process.platform
-  })
-);
+  });
+  try {
+    const result = await checkForUpdate({
+      currentVersion: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch
+    });
+    logInfo("Update check finished", result);
+    return result;
+  } catch (error) {
+    logError("Update check failed", summarizeError(error));
+    throw error;
+  }
+});
 
 ipcMain.handle("infera:request", async (_event, payload) => requestInfera(payload));
 ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVideo(payload, event.sender));
@@ -2594,45 +3972,54 @@ ipcMain.handle("engine:get-index-content", async () => readEngineIndexContent())
 ipcMain.handle("files:delete-local-file", async (_event, targetPath) => {
   const filePath = String(targetPath || "");
   if (!filePath) {
-    throw new Error("Missing local file path.");
+    throw new Error("缺少本地文件路径");
   }
+  logInfo("Local file delete requested", { fileName: path.basename(filePath), filePath });
 
   let stats;
   try {
     stats = await fs.promises.stat(filePath);
   } catch {
+    logWarn("Local file delete skipped because file is missing", { fileName: path.basename(filePath), filePath });
     return { deleted: false, missing: true, path: filePath };
   }
 
   if (!stats.isFile()) {
-    throw new Error("Only local files can be cleared.");
+    throw new Error("只能清理本地文件");
   }
 
   await shell.trashItem(filePath);
+  logInfo("Local file moved to trash", { fileName: path.basename(filePath), filePath, sizeBytes: stats.size });
   return { deleted: true, path: filePath };
 });
 
 ipcMain.handle("transcode:start-batch", async (_event, payload) => {
+  logInfo("Transcode start requested", {
+    jobCount: Array.isArray(payload?.jobs) ? payload.jobs.length : 0,
+    outputDirectory: payload?.outputDirectory,
+    processingDevice: payload?.options?.processingDevice
+  });
   if (queueBusy) {
-    throw new Error("A batch is already running.");
+    throw new Error("已有处理任务正在运行");
   }
 
   const jobs = Array.isArray(payload?.jobs) ? payload.jobs.filter((job) => fs.existsSync(job.path)) : [];
   if (jobs.length === 0) {
-    throw new Error("No valid videos selected.");
+    throw new Error("没有可处理的有效视频");
   }
 
   processBatch(jobs, payload?.options, payload?.outputDirectory).catch((error) => {
     queueBusy = false;
     pauseRequested = false;
     pauseStartedAt = null;
-    emitBatchUpdate({ status: "error", paused: false, message: error.message || "Batch failed" });
+    emitBatchUpdate({ status: "error", paused: false, message: error.message || "批量处理失败" });
   });
 
   return { started: true };
 });
 
 ipcMain.handle("transcode:cancel-batch", async () => {
+  logInfo("Transcode cancel requested");
   cancelRequested = true;
   pauseRequested = false;
   closeActivePauseInterval();
@@ -2646,21 +4033,22 @@ ipcMain.handle("transcode:cancel-batch", async () => {
 });
 
 ipcMain.handle("transcode:pause-batch", async () => {
+  logInfo("Transcode pause requested", { queueBusy, pauseRequested });
   if (!queueBusy || pauseRequested) {
     return { paused: pauseRequested };
   }
 
   pauseRequested = true;
   pauseStartedAt = Date.now();
-  emitPauseJobState("paused", "Paused");
-  emitBatchUpdate({ status: "started", paused: true, message: "Paused" });
+  emitPauseJobState("paused", "已暂停");
+  emitBatchUpdate({ status: "started", paused: true, message: "已暂停" });
 
   const pauseResult = await setActiveProcessesPaused(true);
   if (pauseResult.failed > 0) {
     pauseRequested = false;
     closeActivePauseInterval();
-    emitPauseJobState("processing", "Pause failed");
-    emitBatchUpdate({ status: "started", paused: false, message: "Pause failed" });
+    emitPauseJobState("processing", "暂停失败");
+    emitBatchUpdate({ status: "started", paused: false, message: "暂停失败" });
     throw new Error("无法暂停当前 FFmpeg 进程");
   }
 
@@ -2668,21 +4056,22 @@ ipcMain.handle("transcode:pause-batch", async () => {
 });
 
 ipcMain.handle("transcode:resume-batch", async () => {
+  logInfo("Transcode resume requested", { queueBusy, pauseRequested });
   if (!queueBusy || !pauseRequested) {
     return { paused: pauseRequested };
   }
 
   closeActivePauseInterval();
   pauseRequested = false;
-  emitPauseJobState("processing", "Resumed");
-  emitBatchUpdate({ status: "started", paused: false, resumed: true, message: "Resumed" });
+  emitPauseJobState("processing", "已继续");
+  emitBatchUpdate({ status: "started", paused: false, resumed: true, message: "已继续" });
 
   const resumeResult = await setActiveProcessesPaused(false);
   if (resumeResult.failed > 0) {
     pauseRequested = true;
     pauseStartedAt = Date.now();
-    emitPauseJobState("paused", "Resume failed");
-    emitBatchUpdate({ status: "started", paused: true, message: "Resume failed" });
+    emitPauseJobState("paused", "继续失败");
+    emitBatchUpdate({ status: "started", paused: true, message: "继续失败" });
     throw new Error("无法恢复当前 FFmpeg 进程");
   }
 
@@ -2690,22 +4079,27 @@ ipcMain.handle("transcode:resume-batch", async () => {
 });
 
 ipcMain.handle("shell:reveal-path", async (_event, targetPath) => {
+  logInfo("Reveal path requested", { targetPath });
   if (targetPath && fs.existsSync(targetPath)) {
     shell.showItemInFolder(targetPath);
+    return { opened: true };
   }
+  return { opened: false, message: "Path does not exist." };
 });
 
 ipcMain.handle("shell:open-path", async (_event, targetPath) => {
+  logInfo("Open path requested", { targetPath });
   if (targetPath && fs.existsSync(targetPath)) {
-    return shell.openPath(targetPath);
+    const message = await shell.openPath(targetPath);
+    return message ? { opened: false, message } : { opened: true };
   }
-  return "Path does not exist.";
+  return { opened: false, message: "Path does not exist." };
 });
 
 ipcMain.handle("shell:open-external", async (_event, targetUrl) => {
   const url = String(targetUrl || "");
   if (!isAllowedUpdateUrl(url)) {
-    throw new Error("Unsupported update URL.");
+    throw new Error("不支持的更新链接");
   }
 
   await shell.openExternal(url);

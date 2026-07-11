@@ -25,6 +25,14 @@ const release = {
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/x64.dmg"
     },
     {
+      name: "DL-Studio-Mac-1.2.0-x64.pkg",
+      browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/x64-pkg"
+    },
+    {
+      name: "DL-Studio-Mac-1.2.0-x64.dmg",
+      browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/x64-dmg"
+    },
+    {
       name: "DL-Studio-Windows-Setup-1.2.0.exe",
       browser_download_url: "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/exe"
     },
@@ -61,6 +69,15 @@ const macIntelUpdate = buildUpdateResult({
 });
 assert.equal(macIntelUpdate.status, "available");
 assert.equal(macIntelUpdate.downloadUrl, "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/x64.dmg");
+
+const intelMacUpdate = buildUpdateResult({
+  currentVersion: "1.0.0",
+  platform: "darwin",
+  arch: "x64",
+  release
+});
+assert.equal(intelMacUpdate.status, "available");
+assert.equal(intelMacUpdate.downloadUrl, "https://github.com/infera-AI/DL-Editor/releases/download/v1.2.0/x64.dmg");
 
 const current = buildUpdateResult({
   currentVersion: "1.2.0",

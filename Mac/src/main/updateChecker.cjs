@@ -4,6 +4,7 @@ const INFERA_API_BASE_URL = process.env.INFERA_API_BASE_URL || process.env.VITE_
 const CLIENT_RELEASES_URL = `${INFERA_API_BASE_URL.replace(/\/+$/, "")}/client/releases`;
 const LATEST_RELEASE_API_URL = `${CLIENT_RELEASES_URL}/latest`;
 const RELEASES_URL = `${CLIENT_RELEASES_URL}/latest`;
+const UPDATE_CHECK_TIMEOUT_MS = 60000;
 
 function normalizeVersion(value) {
   return String(value || "")
@@ -31,44 +32,32 @@ function getReleaseVersion(release) {
   return normalizeVersion(release?.tag_name || release?.name);
 }
 
-function normalizeArch(value) {
-  const arch = String(value || "").toLowerCase();
-  if (arch === "x64" || arch === "x86_64" || arch === "amd64") return "x64";
+function getAssetName(asset) {
+  return String(asset?.name || asset?.assetName || "").toLowerCase();
+}
+
+function getAssetDownloadUrl(asset) {
+  return asset?.browser_download_url || asset?.downloadUrl || "";
+}
+
+function getAssetArch(asset) {
+  const arch = String(asset?.arch || "").toLowerCase();
+  if (arch === "x64" || arch === "x86_64") return "x64";
   if (arch === "arm64" || arch === "aarch64") return "arm64";
-  return arch;
-}
 
-function hasArchToken(name, arch) {
-  if (arch === "arm64") return /(^|[^a-z0-9])arm64([^a-z0-9]|$)/.test(name);
-  if (arch === "x64") return /(^|[^a-z0-9])(x64|x86_64|amd64)([^a-z0-9]|$)/.test(name);
-  return false;
-}
-
-function getDarwinArchScore(name, arch) {
-  const targetArch = normalizeArch(arch);
-  if (targetArch !== "arm64" && targetArch !== "x64") return 0;
-
-  const hasArm64 = hasArchToken(name, "arm64");
-  const hasX64 = hasArchToken(name, "x64");
-  if (targetArch === "arm64") {
-    if (hasArm64) return 15;
-    if (hasX64) return -1;
-  }
-  if (targetArch === "x64") {
-    if (hasX64) return 15;
-    if (hasArm64) return -1;
-  }
-
-  return hasArm64 || hasX64 ? -1 : 1;
+  const name = getAssetName(asset);
+  if (name.includes("x64") || name.includes("x86_64")) return "x64";
+  if (name.includes("arm64") || name.includes("aarch64")) return "arm64";
+  return "";
 }
 
 function scoreAsset(asset, platform, arch = process.arch) {
-  const name = String(asset?.name || "").toLowerCase();
-  if (!asset?.browser_download_url || name.endsWith(".blockmap") || name.endsWith(".yml")) return 0;
+  const name = getAssetName(asset);
+  if (!getAssetDownloadUrl(asset) || name.endsWith(".blockmap") || name.endsWith(".yml")) return 0;
 
   if (platform === "darwin") {
-    const archScore = getDarwinArchScore(name, arch);
-    if (archScore < 0) return 0;
+    const assetArch = getAssetArch(asset);
+    const archScore = !assetArch ? 1 : assetArch === arch ? 20 : -100;
     if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".dmg")) return 30 + archScore;
     if ((name.includes("dl-studio-mac") || name.includes("dl-editor-mac")) && name.endsWith(".pkg")) return 20 + archScore;
     if (name.endsWith(".dmg")) return 10 + archScore;
@@ -129,8 +118,8 @@ function buildUpdateResult({ currentVersion, platform = process.platform, arch =
   return {
     ...base,
     status: "available",
-    assetName: asset.name,
-    downloadUrl: asset.browser_download_url
+    assetName: asset.name || asset.assetName || "",
+    downloadUrl: getAssetDownloadUrl(asset)
   };
 }
 
@@ -156,7 +145,7 @@ function requestJson(url) {
           Accept: "application/vnd.github+json",
           "User-Agent": "DL-Studio-Updater"
         },
-        timeout: 15000
+        timeout: UPDATE_CHECK_TIMEOUT_MS
       },
       (response) => {
         let body = "";
@@ -188,12 +177,7 @@ function requestJson(url) {
   });
 }
 
-async function checkForUpdate({
-  currentVersion,
-  platform = process.platform,
-  arch = process.arch,
-  apiUrl = LATEST_RELEASE_API_URL
-} = {}) {
+async function checkForUpdate({ currentVersion, platform = process.platform, arch = process.arch, apiUrl = LATEST_RELEASE_API_URL } = {}) {
   let release;
   try {
     release = await requestJson(apiUrl);
@@ -209,6 +193,7 @@ async function checkForUpdate({
 
 module.exports = {
   LATEST_RELEASE_API_URL,
+  UPDATE_CHECK_TIMEOUT_MS,
   buildNoReleaseResult,
   buildUpdateResult,
   checkForUpdate,

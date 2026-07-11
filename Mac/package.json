@@ -1,6 +1,6 @@
 {
   "name": "dl-studio-mac",
-  "version": "1.0.3",
+  "version": "1.0.8",
   "private": true,
   "description": "Desktop batch video downsampler for macOS.",
   "main": "src/main/main.js",
@@ -21,7 +21,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
-    "electron": "^32.3.3",
+    "electron": "^34.1.1",
     "electron-builder": "^25.1.8",
     "ffmpeg-static": "^5.2.0",
     "ffprobe-static": "^3.1.0",

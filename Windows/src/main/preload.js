@@ -9,9 +9,13 @@ const on = (channel, listener) => {
 contextBridge.exposeInMainWorld("dlEditor", {
   platform: process.platform,
   selectVideos: () => ipcRenderer.invoke("videos:select"),
+  getVideoMetadata: (filePath) => ipcRenderer.invoke("videos:get-metadata", filePath),
   selectOutputDirectory: () => ipcRenderer.invoke("output:select-directory"),
   getCapabilities: () => ipcRenderer.invoke("system:get-capabilities"),
   getUsage: () => ipcRenderer.invoke("system:get-usage"),
+  getMainLogPath: () => ipcRenderer.invoke("logs:get-main-log-path"),
+  writeLog: (payload) => ipcRenderer.invoke("logs:write", payload),
+  revealMainLog: () => ipcRenderer.invoke("logs:reveal-main-log"),
   checkForUpdates: () => ipcRenderer.invoke("updates:check"),
   requestInfera: (payload) => ipcRenderer.invoke("infera:request", payload),
   requestEngine: (payload) => ipcRenderer.invoke("engine:request", payload),
