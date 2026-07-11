@@ -1,6 +1,6 @@
 {
   "name": "dl-studio-mac",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "private": true,
   "description": "Desktop batch video downsampler for macOS.",
   "main": "src/main/main.js",
