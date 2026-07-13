@@ -75,6 +75,7 @@ const RESEARCH_PAGE_SIZE = 100;
 const RESEARCH_SIGNED_URL_CACHE_TTL_MS = 20 * 60 * 1000;
 const RESEARCH_SIGNED_URL_CACHE_MAX = 600;
 const RESEARCH_SIGNED_URL_CONCURRENCY = 8;
+const INFERA_AUTH_EXPIRED_MESSAGE = "登录已过期，请重新登录";
 const RESEARCH_RESOURCE_STATUSES = [
   { id: "", label: "All statuses" },
   { id: "PARSED", label: "PARSED" },
@@ -85,6 +86,8 @@ const RESEARCH_RESOURCE_STATUSES = [
 const researchSignedUrlCache = new Map();
 const researchSignedUrlQueue = [];
 let researchSignedUrlActiveCount = 0;
+let inferaAuthController = null;
+let inferaRefreshPromise = null;
 const DEFAULT_AUTOMATION_OPTIONS = {
   autoUpload: true,
   autoBackup: true,
@@ -331,7 +334,122 @@ function resolveInferaUrl(value) {
   }
 }
 
-async function requestInfera(path, { accept, method = "GET", token, body, responseType = "json", signal } = {}) {
+function createInferaHttpError(status, detail) {
+  const statusCode = Number(status) || 0;
+  const normalizedDetail = typeof detail === "string" ? detail.trim() : detail ? JSON.stringify(detail) : "";
+  const message = normalizedDetail.includes(`(${statusCode})`)
+    ? normalizedDetail
+    : `请求失败 (${statusCode})${normalizedDetail ? `：${normalizedDetail}` : ""}`;
+  const error = new Error(message);
+  error.status = statusCode;
+  return error;
+}
+
+function isInferaUnauthorizedError(error) {
+  return Number(error?.status || error?.statusCode) === 401 || /\(401\)/.test(String(error?.message || ""));
+}
+
+function isInferaAuthEndpoint(path) {
+  return /^\/?auth\/(?:login|refresh)\/?(?:\?|$)/i.test(String(path || ""));
+}
+
+function setInferaAuthController(controller) {
+  inferaAuthController = controller;
+  return () => {
+    if (inferaAuthController === controller) {
+      inferaAuthController = null;
+    }
+  };
+}
+
+function expireInferaAuth() {
+  const error = new Error(INFERA_AUTH_EXPIRED_MESSAGE);
+  error.status = 401;
+  inferaAuthController?.onExpired?.(error);
+  return error;
+}
+
+function mergeRefreshedInferaAuth(currentAuth, result) {
+  const refreshed = normalizeAuthPayload(result, currentAuth?.accountName || "");
+  if (!refreshed.token || !refreshed.refreshToken) {
+    throw createInferaHttpError(401, "刷新响应缺少 token");
+  }
+  return {
+    ...currentAuth,
+    ...refreshed,
+    accountName: refreshed.accountName || currentAuth?.accountName || "",
+    displayName: refreshed.displayName || currentAuth?.displayName || "",
+    phone: refreshed.phone || currentAuth?.phone || "",
+    email: refreshed.email || currentAuth?.email || "",
+    nickname: refreshed.nickname || currentAuth?.nickname || "",
+    avatar: refreshed.avatar || currentAuth?.avatar || ""
+  };
+}
+
+async function refreshInferaAuth() {
+  if (inferaRefreshPromise) {
+    return inferaRefreshPromise;
+  }
+
+  const currentAuth = inferaAuthController?.getAuth?.();
+  if (!currentAuth?.refreshToken) {
+    throw expireInferaAuth();
+  }
+
+  const operation = (async () => {
+    try {
+      const result = await requestInferaRaw("/auth/refresh", {
+        method: "POST",
+        body: { refreshToken: currentAuth.refreshToken }
+      });
+      const nextAuth = mergeRefreshedInferaAuth(currentAuth, result);
+      inferaAuthController?.onRefreshed?.(nextAuth, currentAuth);
+      return nextAuth;
+    } catch (error) {
+      if (isInferaUnauthorizedError(error)) {
+        throw expireInferaAuth();
+      }
+      const refreshError = new Error(`登录状态刷新失败：${error.message || "请检查网络后重试"}`);
+      inferaAuthController?.onRefreshError?.(refreshError);
+      throw refreshError;
+    }
+  })();
+
+  inferaRefreshPromise = operation;
+  try {
+    return await operation;
+  } finally {
+    if (inferaRefreshPromise === operation) {
+      inferaRefreshPromise = null;
+    }
+  }
+}
+
+async function requestInfera(path, options = {}) {
+  const currentAuth = inferaAuthController?.getAuth?.();
+  const suppliedToken = options.token;
+  const effectiveToken = suppliedToken && currentAuth?.token ? currentAuth.token : suppliedToken;
+
+  try {
+    return await requestInferaRaw(path, { ...options, token: effectiveToken });
+  } catch (error) {
+    if (!suppliedToken || isInferaAuthEndpoint(path) || !isInferaUnauthorizedError(error)) {
+      throw error;
+    }
+
+    const nextAuth = await refreshInferaAuth();
+    try {
+      return await requestInferaRaw(path, { ...options, token: nextAuth.token });
+    } catch (retryError) {
+      if (isInferaUnauthorizedError(retryError)) {
+        throw expireInferaAuth();
+      }
+      throw retryError;
+    }
+  }
+}
+
+async function requestInferaRaw(path, { accept, method = "GET", token, body, responseType = "json", signal } = {}) {
   if (typeof dlEditor.requestInfera === "function") {
     const result = await dlEditor.requestInfera({ accept, path, method, token, body, responseType });
     return responseType === "download" ? result : unwrapInferaResult(result);
@@ -354,15 +472,23 @@ async function requestInfera(path, { accept, method = "GET", token, body, respon
   });
 
   if (responseType === "redirect") {
+    if (!response.ok && (response.status < 300 || response.status >= 400)) {
+      let detail = "";
+      try {
+        const text = await response.text();
+        const payload = text ? JSON.parse(text) : null;
+        detail = payload?.message || payload?.detail || text;
+      } catch {
+        detail = "";
+      }
+      throw createInferaHttpError(response.status, detail);
+    }
     const location = response.headers.get("location");
     if (location) {
       return { url: new URL(location, resolveInferaUrl(path)).toString() };
     }
     if (response.redirected || response.url) {
       return { url: response.url };
-    }
-    if (!response.ok) {
-      throw new Error(`请求失败 (${response.status})`);
     }
     return { url: resolveInferaUrl(path) };
   }
@@ -373,13 +499,13 @@ async function requestInfera(path, { accept, method = "GET", token, body, respon
       const payload = await response.json();
       if (!response.ok) {
         const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
-        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        throw createInferaHttpError(response.status, detail);
       }
       return payload;
     }
     const blob = await response.blob();
     if (!response.ok) {
-      throw new Error(`请求失败 (${response.status})`);
+      throw createInferaHttpError(response.status, "");
     }
     return {
       blob,
@@ -399,7 +525,7 @@ async function requestInfera(path, { accept, method = "GET", token, body, respon
 
   if (!response.ok) {
     const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw createInferaHttpError(response.status, detail);
   }
 
   return unwrapInferaResult(payload);
@@ -1202,6 +1328,44 @@ function App() {
   }, [authState]);
 
   useEffect(() => {
+    const controller = {
+      getAuth: () => authStateRef.current,
+      onRefreshed: (nextAuth, previousAuth) => {
+        authStateRef.current = nextAuth;
+        setAuthState(nextAuth);
+        const storedAuth = readStoredAuth();
+        if (
+          storedAuth &&
+          (storedAuth.refreshToken === previousAuth?.refreshToken || storedAuth.token === previousAuth?.token)
+        ) {
+          window.localStorage?.setItem(AUTH_STORAGE_KEY, JSON.stringify(nextAuth));
+        }
+        logRendererEvent("Infera access token refreshed", { userId: nextAuth.userId });
+      },
+      onExpired: () => {
+        const previousAuth = authStateRef.current;
+        window.localStorage?.removeItem(AUTH_STORAGE_KEY);
+        authStateRef.current = null;
+        setAuthState(null);
+        setLoginForm((current) => ({
+          ...current,
+          identifier: current.identifier || getAuthAccountName(previousAuth),
+          password: ""
+        }));
+        setLoginStatus({ status: "error", message: INFERA_AUTH_EXPIRED_MESSAGE });
+        setNotice(INFERA_AUTH_EXPIRED_MESSAGE);
+        setShowLogin(true);
+        logRendererEvent("Infera session expired", { userId: previousAuth?.userId || "" }, "warn");
+      },
+      onRefreshError: (error) => {
+        setNotice(error.message || "登录状态刷新失败，请检查网络后重试");
+        logRendererEvent("Infera token refresh failed", { message: error.message || "" }, "warn");
+      }
+    };
+    return setInferaAuthController(controller);
+  }, []);
+
+  useEffect(() => {
     automationOptionsRef.current = automationOptions;
     window.localStorage?.setItem(AUTOMATION_STORAGE_KEY, JSON.stringify(automationOptions));
   }, [automationOptions]);
@@ -1722,6 +1886,30 @@ function App() {
     }
   }
 
+  async function uploadInferaVideoWithAuthRefresh(payload) {
+    const currentAuth = authStateRef.current;
+    if (!currentAuth?.token) {
+      throw expireInferaAuth();
+    }
+
+    try {
+      return await dlEditor.uploadInferaVideo({ ...payload, token: currentAuth.token });
+    } catch (error) {
+      if (!isInferaUnauthorizedError(error)) {
+        throw error;
+      }
+      const nextAuth = await refreshInferaAuth();
+      try {
+        return await dlEditor.uploadInferaVideo({ ...payload, token: nextAuth.token });
+      } catch (retryError) {
+        if (isInferaUnauthorizedError(retryError)) {
+          throw expireInferaAuth();
+        }
+        throw retryError;
+      }
+    }
+  }
+
   function updateTransferTask(taskId, patch) {
     const nextQueue = transferQueueRef.current.map((item) => (item.id === taskId ? { ...item, ...patch } : item));
     transferQueueRef.current = nextQueue;
@@ -1824,14 +2012,13 @@ function App() {
         );
         let result = null;
         try {
-          result = await dlEditor.uploadInferaVideo({
+          result = await uploadInferaVideoWithAuthRefresh({
             durationSeconds: job.duration,
             durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
             jobId: job.id,
             path: job.uploadPath,
             fileName: job.uploadName,
             startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
-            token: auth.token,
             uploadId,
             uploadPath: endpoint
           });
@@ -2283,7 +2470,7 @@ function App() {
       return;
     }
 
-    setLoginStatus({ status: "checking", message: "正在验证 infera-button-demo 账号..." });
+    setLoginStatus({ status: "checking", message: "正在登录..." });
     try {
       const result = await loginToInfera({ identifier, password: loginForm.password });
       const nextAuth = normalizeAuthPayload(result, identifier);
@@ -2297,6 +2484,7 @@ function App() {
         window.localStorage?.removeItem(AUTH_STORAGE_KEY);
       }
 
+      authStateRef.current = nextAuth;
       setAuthState(nextAuth);
       setLoginStatus({ status: "idle", message: "" });
       setLoginForm((current) => ({ ...current, identifier, password: "" }));
@@ -2317,6 +2505,7 @@ function App() {
 
   function logout() {
     window.localStorage?.removeItem(AUTH_STORAGE_KEY);
+    authStateRef.current = null;
     setAuthState(null);
     setLoginStatus({ status: "idle", message: "" });
     setRepositoryState({
@@ -4332,11 +4521,15 @@ function ResearchPage({
 
   if (!authState?.token) {
     return (
-      <section className="research-page">
-        <div className="research-empty">
-          <LockKeyhole size={30} />
-          <h1>Research</h1>
-          <p>使用 DL Studio 当前登录账户访问 Research 数据。</p>
+      <section className="research-login-page">
+        <div className="research-login-card">
+          <div className="research-login-icon">
+            <LockKeyhole size={24} />
+          </div>
+          <div className="research-login-copy">
+            <h1>登录后访问 Research</h1>
+            <p>使用当前 DL Studio 账户查看有权限的 Research 数据。</p>
+          </div>
           <button className="primary-button" onClick={onLogin} type="button">
             <UserRound size={16} />
             <span>登录</span>
@@ -4989,7 +5182,7 @@ function ResearchStatisticsView({ data }) {
 }
 
 function ResearchStatisticsModal({ onClose, onPageChange, page, user }) {
-  const pageSize = 20;
+  const pageSize = 14;
   const daily = (Array.isArray(user.daily) ? user.daily : [])
     .map((item) => ({
       chatCount: Number(item.chat_count ?? item.chatCount ?? 0) || 0,
@@ -5009,28 +5202,30 @@ function ResearchStatisticsModal({ onClose, onPageChange, page, user }) {
           <h2>{user.nickname || `User ${user.user_id ?? user.userId}`} daily duration</h2>
           <button className="ghost-button" onClick={onClose} type="button">Close</button>
         </header>
-        {rows.length ? (
-          <table className="research-stats-table">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Duration</th>
-                <th>Agent chats</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((item) => (
-                <tr key={item.date}>
-                  <td>{item.date}</td>
-                  <td>{formatResearchLongDuration(item.durationMs)}</td>
-                  <td>{formatResearchNumber(item.chatCount)}</td>
+        <div className="research-modal-body">
+          {rows.length ? (
+            <table className="research-stats-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Duration</th>
+                  <th>Agent chats</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <div className="research-preview-empty">No daily duration data</div>
-        )}
+              </thead>
+              <tbody>
+                {rows.map((item) => (
+                  <tr key={item.date}>
+                    <td>{item.date}</td>
+                    <td>{formatResearchLongDuration(item.durationMs)}</td>
+                    <td>{formatResearchNumber(item.chatCount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="research-preview-empty">No daily duration data</div>
+          )}
+        </div>
         <footer>
           <button className="ghost-button" disabled={safePage <= 0} onClick={() => onPageChange(safePage - 1)} type="button">Previous</button>
           <span>Page {safePage + 1} / {totalPages}</span>
@@ -5628,7 +5823,7 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
               取消
             </button>
             <button className="primary-button" disabled={isChecking} type="submit">
-              {isChecking ? "验证中" : "登录"}
+              {isChecking ? "登录中" : "登录"}
             </button>
           </div>
         </form>

@@ -563,6 +563,11 @@ function getResponseFilename(response, fallback = "research-export.zip") {
   return match?.[1] || fallback;
 }
 
+function getInferaHttpErrorMessage(statusCode, detail) {
+  const normalizedDetail = typeof detail === "string" ? detail.trim() : detail ? JSON.stringify(detail) : "";
+  return `请求失败 (${Number(statusCode) || 0})${normalizedDetail ? `：${normalizedDetail}` : ""}`;
+}
+
 async function requestInfera(payload = {}) {
   const method = String(payload.method || "GET").toUpperCase();
   const responseType = payload.responseType || "json";
@@ -584,15 +589,18 @@ async function requestInfera(payload = {}) {
   });
 
   if (responseType === "redirect") {
+    if (!response.ok && (response.status < 300 || response.status >= 400)) {
+      const text = await response.text();
+      const result = parseJsonSafely(text);
+      const detail = result?.message || result?.detail || text;
+      throw new Error(getInferaHttpErrorMessage(response.status, detail));
+    }
     const location = response.headers.get("location");
     if (location) {
       return { url: new URL(location, resolveInferaUrl(payload.path)).toString() };
     }
     if (response.redirected || response.url) {
       return { url: response.url };
-    }
-    if (!response.ok) {
-      throw new Error(`璇锋眰澶辫触 (${response.status})`);
     }
     return { url: resolveInferaUrl(payload.path) };
   }
@@ -603,14 +611,16 @@ async function requestInfera(payload = {}) {
       const result = await response.json();
       if (!response.ok) {
         const detail = result?.message || result?.detail || `璇锋眰澶辫触 (${response.status})`;
-        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        throw new Error(getInferaHttpErrorMessage(response.status, detail));
       }
       return result;
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
     if (!response.ok) {
-      throw new Error(`璇锋眰澶辫触 (${response.status})`);
+      const text = buffer.toString("utf8");
+      const result = parseJsonSafely(text);
+      throw new Error(getInferaHttpErrorMessage(response.status, result?.message || result?.detail || text));
     }
     return {
       delivery: "direct",
@@ -630,7 +640,7 @@ async function requestInfera(payload = {}) {
 
   if (!response.ok) {
     const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw new Error(getInferaHttpErrorMessage(response.status, detail));
   }
 
   return result;
@@ -845,9 +855,16 @@ function getUploadHttpErrorMessage(statusCode, responseText) {
 }
 
 function createUploadError(message, { retryable, statusCode } = {}) {
-  const error = new Error(message || "上传失败");
-  if (statusCode !== undefined && statusCode !== null && Number.isFinite(Number(statusCode))) {
-    error.statusCode = Number(statusCode);
+  const hasStatusCode = statusCode !== undefined && statusCode !== null && Number.isFinite(Number(statusCode));
+  const normalizedStatusCode = hasStatusCode ? Number(statusCode) : null;
+  const normalizedMessage = String(message || "上传失败");
+  const error = new Error(
+    hasStatusCode && !normalizedMessage.includes(`(${normalizedStatusCode})`)
+      ? `${normalizedMessage} (${normalizedStatusCode})`
+      : normalizedMessage
+  );
+  if (hasStatusCode) {
+    error.statusCode = normalizedStatusCode;
   }
   if (retryable !== undefined) {
     error.retryable = Boolean(retryable);
