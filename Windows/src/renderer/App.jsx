@@ -1226,7 +1226,8 @@ function App() {
     selectedResourceIds: [],
     selectedChatIds: [],
     message: "",
-    exportMessage: ""
+    exportMessage: "",
+    exportDownload: null
   });
   const [startTimeEditor, setStartTimeEditor] = useState(null);
   const [showAppInfo, setShowAppInfo] = useState(false);
@@ -2783,7 +2784,7 @@ function App() {
           : await exportResearchResources(token, {
               ...commonPayload,
               asset_ids: selectAll ? [] : selectedIds.map(Number),
-              delivery: "direct",
+              delivery: "oss",
               max_assets: 500,
               parse_status: researchFilters.status || null,
               date_start_ms: dateParams.date_start_ms,
@@ -2792,7 +2793,20 @@ function App() {
               include_parsed_data: true
             });
       await saveResearchDownload(result, kind === "chats" ? "research-chats.zip" : "research-videos.zip");
-      setResearchState((current) => ({ ...current, exportMessage: "导出已开始下载" }));
+      const exportDownload = result?.download_url
+        ? {
+            kind,
+            url: result.download_url,
+            filename: result.filename || (kind === "chats" ? "research-chats.zip" : "research-videos.zip"),
+            sizeBytes: Number(result.size_bytes) || 0,
+            expiresAt: Number(result.expires_seconds) > 0 ? Date.now() + Number(result.expires_seconds) * 1000 : 0
+          }
+        : null;
+      setResearchState((current) => ({
+        ...current,
+        exportMessage: exportDownload ? "" : "导出已开始下载",
+        exportDownload: exportDownload || current.exportDownload
+      }));
     } catch (error) {
       setResearchState((current) => ({ ...current, exportMessage: error.message || "导出失败" }));
     }
@@ -4596,6 +4610,7 @@ function ResearchPage({
   const loadedChatCount = state.chats?.length || 0;
   const activeResource = (state.resources || []).find((item) => getResearchResourceId(item) === String(activeResourceId)) || state.resources?.[0] || null;
   const activeChat = (state.chats || []).find((item) => getResearchChatId(item) === String(activeChatId)) || state.chats?.[0] || null;
+  const exportDownload = state.exportDownload?.kind === tab ? state.exportDownload : null;
 
   useEffect(() => {
     if (tab !== "resources") return;
@@ -4751,6 +4766,20 @@ function ResearchPage({
           </div>
         )}
         {state.exportMessage && <div className="notice">{state.exportMessage}</div>}
+        {exportDownload && (
+          <div className="research-download-notice">
+            <div>
+              <strong>导出包已就绪</strong>
+              <span>
+                {[formatBytes(exportDownload.sizeBytes), formatResearchDownloadExpiry(exportDownload.expiresAt)].filter(Boolean).join(" · ")}
+              </span>
+            </div>
+            <a className="secondary-button" download={exportDownload.filename} href={exportDownload.url} rel="noreferrer">
+              <Download size={16} />
+              <span>再次下载 {exportDownload.filename}</span>
+            </a>
+          </div>
+        )}
 
         {tab === "chats" ? (
           <ResearchChatsView
@@ -7268,6 +7297,12 @@ function getResearchErrorMessage(error) {
     return "当前账号没有 Research 访问权限，请确认已授予 research.access";
   }
   return message || "无法读取 Research 数据";
+}
+
+function formatResearchDownloadExpiry(expiresAt) {
+  const remainingMs = Number(expiresAt) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "下载链接可能已过期";
+  return `下载链接约 ${Math.max(1, Math.ceil(remainingMs / 60000))} 分钟内有效`;
 }
 
 async function saveResearchDownload(result, fallbackName) {

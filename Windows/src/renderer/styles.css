@@ -3868,6 +3868,48 @@ button:disabled {
   min-width: 108px;
 }
 
+.research-download-notice {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 9px 10px;
+}
+
+.research-download-notice > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.research-download-notice strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.research-download-notice span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.research-download-notice > .secondary-button {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  text-decoration: none;
+}
+
+.research-download-notice > .secondary-button span {
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .research-filter-row {
   display: flex;
   min-width: 0;
