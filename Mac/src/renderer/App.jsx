@@ -71,6 +71,20 @@ const CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID = "all";
 const CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID = "all_status";
 const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine", "Research"];
 const ENGINE_PASSWORD = "111111";
+const RESEARCH_PAGE_SIZE = 100;
+const RESEARCH_SIGNED_URL_CACHE_TTL_MS = 20 * 60 * 1000;
+const RESEARCH_SIGNED_URL_CACHE_MAX = 600;
+const RESEARCH_SIGNED_URL_CONCURRENCY = 8;
+const RESEARCH_RESOURCE_STATUSES = [
+  { id: "", label: "All statuses" },
+  { id: "PARSED", label: "PARSED" },
+  { id: "FALLBACK_PARSED", label: "FALLBACK_PARSED" },
+  { id: "PARTIAL_PARSED", label: "PARTIAL_PARSED" },
+  { id: "FAILED", label: "FAILED" }
+];
+const researchSignedUrlCache = new Map();
+const researchSignedUrlQueue = [];
+let researchSignedUrlActiveCount = 0;
 const DEFAULT_AUTOMATION_OPTIONS = {
   autoUpload: true,
   autoBackup: true,
@@ -107,8 +121,6 @@ const CLOUD_SPACES = [
   { id: "repository", label: "DL Repository" },
   { id: "rawdata", label: "DL Rawdata" }
 ];
-const RESEARCH_PARSE_STATUSES = ["PARSED", "FALLBACK_PARSED", "PARTIAL_PARSED"];
-const RESEARCH_PAGE_SIZE = 200;
 const ENGINE_HEALTH_RETRY_MS = 3000;
 const ENGINE_INDEX_QUERY = "*";
 const ENGINE_INDEX_HITS = 100;
@@ -301,6 +313,15 @@ function resolveInferaUrl(value) {
     return rawPath;
   }
 
+  if (/^\/?admin\//i.test(rawPath)) {
+    try {
+      const apiUrl = new URL(INFERA_API_BASE_URL);
+      return new URL(rawPath.replace(/^\/+/, ""), `${apiUrl.origin}/`).toString();
+    } catch {
+      return rawPath;
+    }
+  }
+
   const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
   const normalizedPath = rawPath.replace(/^\/+/, "");
   try {
@@ -310,27 +331,13 @@ function resolveInferaUrl(value) {
   }
 }
 
-function resolveInferaAdminUrl(value) {
-  if (!value) return "";
-  const rawPath = String(value);
-  if (/^https?:\/\//i.test(rawPath)) {
-    return rawPath;
-  }
-
-  try {
-    const apiUrl = new URL(INFERA_API_BASE_URL);
-    return new URL(rawPath.replace(/^\/+/, ""), `${apiUrl.origin}/`).toString();
-  } catch {
-    return rawPath;
-  }
-}
-
-async function requestInfera(path, { method = "GET", token, body, signal } = {}) {
+async function requestInfera(path, { accept, method = "GET", token, body, responseType = "json", signal } = {}) {
   if (typeof dlEditor.requestInfera === "function") {
-    return unwrapInferaResult(await dlEditor.requestInfera({ path, method, token, body }));
+    const result = await dlEditor.requestInfera({ accept, path, method, token, body, responseType });
+    return responseType === "download" ? result : unwrapInferaResult(result);
   }
 
-  const headers = { Accept: "application/json" };
+  const headers = { Accept: accept || (responseType === "download" ? "application/json, application/zip" : "application/json") };
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
@@ -342,8 +349,46 @@ async function requestInfera(path, { method = "GET", token, body, signal } = {})
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    redirect: responseType === "redirect" ? "manual" : "follow",
     signal
   });
+
+  if (responseType === "redirect") {
+    const location = response.headers.get("location");
+    if (location) {
+      return { url: new URL(location, resolveInferaUrl(path)).toString() };
+    }
+    if (response.redirected || response.url) {
+      return { url: response.url };
+    }
+    if (!response.ok) {
+      throw new Error(`请求失败 (${response.status})`);
+    }
+    return { url: resolveInferaUrl(path) };
+  }
+
+  if (responseType === "download") {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const payload = await response.json();
+      if (!response.ok) {
+        const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return payload;
+    }
+    const blob = await response.blob();
+    if (!response.ok) {
+      throw new Error(`请求失败 (${response.status})`);
+    }
+    return {
+      blob,
+      content_type: contentType || "application/zip",
+      delivery: "direct",
+      filename: getResearchDownloadFilename(response.headers.get("content-disposition")),
+      size_bytes: blob.size
+    };
+  }
 
   let payload = null;
   try {
@@ -462,91 +507,6 @@ function mergeEngineQaResponse(currentResponse, patch) {
 
 function nonEmptyEngineAnswer(value) {
   return typeof value === "string" && value.trim() ? value : "";
-}
-
-async function requestResearchAdmin(path, { method = "GET", body, form, responseType = "json" } = {}) {
-  if (typeof dlEditor.requestInfera === "function") {
-    return dlEditor.requestInfera({
-      admin: true,
-      body,
-      form,
-      method,
-      path,
-      redirect: responseType === "text" ? "manual" : undefined,
-      responseType
-    });
-  }
-
-  const headers = { Accept: responseType === "download" ? "application/json, application/zip" : "application/json" };
-  const options = {
-    credentials: "include",
-    method,
-    headers
-  };
-  if (form !== undefined) {
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-    options.body = new URLSearchParams(form).toString();
-  } else if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(resolveInferaAdminUrl(path), options);
-  if (responseType === "text") {
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(text || `请求失败 (${response.status})`);
-    }
-    return { status: response.status, text };
-  }
-
-  if (responseType === "download") {
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      const payload = await response.json();
-      if (!response.ok) {
-        const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
-        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-      }
-      return payload;
-    }
-    const blob = await response.blob();
-    if (!response.ok) {
-      throw new Error(`请求失败 (${response.status})`);
-    }
-    return {
-      blob,
-      content_type: contentType || "application/zip",
-      delivery: "direct",
-      filename: getResearchDownloadFilename(response.headers.get("content-disposition")),
-      size_bytes: blob.size
-    };
-  }
-
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch {
-    payload = null;
-  }
-  if (!response.ok) {
-    const detail = payload?.message || payload?.detail || `请求失败 (${response.status})`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-  }
-  return payload;
-}
-
-function getResearchDownloadFilename(disposition, fallback = "research-videos.zip") {
-  const text = String(disposition || "");
-  const utf8Match = text.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8Match) {
-    try {
-      return decodeURIComponent(utf8Match[1]);
-    } catch {
-      return utf8Match[1];
-    }
-  }
-  return text.match(/filename="?([^";]+)"?/i)?.[1] || fallback;
 }
 
 function normalizeAuthPayload(result, fallbackAccountName = "") {
@@ -690,6 +650,20 @@ function getCloudRepositoryDateRange(dateKey) {
   };
 }
 
+function parseLocalDateBoundary(dateKey, endOfDay = false) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return NaN;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = endOfDay
+    ? new Date(year, month - 1, day, 23, 59, 59, 999)
+    : new Date(year, month - 1, day, 0, 0, 0, 0);
+  return date.getTime();
+}
+
 function getLocalDateKey(date = new Date()) {
   return [
     date.getFullYear(),
@@ -734,6 +708,292 @@ async function deleteRawDataArchive(token, item) {
   });
 }
 
+function buildResearchPath(path, params = {}) {
+  const query = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      query.set(key, String(value));
+    }
+  });
+  return `/admin/research${path}${query.toString() ? `?${query.toString()}` : ""}`;
+}
+
+function getResearchDateRangeParams(filters = {}) {
+  const params = {};
+  if (filters.from) {
+    const start = parseLocalDateBoundary(filters.from, false);
+    if (Number.isFinite(start)) {
+      params.start_ms = start;
+      params.date_start_ms = start;
+    }
+  }
+  if (filters.to) {
+    const end = parseLocalDateBoundary(filters.to, true);
+    if (Number.isFinite(end)) {
+      params.end_ms = end;
+      params.date_end_ms = end;
+    }
+  }
+  return params;
+}
+
+function getResearchListParams(filters = {}, options = {}) {
+  const dateParams = getResearchDateRangeParams(filters);
+  return {
+    limit: options.limit || RESEARCH_PAGE_SIZE,
+    offset: options.offset || 0,
+    user_id: filters.userId || "",
+    parse_status: options.includeStatus ? filters.status || "" : "",
+    start_ms: dateParams.start_ms,
+    end_ms: dateParams.end_ms,
+    date_start_ms: dateParams.date_start_ms,
+    date_end_ms: dateParams.date_end_ms
+  };
+}
+
+async function fetchResearchUsers(token) {
+  return requestInfera(buildResearchPath("/users"), { token });
+}
+
+async function fetchResearchResources(token, filters, options = {}) {
+  const params = getResearchListParams(filters, { includeStatus: true, limit: options.limit, offset: options.offset });
+  delete params.start_ms;
+  delete params.end_ms;
+  return requestInfera(buildResearchPath("/assets/videos", params), { token });
+}
+
+async function fetchResearchChats(token, filters, options = {}) {
+  const params = getResearchListParams(filters, { limit: options.limit, offset: options.offset });
+  delete params.parse_status;
+  delete params.date_start_ms;
+  delete params.date_end_ms;
+  return requestInfera(buildResearchPath("/chats", params), { token });
+}
+
+async function fetchResearchStatistics(token) {
+  return requestInfera(buildResearchPath("/upload-duration-stats", { timezone: "Asia/Shanghai" }), { token });
+}
+
+async function exportResearchResources(token, payload) {
+  return requestInfera(buildResearchPath("/assets/videos/export"), {
+    method: "POST",
+    token,
+    body: payload,
+    responseType: "download"
+  });
+}
+
+async function exportResearchChats(token, payload) {
+  return requestInfera(buildResearchPath("/chats/export"), {
+    method: "POST",
+    token,
+    body: payload,
+    responseType: "download"
+  });
+}
+
+function getResearchDownloadFilename(disposition, fallback = "research-export.zip") {
+  const text = String(disposition || "");
+  const utf8Match = text.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  return text.match(/filename="?([^";]+)"?/i)?.[1] || fallback;
+}
+
+async function resolveResearchSignedUrl(token, path) {
+  if (!path) return "";
+  const cacheKey = `${String(token || "").slice(-18)}:${path}`;
+  const cached = researchSignedUrlCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.promise || cached.url || "";
+  }
+
+  const promise = enqueueResearchSignedUrlRequest(async () => {
+    const result = await requestInfera(path, { token, responseType: "redirect" });
+    return result?.url || "";
+  })
+    .then((url) => {
+      researchSignedUrlCache.set(cacheKey, {
+        expiresAt: Date.now() + RESEARCH_SIGNED_URL_CACHE_TTL_MS,
+        url
+      });
+      trimResearchSignedUrlCache();
+      return url;
+    })
+    .catch((error) => {
+      researchSignedUrlCache.delete(cacheKey);
+      throw error;
+    });
+
+  researchSignedUrlCache.set(cacheKey, {
+    expiresAt: Date.now() + RESEARCH_SIGNED_URL_CACHE_TTL_MS,
+    promise
+  });
+  trimResearchSignedUrlCache();
+  return promise;
+}
+
+function enqueueResearchSignedUrlRequest(run) {
+  return new Promise((resolve, reject) => {
+    researchSignedUrlQueue.push({ reject, resolve, run });
+    pumpResearchSignedUrlQueue();
+  });
+}
+
+function pumpResearchSignedUrlQueue() {
+  while (researchSignedUrlActiveCount < RESEARCH_SIGNED_URL_CONCURRENCY && researchSignedUrlQueue.length > 0) {
+    const task = researchSignedUrlQueue.shift();
+    researchSignedUrlActiveCount += 1;
+    Promise.resolve()
+      .then(task.run)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        researchSignedUrlActiveCount = Math.max(0, researchSignedUrlActiveCount - 1);
+        pumpResearchSignedUrlQueue();
+      });
+  }
+}
+
+function trimResearchSignedUrlCache() {
+  if (researchSignedUrlCache.size <= RESEARCH_SIGNED_URL_CACHE_MAX) return;
+  const overflow = researchSignedUrlCache.size - RESEARCH_SIGNED_URL_CACHE_MAX;
+  let removed = 0;
+  for (const key of researchSignedUrlCache.keys()) {
+    researchSignedUrlCache.delete(key);
+    removed += 1;
+    if (removed >= overflow) break;
+  }
+}
+
+function useResearchLazyLoad(rootMargin = "360px") {
+  const ref = useRef(null);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (visible) return undefined;
+    const element = ref.current;
+    if (!element) return undefined;
+    if (typeof IntersectionObserver !== "function") {
+      setVisible(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin }
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [rootMargin, visible]);
+
+  return [ref, visible];
+}
+
+async function fetchResearchParsedData(token, path) {
+  if (!path) return null;
+  return requestInfera(path, { token });
+}
+
+function getResearchResourceId(item) {
+  return String(item?.asset_id || item?.id || "");
+}
+
+function getResearchChatId(item) {
+  return String(item?.session_id || item?.id || "");
+}
+
+function getResearchItemTimestamp(item) {
+  return Number(item?.timestamp_ms || item?.start_timestamp_ms || item?.["captured_at_ms"] || item?.created_at_ms || 0) || 0;
+}
+
+function isResearchAudio(item) {
+  const type = String(item?.asset_type || item?.media_type || item?.mime || "").toLowerCase();
+  return type.includes("audio");
+}
+
+function groupResearchResources(items) {
+  const groups = new Map();
+  for (const item of items || []) {
+    const timestampMs = getResearchItemTimestamp(item);
+    const fallbackDate = timestampMs ? getLocalDateKey(new Date(timestampMs)) : "unknown";
+    const key = item.captured_date_key || fallbackDate;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        dateKey: key,
+        dateLabel: item.captured_date_label || (key === "unknown" ? "Unknown date" : key),
+        items: []
+      });
+    }
+    groups.get(key).items.push(item);
+  }
+  return Array.from(groups.values()).sort((left, right) => String(right.dateKey).localeCompare(String(left.dateKey)));
+}
+
+function getResearchFeedbackMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : []).filter((message) => message.feedback_rating || message.feedback_text);
+}
+
+function normalizeResearchFeedbackRating(value) {
+  const rating = String(value || "").toLowerCase();
+  if (rating === "up" || rating === "like" || rating === "thumbs_up") return "like";
+  if (rating === "down" || rating === "dislike" || rating === "thumbs_down") return "dislike";
+  return rating;
+}
+
+function formatResearchDateTime(value) {
+  const timestamp = Number(value || 0);
+  if (!timestamp) return "";
+  return formatRepositoryDate(timestamp);
+}
+
+function formatResearchShortTime(value) {
+  const timestamp = Number(value || 0);
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function formatResearchLongDuration(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}
+
+function formatResearchNumber(value) {
+  return new Intl.NumberFormat().format(Number(value) || 0);
+}
+
+function getRecentResearchDateKeys(days = 7) {
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - index);
+    return getLocalDateKey(date);
+  });
+}
+
+function shortResearchDateKey(value) {
+  const parts = String(value || "").split("-");
+  return parts.length === 3 ? `${parts[1]}-${parts[2]}` : value;
+}
+
+function getResearchUserLabel(user) {
+  return user?.label || user?.nickname || user?.name || `User ${user?.user_id || user?.id || "-"}`;
+}
+
 function App() {
   const [jobs, setJobs] = useState([]);
   const [fpsPreset, setFpsPreset] = useState(2);
@@ -763,9 +1023,6 @@ function App() {
   const [engineUnlocked, setEngineUnlocked] = useState(false);
   const [enginePassword, setEnginePassword] = useState("");
   const [engineError, setEngineError] = useState("");
-  const [researchUnlocked, setResearchUnlocked] = useState(false);
-  const [researchPassword, setResearchPassword] = useState("");
-  const [researchError, setResearchError] = useState("");
   const [authState, setAuthState] = useState(readStoredAuth);
   const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
@@ -809,6 +1066,28 @@ function App() {
     nextCursor: null,
     nextOffset: 0,
     message: ""
+  });
+  const [researchTab, setResearchTab] = useState("resources");
+  const [researchFilters, setResearchFilters] = useState({
+    from: "",
+    status: "",
+    to: "",
+    userId: ""
+  });
+  const [researchState, setResearchState] = useState({
+    status: "idle",
+    users: [],
+    resources: [],
+    resourcesTotal: 0,
+    videoCount: 0,
+    audioCount: 0,
+    chats: [],
+    chatsTotal: 0,
+    statistics: null,
+    selectedResourceIds: [],
+    selectedChatIds: [],
+    message: "",
+    exportMessage: ""
   });
   const [startTimeEditor, setStartTimeEditor] = useState(null);
   const [showAppInfo, setShowAppInfo] = useState(false);
@@ -977,6 +1256,27 @@ function App() {
 
     loadCloudRepository(authState, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
   }, [activeNav, authState?.token, cloudRepositoryDateKey, cloudRepositoryStatusFilterId, cloudSpaceId]);
+
+  useEffect(() => {
+    if (activeNav !== "Research") {
+      return;
+    }
+
+    if (!authState?.token) {
+      setResearchState((current) => ({
+        ...current,
+        status: "auth",
+        resources: [],
+        resourcesTotal: 0,
+        chats: [],
+        chatsTotal: 0,
+        message: "请先登录后查看 Research"
+      }));
+      return;
+    }
+
+    loadResearchData(researchTab, authState, researchFilters);
+  }, [activeNav, authState?.token, researchFilters.from, researchFilters.status, researchFilters.to, researchFilters.userId, researchTab]);
 
   useEffect(() => {
     if (!hasProcessingJobs && !isUploadActive(uploadState) && !transferQueue.some((item) => item.status === "uploading")) {
@@ -2004,6 +2304,8 @@ function App() {
 
       if (activeNav === "Cloud") {
         loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
+      } else if (activeNav === "Research") {
+        loadResearchData(researchTab, nextAuth, researchFilters);
       }
     } catch (error) {
       setLoginStatus({
@@ -2029,6 +2331,175 @@ function App() {
       nextOffset: 0,
       message: "请先登录后查看 Cloud repository"
     });
+  }
+
+  async function loadResearchData(tabOverride = researchTab, authOverride = authState, filtersOverride = researchFilters, options = {}) {
+    const token = authOverride?.token;
+    const append = Boolean(options.append);
+    const offset = Number(options.offset || 0);
+    if (!token) {
+      setResearchState((current) => ({
+        ...current,
+        status: "auth",
+        message: "请先登录后查看 Research"
+      }));
+      return;
+    }
+
+    setResearchState((current) => ({ ...current, status: append ? "ready" : "loading", message: "", exportMessage: "" }));
+    try {
+      const usersPromise = fetchResearchUsers(token);
+      if (tabOverride === "chats") {
+        const [users, chats] = await Promise.all([usersPromise, fetchResearchChats(token, filtersOverride, { offset })]);
+        const chatItems = normalizeResearchItems(chats);
+        setResearchState((current) => ({
+          ...current,
+          status: "ready",
+          users: normalizeResearchItems(users),
+          chats: append ? [...current.chats, ...chatItems] : chatItems,
+          chatsTotal: Number(chats?.total) || chatItems.length,
+          selectedChatIds: append
+            ? current.selectedChatIds
+            : current.selectedChatIds.filter((id) => chatItems.some((item) => getResearchChatId(item) === String(id))),
+          message: ""
+        }));
+      } else if (tabOverride === "statistics") {
+        const [users, statistics] = await Promise.all([usersPromise, fetchResearchStatistics(token)]);
+        setResearchState((current) => ({
+          ...current,
+          status: "ready",
+          users: normalizeResearchItems(users),
+          statistics,
+          message: ""
+        }));
+      } else {
+        const [users, resources] = await Promise.all([usersPromise, fetchResearchResources(token, filtersOverride, { offset })]);
+        const resourceItems = normalizeResearchItems(resources);
+        setResearchState((current) => ({
+          ...current,
+          status: "ready",
+          users: normalizeResearchItems(users),
+          resources: append ? [...current.resources, ...resourceItems] : resourceItems,
+          resourcesTotal: Number(resources?.total) || resourceItems.length,
+          videoCount: Number(resources?.video_count) || 0,
+          audioCount: Number(resources?.audio_count) || 0,
+          selectedResourceIds: append
+            ? current.selectedResourceIds
+            : current.selectedResourceIds.filter((id) => resourceItems.some((item) => getResearchResourceId(item) === String(id))),
+          message: ""
+        }));
+      }
+    } catch (error) {
+      setResearchState((current) => ({
+        ...current,
+        status: "error",
+        message: getResearchErrorMessage(error)
+      }));
+    }
+  }
+
+  function loadMoreResearchResources() {
+    return loadResearchData("resources", authState, researchFilters, {
+      append: true,
+      offset: researchState.resources.length
+    });
+  }
+
+  function loadMoreResearchChats() {
+    return loadResearchData("chats", authState, researchFilters, {
+      append: true,
+      offset: researchState.chats.length
+    });
+  }
+
+  function updateResearchFilter(patch) {
+    setResearchFilters((current) => ({ ...current, ...patch }));
+  }
+
+  function toggleResearchResource(id) {
+    setResearchState((current) => ({ ...current, selectedResourceIds: toggleId(current.selectedResourceIds, id) }));
+  }
+
+  function toggleResearchChat(id) {
+    setResearchState((current) => ({ ...current, selectedChatIds: toggleId(current.selectedChatIds, id) }));
+  }
+
+  function selectLoadedResearchResources() {
+    setResearchState((current) => ({
+      ...current,
+      selectedResourceIds: current.resources.map(getResearchResourceId).filter(Boolean)
+    }));
+  }
+
+  function selectLoadedResearchChats() {
+    setResearchState((current) => ({
+      ...current,
+      selectedChatIds: current.chats.map(getResearchChatId).filter(Boolean)
+    }));
+  }
+
+  async function exportSelectedResearchResources() {
+    await exportResearchArchive("resources", false);
+  }
+
+  async function exportFilteredResearchResources() {
+    await exportResearchArchive("resources", true);
+  }
+
+  async function exportSelectedResearchChats() {
+    await exportResearchArchive("chats", false);
+  }
+
+  async function exportFilteredResearchChats() {
+    await exportResearchArchive("chats", true);
+  }
+
+  async function exportResearchArchive(kind, selectAll) {
+    const token = authStateRef.current?.token;
+    if (!token) {
+      setShowLogin(true);
+      return;
+    }
+
+    const selectedIds = kind === "chats" ? researchState.selectedChatIds : researchState.selectedResourceIds;
+    if (!selectAll && selectedIds.length === 0) {
+      setResearchState((current) => ({ ...current, exportMessage: kind === "chats" ? "请选择要导出的 chat" : "请选择要导出的资源" }));
+      return;
+    }
+
+    const dateParams = getResearchDateRangeParams(researchFilters);
+    const commonPayload = {
+      select_all: Boolean(selectAll),
+      user_id: researchFilters.userId ? Number(researchFilters.userId) : null
+    };
+    setResearchState((current) => ({ ...current, exportMessage: "正在打包导出..." }));
+    try {
+      const result =
+        kind === "chats"
+          ? await exportResearchChats(token, {
+              ...commonPayload,
+              session_ids: selectAll ? [] : selectedIds.map(Number),
+              max_sessions: 500,
+              start_ms: dateParams.start_ms,
+              end_ms: dateParams.end_ms,
+              include_evidences: true
+            })
+          : await exportResearchResources(token, {
+              ...commonPayload,
+              asset_ids: selectAll ? [] : selectedIds.map(Number),
+              delivery: "direct",
+              max_assets: 500,
+              parse_status: researchFilters.status || null,
+              date_start_ms: dateParams.date_start_ms,
+              date_end_ms: dateParams.date_end_ms,
+              include_metadata: true,
+              include_parsed_data: true
+            });
+      await saveResearchDownload(result, kind === "chats" ? "research-chats.zip" : "research-videos.zip");
+      setResearchState((current) => ({ ...current, exportMessage: "导出已开始下载" }));
+    } catch (error) {
+      setResearchState((current) => ({ ...current, exportMessage: error.message || "导出失败" }));
+    }
   }
 
   async function loadCloudRepository(
@@ -2164,17 +2635,6 @@ function App() {
     setEngineUnlocked(false);
     setEnginePassword("");
     setEngineError("");
-  }
-
-  function unlockResearch() {
-    if (researchPassword === ENGINE_PASSWORD) {
-      setResearchUnlocked(true);
-      setResearchPassword("");
-      setResearchError("");
-      return;
-    }
-
-    setResearchError("密码错误");
   }
 
   return (
@@ -2456,21 +2916,26 @@ function App() {
           />
         )
       ) : activeNav === "Research" ? (
-        researchUnlocked ? (
-          <ResearchExportWorkspace />
-        ) : (
-          <EngineGate
-            error={researchError}
-            label="Research"
-            onChange={(value) => {
-              setResearchPassword(value);
-              setResearchError("");
-            }}
-            onSubmit={unlockResearch}
-            title="DL Research"
-            value={researchPassword}
-          />
-        )
+        <ResearchPage
+          authState={authState}
+          filters={researchFilters}
+          onExportFilteredChats={exportFilteredResearchChats}
+          onExportFilteredResources={exportFilteredResearchResources}
+          onExportSelectedChats={exportSelectedResearchChats}
+          onExportSelectedResources={exportSelectedResearchResources}
+          onFilterChange={updateResearchFilter}
+          onLogin={() => setShowLogin(true)}
+          onLoadMoreChats={loadMoreResearchChats}
+          onLoadMoreResources={loadMoreResearchResources}
+          onRefresh={() => loadResearchData(researchTab, authState, researchFilters)}
+          onSelectLoadedChats={selectLoadedResearchChats}
+          onSelectLoadedResources={selectLoadedResearchResources}
+          onTabChange={setResearchTab}
+          onToggleChat={toggleResearchChat}
+          onToggleResource={toggleResearchResource}
+          state={researchState}
+          tab={researchTab}
+        />
       ) : (
         <PlaceholderPage title={activeNav} />
       )}
@@ -3801,588 +4266,805 @@ function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
   );
 }
 
-function ResearchExportWorkspace() {
-  const [adminStatus, setAdminStatus] = useState("loading");
-  const [loginForm, setLoginForm] = useState({ username: "admin", password: "" });
-  const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
-  const [filters, setFilters] = useState({ userId: "", parseStatus: "" });
-  const [users, setUsers] = useState([]);
-  const [items, setItems] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [videoCount, setVideoCount] = useState(0);
-  const [audioCount, setAudioCount] = useState(0);
-  const [activeAssetId, setActiveAssetId] = useState(null);
-  const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
-  const [listState, setListState] = useState({ status: "loading", message: "" });
-  const [parsedState, setParsedState] = useState({ status: "idle", data: null, message: "" });
-  const [exportState, setExportState] = useState({ status: "idle", message: "", downloadUrl: "", filename: "" });
-  const downloadObjectUrlRef = useRef("");
-  const groups = useMemo(() => groupResearchItems(items), [items]);
-  const activeItem = useMemo(
-    () => items.find((item) => Number(item.asset_id) === Number(activeAssetId)) || null,
-    [activeAssetId, items]
-  );
-  const allLoadedSelected = items.length > 0 && items.every((item) => selectedAssetIds.has(Number(item.asset_id)));
-  const loadedCount = items.length;
-  const hasMore = total > loadedCount;
-  const canExportSelected = selectedAssetIds.size > 0 && exportState.status !== "working";
-  const canExportAll = total > 0 && exportState.status !== "working";
+function ResearchPage({
+  authState,
+  filters,
+  onExportFilteredChats,
+  onExportFilteredResources,
+  onExportSelectedChats,
+  onExportSelectedResources,
+  onFilterChange,
+  onLogin,
+  onLoadMoreChats,
+  onLoadMoreResources,
+  onRefresh,
+  onSelectLoadedChats,
+  onSelectLoadedResources,
+  onTabChange,
+  onToggleChat,
+  onToggleResource,
+  state,
+  tab
+}) {
+  const isLoading = state.status === "loading";
+  const users = state.users || [];
+  const [activeResourceId, setActiveResourceId] = useState("");
+  const [activeChatId, setActiveChatId] = useState("");
+  const selectedResourceCount = state.selectedResourceIds?.length || 0;
+  const selectedChatCount = state.selectedChatIds?.length || 0;
+  const loadedResourceCount = state.resources?.length || 0;
+  const loadedChatCount = state.chats?.length || 0;
+  const activeResource = (state.resources || []).find((item) => getResearchResourceId(item) === String(activeResourceId)) || state.resources?.[0] || null;
+  const activeChat = (state.chats || []).find((item) => getResearchChatId(item) === String(activeChatId)) || state.chats?.[0] || null;
 
   useEffect(() => {
-    refreshResearchData();
-    return () => {
-      if (downloadObjectUrlRef.current) {
-        URL.revokeObjectURL(downloadObjectUrlRef.current);
-      }
-    };
-  }, []);
+    if (tab !== "resources") return;
+    const ids = (state.resources || []).map(getResearchResourceId);
+    if (!ids.length) {
+      setActiveResourceId("");
+    } else if (!ids.includes(String(activeResourceId))) {
+      setActiveResourceId(ids[0]);
+    }
+  }, [activeResourceId, state.resources, tab]);
 
   useEffect(() => {
-    if (!activeItem) {
-      setParsedState({ status: "idle", data: null, message: "" });
-      return;
+    if (tab !== "chats") return;
+    const ids = (state.chats || []).map(getResearchChatId);
+    if (!ids.length) {
+      setActiveChatId("");
+    } else if (!ids.includes(String(activeChatId))) {
+      setActiveChatId(ids[0]);
     }
+  }, [activeChatId, state.chats, tab]);
 
-    let isCancelled = false;
-    setParsedState({ status: "loading", data: null, message: "" });
-    requestResearchAdmin(activeItem.parsed_data_url)
-      .then((data) => {
-        if (!isCancelled) {
-          setParsedState({ status: "ready", data, message: "" });
-        }
-      })
-      .catch((error) => {
-        if (isCancelled) {
-          return;
-        }
-        if (isResearchAdminAuthError(error)) {
-          setAdminStatus("auth");
-        }
-        setParsedState({ status: "error", data: null, message: getResearchAdminErrorMessage(error) || "Parsed data 加载失败" });
-      });
+  const tabs = [
+    ["resources", "Resources"],
+    ["chats", "Chats"],
+    ["statistics", "Statistics"]
+  ];
+  const title = tab === "chats" ? "Agent Chats" : tab === "statistics" ? "User Statistics" : "Research Resources";
+  const meta =
+    tab === "chats"
+      ? `${loadedChatCount}${state.chatsTotal > loadedChatCount ? ` / ${state.chatsTotal}` : ""} chats loaded · Selected ${selectedChatCount} chats`
+      : tab === "statistics"
+        ? `${state.statistics?.users?.length || 0} users counted`
+        : `${loadedResourceCount}${state.resourcesTotal > loadedResourceCount ? ` / ${state.resourcesTotal}` : ""} files loaded · Selected ${selectedResourceCount} items`;
 
-    return () => {
-      isCancelled = true;
-    };
-  }, [activeItem?.asset_id]);
-
-  function handleResearchError(error) {
-    const message = getResearchAdminErrorMessage(error);
-    if (isResearchAdminAuthError(error)) {
-      setAdminStatus("auth");
-      setListState({ status: "auth", message: "请先登录 Research Admin" });
-    } else {
-      setListState({ status: "error", message });
-    }
-  }
-
-  async function loadResearchUsers() {
-    const data = await requestResearchAdmin("/admin/research/users");
-    setUsers(data.items || []);
-  }
-
-  async function loadResearchVideos({ append = false, nextFilters = filters } = {}) {
-    const offset = append ? items.length : 0;
-    setListState({ status: append ? "loading-more" : "loading", message: "" });
-    const data = await requestResearchAdmin(getResearchListPath(nextFilters, offset));
-    const incomingItems = data.items || [];
-    const nextItems = append ? mergeResearchItems(items, incomingItems) : incomingItems;
-    setItems(nextItems);
-    setTotal(data.total || nextItems.length);
-    setVideoCount(data.video_count || 0);
-    setAudioCount(data.audio_count || 0);
-    setAdminStatus("ready");
-    setListState({ status: "ready", message: "" });
-    if (!append) {
-      setSelectedAssetIds(new Set());
-    }
-    setActiveAssetId((current) => {
-      if (current && nextItems.some((item) => Number(item.asset_id) === Number(current))) {
-        return current;
-      }
-      return nextItems[0]?.asset_id ? Number(nextItems[0].asset_id) : null;
-    });
-  }
-
-  async function refreshResearchData() {
-    setAdminStatus((current) => (current === "ready" ? current : "loading"));
-    try {
-      await loadResearchUsers();
-      await loadResearchVideos({ append: false });
-      setExportState((current) => ({ ...current, status: current.downloadUrl ? "ready" : "idle", message: "" }));
-    } catch (error) {
-      handleResearchError(error);
-    }
-  }
-
-  async function submitResearchLogin(event) {
-    event.preventDefault();
-    setLoginStatus({ status: "checking", message: "验证中" });
-    try {
-      await requestResearchAdmin("/admin/research/login", {
-        method: "POST",
-        form: loginForm,
-        responseType: "text"
-      });
-      await loadResearchUsers();
-      await loadResearchVideos({ append: false });
-      setLoginStatus({ status: "idle", message: "" });
-      setLoginForm((current) => ({ ...current, password: "" }));
-    } catch (error) {
-      setAdminStatus("auth");
-      setLoginStatus({ status: "error", message: isResearchAdminAuthError(error) ? "Research Admin 登录失败" : getResearchAdminErrorMessage(error) });
-    }
-  }
-
-  async function logoutResearchAdmin() {
-    try {
-      await requestResearchAdmin("/admin/research/logout", { method: "POST", responseType: "text" });
-    } catch {
-      // The UI should still return to the login state if server-side logout response is unavailable.
-    }
-    setAdminStatus("auth");
-    setItems([]);
-    setUsers([]);
-    setSelectedAssetIds(new Set());
-    setActiveAssetId(null);
-    setParsedState({ status: "idle", data: null, message: "" });
-    setListState({ status: "auth", message: "已退出 Research Admin" });
-  }
-
-  function changeResearchFilter(changes) {
-    const nextFilters = { ...filters, ...changes };
-    setFilters(nextFilters);
-    loadResearchVideos({ append: false, nextFilters }).catch(handleResearchError);
-  }
-
-  function selectResearchAsset(item, event) {
-    const assetId = Number(item.asset_id);
-    if (event?.metaKey || event?.ctrlKey || event?.shiftKey) {
-      toggleResearchSelection(assetId);
-      return;
-    }
-    setActiveAssetId(assetId);
-  }
-
-  function toggleResearchSelection(assetId) {
-    setSelectedAssetIds((current) => {
-      const next = new Set(current);
-      if (next.has(Number(assetId))) {
-        next.delete(Number(assetId));
-      } else {
-        next.add(Number(assetId));
-      }
-      return next;
-    });
-  }
-
-  function toggleSelectAllResearchItems() {
-    setSelectedAssetIds((current) => {
-      const next = new Set(current);
-      if (allLoadedSelected) {
-        items.forEach((item) => next.delete(Number(item.asset_id)));
-      } else {
-        items.forEach((item) => next.add(Number(item.asset_id)));
-      }
-      return next;
-    });
-  }
-
-  function setResearchDownload(url, filename, isObjectUrl = false) {
-    if (downloadObjectUrlRef.current && downloadObjectUrlRef.current !== url) {
-      URL.revokeObjectURL(downloadObjectUrlRef.current);
-      downloadObjectUrlRef.current = "";
-    }
-    if (isObjectUrl) {
-      downloadObjectUrlRef.current = url;
-    }
-    setExportState({
-      status: "ready",
-      message: `Ready - ${filename || "research-videos.zip"}`,
-      downloadUrl: url,
-      filename: filename || "research-videos.zip"
-    });
-    triggerResearchDownload(url, filename || "research-videos.zip");
-  }
-
-  async function downloadResearchExport(payload) {
-    setExportState({ status: "working", message: "Preparing...", downloadUrl: "", filename: "" });
-    const result = await requestResearchAdmin("/admin/research/assets/videos/export", {
-      method: "POST",
-      body: {
-        delivery: "oss",
-        include_metadata: true,
-        include_parsed_data: true,
-        ...payload
-      },
-      responseType: "download"
-    });
-
-    if (result.download_url) {
-      setResearchDownload(result.download_url, result.filename || "research-videos.zip");
-      setExportState((current) => ({
-        ...current,
-        message: `Ready - ${formatBytes(result.size_bytes) || "zip"} · ${Math.round(Number(result.expires_seconds || 0) / 60)}m`
-      }));
-      return;
-    }
-
-    const blob =
-      result.blob ||
-      (result.base64 ? base64ToBlob(result.base64, result.content_type || "application/zip") : null);
-    if (!blob) {
-      throw new Error("Export did not return a downloadable zip");
-    }
-    const objectUrl = URL.createObjectURL(blob);
-    setResearchDownload(objectUrl, result.filename || "research-videos.zip", true);
-  }
-
-  async function exportSelectedResearchItems() {
-    if (!selectedAssetIds.size) {
-      return;
-    }
-    try {
-      await downloadResearchExport({ asset_ids: Array.from(selectedAssetIds) });
-    } catch (error) {
-      setExportState({ status: "error", message: getResearchAdminErrorMessage(error) || "导出失败", downloadUrl: "", filename: "" });
-    }
-  }
-
-  async function exportAllResearchItems() {
-    try {
-      await downloadResearchExport({
-        max_assets: 2000,
-        parse_status: filters.parseStatus || null,
-        select_all: true,
-        user_id: filters.userId ? Number(filters.userId) : null
-      });
-    } catch (error) {
-      setExportState({ status: "error", message: getResearchAdminErrorMessage(error) || "导出失败", downloadUrl: "", filename: "" });
-    }
-  }
-
-  if (adminStatus === "auth") {
+  if (!authState?.token) {
     return (
-      <ResearchAdminLogin
-        form={loginForm}
-        loginStatus={loginStatus}
-        onChange={(changes) => setLoginForm((current) => ({ ...current, ...changes }))}
-        onSubmit={submitResearchLogin}
-      />
+      <section className="research-page">
+        <div className="research-empty">
+          <LockKeyhole size={30} />
+          <h1>Research</h1>
+          <p>使用 DL Studio 当前登录账户访问 Research 数据。</p>
+          <button className="primary-button" onClick={onLogin} type="button">
+            <UserRound size={16} />
+            <span>登录</span>
+          </button>
+        </div>
+      </section>
     );
   }
 
   return (
     <section className="research-page">
-      <header className="research-toolbar">
-        <div className="research-title-block">
-          <strong>DL Research</strong>
-          <span>
-            {loadedCount} / {total || loadedCount} files · Selected {selectedAssetIds.size}
-          </span>
-        </div>
-        <div className="research-metrics">
-          <ResearchMetric icon={<FileVideo size={15} />} label="Videos" value={videoCount} />
-          <ResearchMetric icon={<FileAudio size={15} />} label="Audio" value={audioCount} />
-        </div>
-        <div className="research-actions">
-          <button className="ghost-button" onClick={toggleSelectAllResearchItems} type="button">
-            <SquareCheck size={15} />
-            <span>{allLoadedSelected ? "Clear loaded" : "Select all"}</span>
+      <div className="research-tabs">
+        {tabs.map(([id, label]) => (
+          <button className={tab === id ? "active" : ""} key={id} onClick={() => onTabChange(id)} type="button">
+            {label}
           </button>
-          <button className="primary-button" disabled={!canExportSelected} onClick={exportSelectedResearchItems} type="button">
-            <Download size={15} />
-            <span>Export selected</span>
-          </button>
-          <button className="secondary-button" disabled={!canExportAll} onClick={exportAllResearchItems} type="button">
-            <Archive size={15} />
-            <span>Export all</span>
-          </button>
-          <button className="secondary-button research-icon-action" disabled={listState.status === "loading"} onClick={refreshResearchData} title="Refresh" type="button">
-            <RotateCcw size={15} />
-          </button>
-          <button className="ghost-button research-icon-action" onClick={logoutResearchAdmin} title="Logout" type="button">
-            <UserRound size={15} />
-          </button>
-        </div>
-        <div className="research-filter-row">
-          <label className="research-select">
-            <UserRound size={15} />
-            <select onChange={(event) => changeResearchFilter({ userId: event.target.value })} value={filters.userId}>
-              <option value="">All users</option>
-              {users.map((user) => (
-                <option key={user.user_id} value={user.user_id}>
-                  {user.label || `User ${user.user_id}`} · parsed {user.parsed_asset_count ?? 0}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="research-select">
-            <CheckCheck size={15} />
-            <select onChange={(event) => changeResearchFilter({ parseStatus: event.target.value })} value={filters.parseStatus}>
-              <option value="">All parsed statuses</option>
-              {RESEARCH_PARSE_STATUSES.map((status) => (
-                <option key={status} value={status}>
-                  {status}
-                </option>
-              ))}
-            </select>
-          </label>
-          <span className={`research-export-status ${exportState.status}`}>{exportState.message}</span>
-          {exportState.downloadUrl && (
-            <a className="research-download-link" href={exportState.downloadUrl} rel="noopener" target="_blank">
-              Download zip
-            </a>
-          )}
-        </div>
-      </header>
-
-      <div className="research-shell">
-        <main className="research-gallery">
-          {listState.status === "loading" && items.length === 0 ? (
-            <div className="research-empty">正在读取 Research videos...</div>
-          ) : listState.status === "error" ? (
-            <div className="research-alert">
-              <TriangleAlert size={16} />
-              <span>{listState.message}</span>
+        ))}
+      </div>
+      <div className="research-body">
+        <header className="research-head">
+          <div>
+            <p className="eyebrow">RESEARCH</p>
+            <h1>{title}</h1>
+            <span>
+              {tab === "chats"
+                ? `${state.chatsTotal || 0} chats · selected ${selectedChatCount}`
+                : tab === "statistics"
+                  ? `${state.statistics?.users?.length || 0} users`
+                  : `${state.resourcesTotal || 0} files · selected ${selectedResourceCount}`}
+            </span>
+          </div>
+          {tab === "resources" && (
+            <div className="research-count-chips">
+              <span>Videos <strong>{formatResearchNumber(state.videoCount)}</strong></span>
+              <span>Audio <strong>{formatResearchNumber(state.audioCount)}</strong></span>
             </div>
-          ) : groups.length === 0 ? (
-            <div className="research-empty">No matching videos</div>
+          )}
+          <button className="secondary-button research-refresh" disabled={isLoading} onClick={onRefresh} type="button">
+            <RotateCcw size={16} />
+            <span>{isLoading ? "Loading" : "Refresh"}</span>
+          </button>
+        </header>
+
+        {tab !== "statistics" && <ResearchFilters filters={filters} onChange={onFilterChange} showStatus={tab === "resources"} users={users} />}
+
+        {state.status === "error" && (
+          <div className="repository-alert">
+            <TriangleAlert size={16} />
+            <span>{state.message}</span>
+          </div>
+        )}
+        {state.exportMessage && <div className="notice">{state.exportMessage}</div>}
+
+        {tab === "chats" ? (
+          <ResearchChatsView
+            activeId={getResearchChatId(activeChat)}
+            activeItem={activeChat}
+            hasMore={loadedChatCount < Number(state.chatsTotal || 0)}
+            items={state.chats}
+            onExportFiltered={onExportFilteredChats}
+            onExportSelected={onExportSelectedChats}
+            onLoadMore={onLoadMoreChats}
+            onSelectItem={setActiveChatId}
+            onSelectLoaded={onSelectLoadedChats}
+            onToggle={onToggleChat}
+            selectedIds={state.selectedChatIds}
+          />
+        ) : tab === "statistics" ? (
+          <ResearchStatisticsView data={state.statistics} />
+        ) : (
+          <ResearchResourcesView
+            activeId={getResearchResourceId(activeResource)}
+            activeItem={activeResource}
+            hasMore={loadedResourceCount < Number(state.resourcesTotal || 0)}
+            items={state.resources}
+            onExportFiltered={onExportFilteredResources}
+            onExportSelected={onExportSelectedResources}
+            onLoadMore={onLoadMoreResources}
+            onSelectItem={setActiveResourceId}
+            onSelectLoaded={onSelectLoadedResources}
+            onToggle={onToggleResource}
+            selectedIds={state.selectedResourceIds}
+            token={authState.token}
+          />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ResearchFilters({ filters, onChange, showStatus, users }) {
+  return (
+    <div className="research-filter-row">
+      <select onChange={(event) => onChange({ userId: event.target.value })} value={filters.userId}>
+        <option value="">All users</option>
+        {users.map((user) => (
+          <option key={user.user_id || user.id} value={user.user_id || user.id}>
+            {user.label || `User ${user.user_id || user.id}`}
+          </option>
+        ))}
+      </select>
+      {showStatus && (
+        <select onChange={(event) => onChange({ status: event.target.value })} value={filters.status}>
+          {RESEARCH_RESOURCE_STATUSES.map((status) => (
+            <option key={status.id || "all"} value={status.id}>
+              {status.label}
+            </option>
+          ))}
+        </select>
+      )}
+      <label className="research-date-input">
+        <span>From</span>
+        <input onChange={(event) => onChange({ from: event.target.value })} type="date" value={filters.from} />
+      </label>
+      <label className="research-date-input">
+        <span>To</span>
+        <input onChange={(event) => onChange({ to: event.target.value })} type="date" value={filters.to} />
+      </label>
+    </div>
+  );
+}
+
+function ResearchResourcesView({
+  activeId,
+  activeItem,
+  hasMore,
+  items,
+  onExportFiltered,
+  onExportSelected,
+  onLoadMore,
+  onSelectItem,
+  onSelectLoaded,
+  onToggle,
+  selectedIds,
+  token
+}) {
+  const selected = new Set((selectedIds || []).map(String));
+  const groups = groupResearchResources(items || []);
+  return (
+    <section className="research-shell">
+      <div className="research-actions">
+        <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded</button>
+        <button className="primary-button" onClick={onExportSelected} type="button">Export selected</button>
+        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered</button>
+      </div>
+      <div className="research-workspace">
+        <div className="research-gallery">
+          {items.length === 0 ? (
+            <div className="repository-empty">No matching resources</div>
           ) : (
             <>
               {groups.map((group) => (
-                <section className="research-group" key={group.date_key}>
+                <section className="research-date-group" key={group.dateKey}>
                   <h2>
-                    {group.date_label}
-                    <span>{group.capture_count} captures</span>
+                    {group.dateLabel}
+                    <span>{group.dateKey} · {group.items.length} captures</span>
                   </h2>
-                  <div className="research-media-grid">
-                    {group.items.map((item) => (
-                      <ResearchMediaTile
-                        active={Number(activeAssetId) === Number(item.asset_id)}
-                        item={item}
-                        key={item.asset_id}
-                        onDoubleClick={() => toggleResearchSelection(item.asset_id)}
-                        onSelect={(event) => selectResearchAsset(item, event)}
-                        selected={selectedAssetIds.has(Number(item.asset_id))}
-                      />
-                    ))}
+                  <div className="research-grid">
+                    {group.items.map((item) => {
+                      const id = getResearchResourceId(item);
+                      return (
+                        <ResearchResourceTile
+                          active={String(activeId) === id}
+                          item={item}
+                          key={id}
+                          onSelect={onSelectItem}
+                          onToggle={onToggle}
+                          selected={selected.has(id)}
+                          token={token}
+                        />
+                      );
+                    })}
                   </div>
                 </section>
               ))}
               {hasMore && (
-                <button className="research-load-more" disabled={listState.status === "loading-more"} onClick={() => loadResearchVideos({ append: true }).catch(handleResearchError)} type="button">
-                  <Download size={15} />
-                  <span>{listState.status === "loading-more" ? "Fetching..." : `Show next ${Math.min(RESEARCH_PAGE_SIZE, total - loadedCount)}`}</span>
-                </button>
+                <div className="research-pager">
+                  <button className="ghost-button" onClick={onLoadMore} type="button">Show next {RESEARCH_PAGE_SIZE}</button>
+                  <span>{items.length} loaded</span>
+                </div>
               )}
             </>
           )}
-        </main>
-        <ResearchDetailPanel activeItem={activeItem} parsedState={parsedState} />
+        </div>
+        <ResearchResourceDetail item={activeItem} token={token} />
       </div>
     </section>
   );
 }
 
-function ResearchAdminLogin({ form, loginStatus, onChange, onSubmit }) {
-  const isChecking = loginStatus.status === "checking";
-  return (
-    <section className="research-login-page">
-      <form className="research-login-card" onSubmit={onSubmit}>
-        <div className="engine-gate-heading">
-          <LockKeyhole size={18} />
-          <div>
-            <strong>DL Research</strong>
-            <span>Research Admin</span>
-          </div>
-        </div>
-        <label className="login-field">
-          <span>用户名</span>
-          <div className="login-input-wrap">
-            <UserRound size={15} />
-            <input
-              autoComplete="username"
-              disabled={isChecking}
-              onChange={(event) => onChange({ username: event.target.value })}
-              placeholder="admin"
-              type="text"
-              value={form.username}
-            />
-          </div>
-        </label>
-        <label className="login-field">
-          <span>密码</span>
-          <div className="login-input-wrap">
-            <LockKeyhole size={15} />
-            <input
-              autoComplete="current-password"
-              disabled={isChecking}
-              onChange={(event) => onChange({ password: event.target.value })}
-              placeholder="输入 Research Admin 密码"
-              type="password"
-              value={form.password}
-            />
-          </div>
-        </label>
-        {loginStatus.message && <div className={`login-status ${loginStatus.status}`}>{loginStatus.message}</div>}
-        <button className="primary-button" disabled={isChecking} type="submit">
-          {isChecking ? "验证中" : "登录"}
-        </button>
-      </form>
-    </section>
-  );
-}
-
-function ResearchMetric({ icon, label, value }) {
-  return (
-    <div className="research-metric">
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function ResearchMediaTile({ active, item, onDoubleClick, onSelect, selected }) {
-  const mediaType = String(item.asset_type || item.media_type || "").toLowerCase();
-  const isAudio = mediaType === "audio" || String(item.mime || "").startsWith("audio/");
-  const thumbnailUrl = item.thumbnail_url ? resolveInferaAdminUrl(item.thumbnail_url) : "";
-  const title = item.file_name || `Asset ${item.asset_id}`;
-
+function ResearchResourceTile({ active, item, onSelect, onToggle, selected, token }) {
+  const id = getResearchResourceId(item);
+  const timestamp = getResearchItemTimestamp(item);
+  function handleClick(event) {
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+      onToggle(id);
+    } else {
+      onSelect(id);
+    }
+  }
   return (
     <article
-      className={["research-tile", active ? "active" : "", selected ? "selected" : ""].filter(Boolean).join(" ")}
-      onClick={onSelect}
-      onDoubleClick={onDoubleClick}
-      title={title}
+      className={`research-tile ${active ? "active" : ""} ${selected ? "selected" : ""}`}
+      onClick={handleClick}
+      onDoubleClick={() => onToggle(id)}
+      title={item.file_name || `Asset ${id}`}
     >
-      <div className="research-thumb">
-        {thumbnailUrl ? <img alt="" draggable="false" src={thumbnailUrl} /> : <span>{isAudio ? "Audio" : "No preview"}</span>}
-        <b>{formatDurationCompact(Number(item.duration_ms || 0)) || "-"}</b>
-        <i>{formatResearchShortTime(item.timestamp_ms)}</i>
-        <em>
-          <Play size={16} />
-        </em>
-        <strong>
-          <CheckCheck size={15} />
-        </strong>
-      </div>
-      <div className="research-tile-meta">
-        <span>{title}</span>
-        <small>{item.parse_status || "-"}</small>
-      </div>
+      <ResearchThumbnail item={item} token={token} />
+      <span className="research-tile-duration">{formatDurationCompact(Number(item.duration_ms || 0)) || "0:00"}</span>
+      <span className="research-tile-time">{formatResearchShortTime(timestamp)}</span>
+      <span className="research-tile-status">{item.parse_status || "-"}</span>
+      <span className="research-tile-check">{selected ? "✓" : ""}</span>
     </article>
   );
 }
 
-function ResearchDetailPanel({ activeItem, parsedState }) {
-  if (!activeItem) {
+function ResearchThumbnail({ item, token }) {
+  const [url, setUrl] = useState("");
+  const [containerRef, shouldLoad] = useResearchLazyLoad();
+  useEffect(() => {
+    let canceled = false;
+    setUrl("");
+    if (!shouldLoad || !item?.thumbnail_url || !token) return;
+    resolveResearchSignedUrl(token, item.thumbnail_url)
+      .then((nextUrl) => {
+        if (!canceled) setUrl(nextUrl);
+      })
+      .catch(() => {
+        if (!canceled) setUrl("");
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [item?.thumbnail_url, shouldLoad, token]);
+
+  return (
+    <div className="research-thumb" ref={containerRef}>
+      {url ? (
+        <img alt="" decoding="async" loading="lazy" src={url} />
+      ) : (
+        <div className="research-tile-placeholder">
+          {isResearchAudio(item) ? <FileAudio size={28} /> : <FileVideo size={28} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResearchResourceDetail({ item, token }) {
+  const [parsedState, setParsedState] = useState({ data: null, message: "", status: "idle" });
+
+  useEffect(() => {
+    let canceled = false;
+    if (!item?.parsed_data_url || !token) {
+      setParsedState({ data: null, message: "", status: item ? "empty" : "idle" });
+      return;
+    }
+    setParsedState({ data: null, message: "Loading", status: "loading" });
+    fetchResearchParsedData(token, item.parsed_data_url)
+      .then((data) => {
+        if (!canceled) setParsedState({ data, message: "", status: "ready" });
+      })
+      .catch((error) => {
+        if (!canceled) setParsedState({ data: null, message: error.message || "Failed", status: "error" });
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [item?.parsed_data_url, token]);
+
+  if (!item) {
     return (
       <aside className="research-detail">
-        <div className="research-detail-empty">Select a video</div>
+        <div className="research-empty compact">Select a video</div>
       </aside>
     );
   }
 
-  const mediaUrl = resolveInferaAdminUrl(activeItem.media_url || activeItem.video_url);
-  const isAudio =
-    String(activeItem.asset_type || activeItem.media_type || "").toLowerCase() === "audio" ||
-    String(activeItem.mime || "").startsWith("audio/");
-
+  const timestamp = getResearchItemTimestamp(item);
   return (
     <aside className="research-detail">
-      <section className="research-preview-panel">
-        <header>
-          <div>
-            <strong>{activeItem.file_name || `Asset ${activeItem.asset_id}`}</strong>
-            <span>
-              {activeItem.parse_status || "-"} · {formatRepositoryDate(activeItem.timestamp_ms) || "-"}
-            </span>
-          </div>
-          <span className="repository-status parsed">{activeItem.asset_type || "media"}</span>
-        </header>
-        {isAudio ? <audio controls key={mediaUrl} src={mediaUrl} /> : <video controls key={mediaUrl} src={mediaUrl} />}
-      </section>
-      <section className="research-parsed-panel">
-        <header>
-          <strong>Parsed Data</strong>
-          <span>{parsedState.status === "loading" ? "Loading" : parsedState.data?.parse_status || ""}</span>
-        </header>
-        <ResearchParsedData parsedState={parsedState} />
-      </section>
+      <header>
+        <div>
+          <h2>{item.file_name || `Asset ${getResearchResourceId(item)}`}</h2>
+          <p>{[item.parse_status, formatResearchDateTime(timestamp), formatBytes(item.size_bytes)].filter(Boolean).join(" · ")}</p>
+        </div>
+        <span>{isResearchAudio(item) ? "Audio" : "Video"}</span>
+      </header>
+      <ResearchMediaPreview item={item} token={token} />
+      <ResearchParsedPanel state={parsedState} />
     </aside>
   );
 }
 
-function ResearchParsedData({ parsedState }) {
-  if (parsedState.status === "loading") {
-    return <div className="research-parsed-empty">Loading</div>;
-  }
-  if (parsedState.status === "error") {
-    return <div className="research-parsed-empty">{parsedState.message}</div>;
-  }
-  if (!parsedState.data) {
-    return <div className="research-parsed-empty">Select a video</div>;
-  }
+function ResearchMediaPreview({ item, token }) {
+  const [mediaUrl, setMediaUrl] = useState("");
+  const path = item?.media_url || item?.video_url || "";
+  const audio = isResearchAudio(item);
 
-  const data = parsedState.data;
-  const segments = data.segments || [];
-  const chunks = data.transcript_chunks || [];
-  const keyframes = data.keyframes || [];
-  const observations = data.observations || [];
-  const events = data.events || [];
+  useEffect(() => {
+    let canceled = false;
+    setMediaUrl("");
+    if (!path || !token) return;
+    resolveResearchSignedUrl(token, path)
+      .then((nextUrl) => {
+        if (!canceled) setMediaUrl(nextUrl);
+      })
+      .catch(() => {
+        if (!canceled) setMediaUrl("");
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [path, token]);
+
+  if (!path) return <div className="research-preview-empty">No media URL</div>;
+  if (!mediaUrl) return <div className="research-preview-empty">Loading preview</div>;
+  return audio ? <audio className="research-audio" controls preload="metadata" src={mediaUrl} /> : <video className="research-video" controls preload="metadata" src={mediaUrl} />;
+}
+
+function ResearchParsedPanel({ state }) {
+  const data = state.data || {};
+  const segments = Array.isArray(data.segments) ? data.segments : [];
+  const transcript = Array.isArray(data.transcript_chunks) ? data.transcript_chunks : [];
+  const keyframes = Array.isArray(data.keyframes) ? data.keyframes : [];
+
+  if (state.status === "loading") return <div className="research-preview-empty">Loading parsed data</div>;
+  if (state.status === "error") return <div className="research-preview-empty">{state.message}</div>;
+  if (!data || (!data.summary_text && !segments.length && !transcript.length && !keyframes.length)) {
+    return <div className="research-preview-empty">No parsed data</div>;
+  }
 
   return (
-    <div className="research-parsed-content">
-      <ResearchParsedSection title="Summary">
-        <div className="research-parsed-item">{data.summary_text || "No summary"}</div>
-      </ResearchParsedSection>
-      <ResearchParsedSection title={`Segments (${segments.length})`}>
-        {segments.slice(0, 30).map((item, index) => (
-          <ResearchParsedTimelineItem key={`${item.start_ms || index}-segment`} timeMs={item.start_ms} text={item.content_text || item.title || ""} />
-        ))}
-        {segments.length === 0 && <span className="research-muted">None</span>}
-      </ResearchParsedSection>
-      <ResearchParsedSection title={`Transcript (${chunks.length})`}>
-        {chunks.slice(0, 30).map((item, index) => (
-          <ResearchParsedTimelineItem key={`${item.start_ms || index}-chunk`} timeMs={item.start_ms} text={item.content_text || item.text || ""} />
-        ))}
-        {chunks.length === 0 && <span className="research-muted">None</span>}
-      </ResearchParsedSection>
-      <ResearchParsedSection title={`Keyframes (${keyframes.length})`}>
-        {keyframes.slice(0, 20).map((item, index) => (
-          <ResearchParsedTimelineItem key={`${item.timestamp_ms || index}-keyframe`} timeMs={item.timestamp_ms} text={item.caption_text || item.ocr_text || ""} />
-        ))}
-        {keyframes.length === 0 && <span className="research-muted">None</span>}
-      </ResearchParsedSection>
-      <ResearchParsedSection title={`Signals (${observations.length + events.length})`}>
-        {[...observations.slice(0, 8), ...events.slice(0, 8)].map((item, index) => (
-          <div className="research-parsed-item" key={`${item.id || index}-signal`}>
-            {item.content_text || item.description || item.event_text || item.label || JSON.stringify(item)}
-          </div>
-        ))}
-        {observations.length + events.length === 0 && <span className="research-muted">None</span>}
-      </ResearchParsedSection>
+    <div className="research-parsed">
+      <section>
+        <h3>Summary</h3>
+        <p>{data.summary_text || "No summary"}</p>
+      </section>
+      <ResearchParsedList title={`Segments (${segments.length})`} items={segments} textKey="content_text" timeKey="start_ms" />
+      <ResearchParsedList title={`Transcript (${transcript.length})`} items={transcript} textKey="content_text" timeKey="start_ms" />
+      <ResearchParsedList title={`Keyframes (${keyframes.length})`} items={keyframes} textKey="caption_text" fallbackKey="ocr_text" timeKey="timestamp_ms" />
     </div>
   );
 }
 
-function ResearchParsedSection({ children, title }) {
+function ResearchParsedList({ fallbackKey, items, textKey, timeKey, title }) {
   return (
-    <section className="research-parsed-section">
+    <section>
       <h3>{title}</h3>
-      {children}
+      {items.length ? (
+        items.slice(0, 30).map((item, index) => (
+          <div className="research-parsed-item" key={`${title}-${index}`}>
+            <strong>{formatDurationCompact(Number(item[timeKey] || 0))}</strong>
+            <span>{item[textKey] || (fallbackKey ? item[fallbackKey] : "") || item.title || ""}</span>
+          </div>
+        ))
+      ) : (
+        <p className="muted">None</p>
+      )}
     </section>
   );
 }
 
-function ResearchParsedTimelineItem({ text, timeMs }) {
+function ResearchResources({ items, onExportFiltered, onExportSelected, onSelectLoaded, onToggle, selectedIds }) {
+  const selected = new Set((selectedIds || []).map(String));
   return (
-    <div className="research-parsed-item">
-      <strong>{formatDurationCompact(Number(timeMs || 0)) || "0s"}</strong>
-      <span>{text || "-"}</span>
+    <section className="research-panel">
+      <div className="research-actions">
+        <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded</button>
+        <button className="primary-button" onClick={onExportSelected} type="button">Export selected</button>
+        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered</button>
+      </div>
+      <div className="research-list">
+        {items.length === 0 ? (
+          <div className="repository-empty">No resources</div>
+        ) : (
+          items.map((item) => {
+            const id = String(item.asset_id || item.id);
+            return (
+              <article className="research-row" key={id}>
+                <input checked={selected.has(id)} onChange={() => onToggle(id)} type="checkbox" />
+                <FileVideo size={17} />
+                <div>
+                  <strong>{item.file_name || `Asset ${id}`}</strong>
+                  <span>{[item.media_type, item.parse_status, item.captured_at || formatRepositoryDate(item.timestamp_ms)].filter(Boolean).join(" · ")}</span>
+                  {item.summary_text && <p>{item.summary_text}</p>}
+                </div>
+                <span>{formatBytes(item.size_bytes) || "-"}</span>
+              </article>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ResearchChatsView({
+  activeId,
+  activeItem,
+  hasMore,
+  items,
+  onExportFiltered,
+  onExportSelected,
+  onLoadMore,
+  onSelectItem,
+  onSelectLoaded,
+  onToggle,
+  selectedIds
+}) {
+  const selected = new Set((selectedIds || []).map(String));
+  return (
+    <section className="research-shell">
+      <div className="research-actions">
+        <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded chats</button>
+        <button className="primary-button" onClick={onExportSelected} type="button">Export selected chats</button>
+        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered chats</button>
+      </div>
+      <div className="research-workspace chats">
+        <div className="research-chat-list">
+          {items.length === 0 ? (
+            <div className="repository-empty">No matching chat sessions</div>
+          ) : (
+            <>
+              {items.map((item) => {
+                const id = getResearchChatId(item);
+                return (
+                  <ResearchChatCard
+                    active={String(activeId) === id}
+                    item={item}
+                    key={id}
+                    onSelect={onSelectItem}
+                    onToggle={onToggle}
+                    selected={selected.has(id)}
+                  />
+                );
+              })}
+              {hasMore && (
+                <div className="research-pager">
+                  <button className="ghost-button" onClick={onLoadMore} type="button">Show next {RESEARCH_PAGE_SIZE}</button>
+                  <span>{items.length} loaded</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        <ResearchChatDetail item={activeItem} />
+      </div>
+    </section>
+  );
+}
+
+function ResearchChatCard({ active, item, onSelect, onToggle, selected }) {
+  const id = getResearchChatId(item);
+  const feedback = getResearchFeedbackMessages(item.messages || []);
+  const dislikeCount = feedback.filter((message) => normalizeResearchFeedbackRating(message.feedback_rating) === "dislike").length;
+
+  function handleClick(event) {
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+      onToggle(id);
+    } else {
+      onSelect(id);
+    }
+  }
+
+  return (
+    <article className={`research-chat-card ${active ? "active" : ""} ${selected ? "selected" : ""}`} onClick={handleClick} onDoubleClick={() => onToggle(id)}>
+      <input
+        checked={selected}
+        onChange={() => onToggle(id)}
+        onClick={(event) => event.stopPropagation()}
+        type="checkbox"
+      />
+      <div>
+        <strong>{item.title || item.latest_question || item.session_code || `Session ${id}`}</strong>
+        <span>{[`User ${item.user_id || "-"}`, `${item.message_count || 0} messages`, formatResearchDateTime(item.update_time || item.created_at_ms)].filter(Boolean).join(" · ")}</span>
+        <p>{item.latest_question || item.latest_answer || ""}</p>
+        <ResearchFeedbackPreview messages={item.messages || []} />
+      </div>
+      {feedback.length > 0 && (
+        <span className={`research-feedback-badge ${dislikeCount ? "dislike" : "like"}`}>
+          {dislikeCount ? `${dislikeCount} dislikes` : `${feedback.length} feedback`}
+        </span>
+      )}
+    </article>
+  );
+}
+
+function ResearchChats({ items, onExportFiltered, onExportSelected, onSelectLoaded, onToggle, selectedIds }) {
+  const selected = new Set((selectedIds || []).map(String));
+  return (
+    <section className="research-panel">
+      <div className="research-actions">
+        <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded chats</button>
+        <button className="primary-button" onClick={onExportSelected} type="button">Export selected chats</button>
+        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered chats</button>
+      </div>
+      <div className="research-list">
+        {items.length === 0 ? (
+          <div className="repository-empty">No chats</div>
+        ) : (
+          items.map((item) => {
+            const id = String(item.session_id || item.id);
+            return (
+              <article className="research-chat-row" key={id}>
+                <input checked={selected.has(id)} onChange={() => onToggle(id)} type="checkbox" />
+                <div>
+                  <strong>{item.title || item.session_code || `Session ${id}`}</strong>
+                  <span>{[`User ${item.user_id || "-"}`, `${item.message_count || 0} messages`, formatRepositoryDate(item.update_time)].filter(Boolean).join(" · ")}</span>
+                  <p>{item.latest_question || item.latest_answer || ""}</p>
+                  <ResearchFeedbackPreview messages={item.messages || []} />
+                </div>
+              </article>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ResearchFeedbackPreview({ messages }) {
+  const feedback = getResearchFeedbackMessages(messages);
+  if (!feedback.length) return null;
+  return (
+    <div className="research-feedback">
+      {feedback.slice(0, 3).map((message) => (
+        <span key={message.message_id || message.id}>
+          {normalizeResearchFeedbackRating(message.feedback_rating) === "like" ? "Like" : "Dislike"}{message.feedback_text ? `: ${message.feedback_text}` : ""}
+        </span>
+      ))}
     </div>
+  );
+}
+
+function ResearchChatDetail({ item }) {
+  if (!item) {
+    return (
+      <aside className="research-detail chat-detail">
+        <div className="research-empty compact">Select a chat session</div>
+      </aside>
+    );
+  }
+
+  const messages = Array.isArray(item.messages) ? item.messages : [];
+  return (
+    <aside className="research-detail chat-detail">
+      <header>
+        <div>
+          <h2>{item.title || item.latest_question || item.session_code || `Session ${getResearchChatId(item)}`}</h2>
+          <p>{[`User ${item.user_id || "-"}`, `${item.message_count || messages.length} messages`].join(" · ")}</p>
+        </div>
+      </header>
+      <div className="research-chat-messages">
+        {messages.length ? (
+          messages.map((message) => <ResearchChatMessage key={message.message_id || message.id || `${message.role}-${message.create_time}`} message={message} />)
+        ) : (
+          <div className="research-preview-empty">No messages</div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function ResearchChatMessage({ message }) {
+  const role = String(message.role || "message").toLowerCase();
+  const feedbackRating = normalizeResearchFeedbackRating(message.feedback_rating);
+  const evidenceCount = Array.isArray(message.evidences) ? message.evidences.length : 0;
+  return (
+    <article className={`research-chat-message ${role}`}>
+      <div className="research-chat-message-meta">
+        <strong>{role}</strong>
+        <span>{formatResearchDateTime(message.create_time)}</span>
+        {message.message_group && <span>{message.message_group}</span>}
+        {evidenceCount > 0 && <span>{evidenceCount} evidences</span>}
+      </div>
+      <p>{message.content || ""}</p>
+      {feedbackRating && (
+        <div className={`research-chat-feedback ${feedbackRating}`}>
+          <strong>Feedback: {feedbackRating === "like" ? "Like" : "Dislike"}</strong>
+          {message.feedback_text && <span>{message.feedback_text}</span>}
+          {message.feedback_at && <small>{formatResearchDateTime(message.feedback_at)}</small>}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function ResearchStatisticsView({ data }) {
+  const [detailUserId, setDetailUserId] = useState("");
+  const [detailPage, setDetailPage] = useState(0);
+  const users = Array.isArray(data?.users)
+    ? [...data.users].sort((a, b) => Number(b.duration_ms ?? b.durationMs ?? 0) - Number(a.duration_ms ?? a.durationMs ?? 0))
+    : [];
+  const recentDates = getRecentResearchDateKeys(7);
+  const totalDuration = users.reduce((sum, item) => sum + (Number(item.duration_ms ?? item.durationMs ?? 0) || 0), 0);
+  const activeUser = users.find((user) => String(user.user_id ?? user.userId) === String(detailUserId));
+
+  return (
+    <section className="research-statistics-view">
+      <div className="research-stat-cards">
+        <div><span>Users</span><strong>{formatResearchNumber(users.length)}</strong></div>
+        <div><span>Total duration</span><strong>{formatResearchLongDuration(totalDuration)}</strong></div>
+        <div><span>Timezone</span><strong>{data?.timezone || "Asia/Shanghai"}</strong></div>
+      </div>
+      <div className="research-table-wrap">
+        {users.length === 0 ? (
+          <div className="repository-empty">No statistics</div>
+        ) : (
+          <table className="research-stats-table">
+            <thead>
+              <tr>
+                <th>User ID</th>
+                <th>Nickname</th>
+                <th>Total duration</th>
+                <th>Agent chats</th>
+                {recentDates.map((dateKey) => <th key={dateKey}>{shortResearchDateKey(dateKey)}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) => {
+                const daily = new Map((Array.isArray(user.daily) ? user.daily : []).map((item) => [item.date, item]));
+                return (
+                  <tr key={user.user_id ?? user.userId} onClick={() => { setDetailUserId(String(user.user_id ?? user.userId)); setDetailPage(0); }}>
+                    <td>{user.user_id ?? user.userId}</td>
+                    <td>{user.nickname || ""}</td>
+                    <td>{formatResearchLongDuration(user.duration_ms ?? user.durationMs)}</td>
+                    <td>{formatResearchNumber(user.chat_count ?? user.chatCount)}</td>
+                    {recentDates.map((dateKey) => {
+                      const item = daily.get(dateKey);
+                      return <td key={dateKey}>{formatResearchLongDuration(item?.duration_ms ?? item?.durationMs)}</td>;
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {activeUser && (
+        <ResearchStatisticsModal
+          onClose={() => setDetailUserId("")}
+          onPageChange={setDetailPage}
+          page={detailPage}
+          user={activeUser}
+        />
+      )}
+    </section>
+  );
+}
+
+function ResearchStatisticsModal({ onClose, onPageChange, page, user }) {
+  const pageSize = 20;
+  const daily = (Array.isArray(user.daily) ? user.daily : [])
+    .map((item) => ({
+      chatCount: Number(item.chat_count ?? item.chatCount ?? 0) || 0,
+      date: String(item.date || ""),
+      durationMs: Number(item.duration_ms ?? item.durationMs ?? 0) || 0
+    }))
+    .filter((item) => item.date && (item.durationMs > 0 || item.chatCount > 0))
+    .sort((left, right) => right.date.localeCompare(left.date));
+  const totalPages = Math.max(1, Math.ceil(daily.length / pageSize));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const rows = daily.slice(safePage * pageSize, safePage * pageSize + pageSize);
+
+  return (
+    <div className="research-modal" onClick={onClose}>
+      <div className="research-modal-panel" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <h2>{user.nickname || `User ${user.user_id ?? user.userId}`} daily duration</h2>
+          <button className="ghost-button" onClick={onClose} type="button">Close</button>
+        </header>
+        {rows.length ? (
+          <table className="research-stats-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Duration</th>
+                <th>Agent chats</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((item) => (
+                <tr key={item.date}>
+                  <td>{item.date}</td>
+                  <td>{formatResearchLongDuration(item.durationMs)}</td>
+                  <td>{formatResearchNumber(item.chatCount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div className="research-preview-empty">No daily duration data</div>
+        )}
+        <footer>
+          <button className="ghost-button" disabled={safePage <= 0} onClick={() => onPageChange(safePage - 1)} type="button">Previous</button>
+          <span>Page {safePage + 1} / {totalPages}</span>
+          <button className="ghost-button" disabled={safePage >= totalPages - 1} onClick={() => onPageChange(safePage + 1)} type="button">Next</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ResearchStatistics({ data }) {
+  const users = Array.isArray(data?.users) ? [...data.users].sort((a, b) => Number(b.duration_ms || 0) - Number(a.duration_ms || 0)) : [];
+  return (
+    <section className="research-panel">
+      <div className="research-list">
+        {users.length === 0 ? (
+          <div className="repository-empty">No statistics</div>
+        ) : (
+          users.map((user) => (
+            <article className="research-stat-row" key={user.user_id}>
+              <div>
+                <strong>{user.nickname || `User ${user.user_id}`}</strong>
+                <span>{user.asset_count || 0} assets · {formatDurationCompact(Number(user.duration_ms || 0)) || "0:00"}</span>
+              </div>
+              <div className="research-stat-days">
+                {(user.daily || []).slice().reverse().map((day) => (
+                  <span key={day.date}>{day.date}: {day.asset_count || 0}</span>
+                ))}
+              </div>
+            </article>
+          ))
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -6163,96 +6845,6 @@ function getCloudFilterCount(stats, filterId) {
   return stats.total;
 }
 
-function getResearchListPath(filters, offset = 0) {
-  const params = new URLSearchParams({
-    limit: String(RESEARCH_PAGE_SIZE),
-    offset: String(offset)
-  });
-  if (filters.userId) {
-    params.set("user_id", filters.userId);
-  }
-  if (filters.parseStatus) {
-    params.set("parse_status", filters.parseStatus);
-  }
-  return `/admin/research/assets/videos?${params.toString()}`;
-}
-
-function mergeResearchItems(currentItems, nextItems) {
-  const merged = [...currentItems];
-  const seen = new Set(currentItems.map((item) => Number(item.asset_id)).filter(Boolean));
-  nextItems.forEach((item) => {
-    const assetId = Number(item.asset_id);
-    if (!assetId || seen.has(assetId)) {
-      return;
-    }
-    seen.add(assetId);
-    merged.push(item);
-  });
-  return merged;
-}
-
-function groupResearchItems(items) {
-  const groups = new Map();
-  items.forEach((item) => {
-    const dateKey = item.captured_date_key || "unknown";
-    if (!groups.has(dateKey)) {
-      groups.set(dateKey, {
-        date_key: dateKey,
-        date_label: item.captured_date_label || dateKey,
-        capture_count: 0,
-        items: []
-      });
-    }
-    const group = groups.get(dateKey);
-    group.capture_count += 1;
-    group.items.push(item);
-  });
-  return Array.from(groups.values());
-}
-
-function isResearchAdminAuthError(error) {
-  return /Research admin login required|401|unauthorized/i.test(error?.message || "");
-}
-
-function getResearchAdminErrorMessage(error) {
-  const message = error?.message || "Research 请求失败";
-  if (/Not Found|404|endpoint not found/i.test(message)) {
-    return "Research admin endpoint not found。开发模式下请重启 Electron 主进程，让 /admin/research 请求不要再走 /api/infera。";
-  }
-  return message;
-}
-
-function formatResearchShortTime(value) {
-  if (!value) return "";
-  const timestamp = typeof value === "number" || /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "";
-  return new Intl.DateTimeFormat(undefined, {
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "2-digit"
-  }).format(new Date(timestamp));
-}
-
-function triggerResearchDownload(url, filename) {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename || "research-videos.zip";
-  link.rel = "noopener";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
-
-function base64ToBlob(base64, contentType = "application/zip") {
-  const binary = window.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return new Blob([bytes], { type: contentType });
-}
-
 function filterCloudRepositoryItems(items, mediaFilterId, statusFilterId, query) {
   const normalizedQuery = String(query || "").trim().toLowerCase();
   const safeItems = Array.isArray(items) ? items : [];
@@ -6285,6 +6877,67 @@ function filterCloudRepositoryItems(items, mediaFilterId, statusFilterId, query)
       getRawDataId(item)
     ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery));
   });
+}
+
+function normalizeResearchItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  return [payload?.items, payload?.users, payload?.data, payload?.list].find(Array.isArray) || [];
+}
+
+function toggleId(ids, id) {
+  const normalizedId = String(id);
+  const current = (ids || []).map(String);
+  return current.includes(normalizedId) ? current.filter((item) => item !== normalizedId) : [...current, normalizedId];
+}
+
+function getResearchErrorMessage(error) {
+  const message = String(error?.message || "");
+  if (message.includes("401") || message.toLowerCase().includes("research admin login required")) {
+    return "当前账号没有 Research 访问权限，请确认已授予 research.access";
+  }
+  if (message.includes("403")) {
+    return "当前账号无权访问所选 Research 数据";
+  }
+  return message || "无法读取 Research 数据";
+}
+
+async function saveResearchDownload(result, fallbackName) {
+  if (result?.download_url) {
+    const anchor = document.createElement("a");
+    anchor.href = result.download_url;
+    anchor.download = result.filename || fallbackName;
+    anchor.rel = "noreferrer";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return;
+  }
+
+  const contentType = result?.content_type || "application/zip";
+  const filename = result?.filename || fallbackName;
+  let blob = result?.blob;
+  if (!blob && result?.base64) {
+    const binary = window.atob(result.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    blob = new Blob([bytes], { type: contentType });
+  }
+  if (!blob) {
+    throw new Error("导出响应缺少下载内容");
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 }
 
 function getAuthDisplayName(authState) {

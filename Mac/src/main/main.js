@@ -45,7 +45,6 @@ let cpuUsageSnapshot = null;
 let latestUsage = null;
 let usageMonitor = null;
 let gpuSampleInFlight = false;
-let researchAdminCookieHeader = "";
 let engineMediaProxyServer = null;
 let engineMediaProxyUrl = "";
 let engineMediaProxyStartPromise = null;
@@ -353,24 +352,14 @@ function resolveInferaUrl(value) {
     return rawPath;
   }
 
+  if (/^\/?admin\//i.test(rawPath)) {
+    const apiUrl = new URL(INFERA_API_BASE_URL);
+    return new URL(rawPath.replace(/^\/+/, ""), `${apiUrl.origin}/`).toString();
+  }
+
   const normalizedBase = INFERA_API_BASE_URL.replace(/\/+$/, "");
   const normalizedPath = rawPath.replace(/^\/+/, "");
   return new URL(normalizedPath, `${normalizedBase}/`).toString();
-}
-
-function resolveInferaAdminUrl(value) {
-  if (!value) {
-    throw new Error("Missing infera admin request path.");
-  }
-
-  const rawPath = String(value);
-  if (/^https?:\/\//i.test(rawPath)) {
-    return rawPath;
-  }
-
-  const apiUrl = new URL(INFERA_API_BASE_URL);
-  const normalizedPath = rawPath.replace(/^\/+/, "");
-  return new URL(normalizedPath, `${apiUrl.origin}/`).toString();
 }
 
 function resolveEngineUrl(value) {
@@ -530,74 +519,6 @@ function stopEngineMediaProxy() {
   engineMediaProxyStartPromise = null;
 }
 
-function getSetCookieHeaders(headers) {
-  if (typeof headers.getSetCookie === "function") {
-    return headers.getSetCookie();
-  }
-
-  const rawHeader = headers.get("set-cookie");
-  if (!rawHeader) {
-    return [];
-  }
-
-  return rawHeader.split(/,(?=[^;,]+=)/).map((value) => value.trim()).filter(Boolean);
-}
-
-async function persistResearchAdminCookie(response, requestUrl) {
-  const setCookieHeaders = getSetCookieHeaders(response.headers);
-  if (setCookieHeaders.length === 0) {
-    return;
-  }
-
-  const url = new URL(requestUrl);
-  const cookiePairs = [];
-  for (const header of setCookieHeaders) {
-    const [pair, ...attributes] = header.split(";").map((part) => part.trim());
-    const separatorIndex = pair.indexOf("=");
-    if (separatorIndex <= 0) {
-      continue;
-    }
-
-    const name = pair.slice(0, separatorIndex);
-    const value = pair.slice(separatorIndex + 1);
-    const lowerAttributes = attributes.map((part) => part.toLowerCase());
-    const isExpired = lowerAttributes.some((part) => part === "max-age=0" || part.startsWith("expires=thu, 01 jan 1970"));
-    if (isExpired || value === "") {
-      if (name === "infera-research-admin") {
-        researchAdminCookieHeader = "";
-      }
-      try {
-        await mainWindow?.webContents.session.cookies.remove(url.origin, name);
-      } catch {
-        // Ignore cookie removal failures; the next admin call will still use the in-memory header.
-      }
-      continue;
-    }
-
-    const maxAgeAttribute = attributes.find((part) => part.toLowerCase().startsWith("max-age="));
-    const maxAgeSeconds = Number(maxAgeAttribute?.split("=")[1]);
-    cookiePairs.push(`${name}=${value}`);
-    try {
-      await mainWindow?.webContents.session.cookies.set({
-        url: url.origin,
-        name,
-        value,
-        path: "/",
-        httpOnly: lowerAttributes.includes("httponly"),
-        secure: url.protocol === "https:",
-        sameSite: "lax",
-        expirationDate: Number.isFinite(maxAgeSeconds) && maxAgeSeconds > 0 ? Math.floor(Date.now() / 1000) + maxAgeSeconds : undefined
-      });
-    } catch {
-      // The stored header is enough for IPC admin requests even if session cookie persistence fails.
-    }
-  }
-
-  if (cookiePairs.length > 0) {
-    researchAdminCookieHeader = cookiePairs.join("; ");
-  }
-}
-
 function getResponseFilename(response, fallback = "research-videos.zip") {
   const disposition = response.headers.get("content-disposition") || "";
   const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -623,46 +544,52 @@ function isAllowedUpdateUrl(value) {
   );
 }
 
+function getResponseFilename(response, fallback = "research-export.zip") {
+  const disposition = response.headers.get("content-disposition") || "";
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || fallback;
+}
+
 async function requestInfera(payload = {}) {
   const method = String(payload.method || "GET").toUpperCase();
-  const isAdminRequest = Boolean(payload.admin);
   const responseType = payload.responseType || "json";
   const headers = { Accept: payload.accept || (responseType === "download" ? "application/json, application/zip" : "application/json") };
-  let body;
 
-  if (payload.form !== undefined) {
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-    body = new URLSearchParams(payload.form).toString();
-  } else if (payload.body !== undefined) {
+  if (payload.body !== undefined) {
     headers["Content-Type"] = "application/json";
-    body = JSON.stringify(payload.body);
   }
   if (payload.token) {
     headers.Authorization = `Bearer ${payload.token}`;
   }
-  if (isAdminRequest && researchAdminCookieHeader) {
-    headers.Cookie = researchAdminCookieHeader;
-  }
-
-  const requestUrl = isAdminRequest ? resolveInferaAdminUrl(payload.path) : resolveInferaUrl(payload.path);
+  const requestUrl = resolveInferaUrl(payload.path);
 
   const response = await fetch(requestUrl, {
     method,
     headers,
-    body,
-    redirect: payload.redirect || "follow"
+    body: payload.body === undefined ? undefined : JSON.stringify(payload.body),
+    redirect: responseType === "redirect" ? "manual" : "follow"
   });
 
-  if (isAdminRequest) {
-    await persistResearchAdminCookie(response, requestUrl);
-  }
-
-  if (responseType === "text") {
-    const text = await response.text();
-    if (response.status >= 400) {
-      throw new Error(text || `请求失败 (${response.status})`);
+  if (responseType === "redirect") {
+    const location = response.headers.get("location");
+    if (location) {
+      return { url: new URL(location, resolveInferaUrl(payload.path)).toString() };
     }
-    return { status: response.status, redirected: response.redirected, text };
+    if (response.redirected || response.url) {
+      return { url: response.url };
+    }
+    if (!response.ok) {
+      throw new Error(`璇锋眰澶辫触 (${response.status})`);
+    }
+    return { url: resolveInferaUrl(payload.path) };
   }
 
   if (responseType === "download") {
@@ -670,7 +597,7 @@ async function requestInfera(payload = {}) {
     if (contentType.includes("application/json")) {
       const result = await response.json();
       if (!response.ok) {
-        const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
+        const detail = result?.message || result?.detail || `璇锋眰澶辫触 (${response.status})`;
         throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
       }
       return result;
@@ -678,7 +605,7 @@ async function requestInfera(payload = {}) {
 
     const buffer = Buffer.from(await response.arrayBuffer());
     if (!response.ok) {
-      throw new Error(`请求失败 (${response.status})`);
+      throw new Error(`璇锋眰澶辫触 (${response.status})`);
     }
     return {
       delivery: "direct",
@@ -698,9 +625,6 @@ async function requestInfera(payload = {}) {
 
   if (!response.ok) {
     const detail = result?.message || result?.detail || `请求失败 (${response.status})`;
-    if (isAdminRequest && response.status === 404) {
-      throw new Error(`Research admin endpoint not found: ${new URL(requestUrl).pathname}`);
-    }
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
 
