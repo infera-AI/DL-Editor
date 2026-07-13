@@ -143,7 +143,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-07-07",
+  updatedAt: "2026-07-14",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -681,6 +681,17 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
+async function fetchCurrentUser(token) {
+  return requestInfera("/users/me", { token });
+}
+
+function hasResearchAccess(user) {
+  return (Array.isArray(user?.permissions) ? user.permissions : []).some((permission) => {
+    const key = String(permission?.permissionKey || permission?.permission_key || "").trim().toLowerCase();
+    return key === "research.access" && permission?.enabled === true;
+  });
+}
+
 async function fetchCloudRepository(token, spaceId = CLOUD_SPACES[0].id, options = {}) {
   const items = [];
   let total = null;
@@ -1180,6 +1191,7 @@ function App() {
   const automationOptionsRef = useRef(automationOptions);
   const automationEnqueueRunningRef = useRef(false);
   const autoLoginPromptedRef = useRef(false);
+  const researchAccessRequestRef = useRef(0);
   const [repositoryState, setRepositoryState] = useState({
     status: "idle",
     spaceId: cloudSpaceId,
@@ -1200,6 +1212,7 @@ function App() {
     to: "",
     userId: ""
   });
+  const [researchAccessState, setResearchAccessState] = useState({ status: "idle", token: "", message: "" });
   const [researchState, setResearchState] = useState({
     status: "idle",
     users: [],
@@ -1344,6 +1357,7 @@ function App() {
       },
       onExpired: () => {
         const previousAuth = authStateRef.current;
+        researchAccessRequestRef.current += 1;
         window.localStorage?.removeItem(AUTH_STORAGE_KEY);
         authStateRef.current = null;
         setAuthState(null);
@@ -1427,6 +1441,8 @@ function App() {
     }
 
     if (!authState?.token) {
+      researchAccessRequestRef.current += 1;
+      setResearchAccessState({ status: "auth", token: "", message: "" });
       setResearchState((current) => ({
         ...current,
         status: "auth",
@@ -1439,8 +1455,38 @@ function App() {
       return;
     }
 
+    if (
+      researchAccessState.token === authState.token &&
+      ["checking", "allowed", "forbidden", "error"].includes(researchAccessState.status)
+    ) {
+      return;
+    }
+
+    loadResearchAccess(authState);
+  }, [activeNav, authState?.token, researchAccessState.status, researchAccessState.token]);
+
+  useEffect(() => {
+    if (
+      activeNav !== "Research" ||
+      !authState?.token ||
+      researchAccessState.status !== "allowed" ||
+      researchAccessState.token !== authState.token
+    ) {
+      return;
+    }
+
     loadResearchData(researchTab, authState, researchFilters);
-  }, [activeNav, authState?.token, researchFilters.from, researchFilters.status, researchFilters.to, researchFilters.userId, researchTab]);
+  }, [
+    activeNav,
+    authState?.token,
+    researchAccessState.status,
+    researchAccessState.token,
+    researchFilters.from,
+    researchFilters.status,
+    researchFilters.to,
+    researchFilters.userId,
+    researchTab
+  ]);
 
   useEffect(() => {
     if (!hasProcessingJobs && !isUploadActive(uploadState) && !transferQueue.some((item) => item.status === "uploading")) {
@@ -2493,7 +2539,7 @@ function App() {
       if (activeNav === "Cloud") {
         loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
       } else if (activeNav === "Research") {
-        loadResearchData(researchTab, nextAuth, researchFilters);
+        loadResearchAccess(nextAuth);
       }
     } catch (error) {
       setLoginStatus({
@@ -2504,10 +2550,12 @@ function App() {
   }
 
   function logout() {
+    researchAccessRequestRef.current += 1;
     window.localStorage?.removeItem(AUTH_STORAGE_KEY);
     authStateRef.current = null;
     setAuthState(null);
     setLoginStatus({ status: "idle", message: "" });
+    setResearchAccessState({ status: "auth", token: "", message: "" });
     setRepositoryState({
       status: "auth",
       spaceId: cloudSpaceId,
@@ -2520,6 +2568,57 @@ function App() {
       nextOffset: 0,
       message: "请先登录后查看 Cloud repository"
     });
+  }
+
+  async function loadResearchAccess(authOverride = authState) {
+    const token = authOverride?.token;
+    if (!token) {
+      researchAccessRequestRef.current += 1;
+      setResearchAccessState({ status: "auth", token: "", message: "" });
+      return;
+    }
+
+    const requestId = researchAccessRequestRef.current + 1;
+    researchAccessRequestRef.current = requestId;
+    setResearchAccessState({ status: "checking", token, message: "" });
+    try {
+      const currentUser = await fetchCurrentUser(token);
+      if (researchAccessRequestRef.current !== requestId) {
+        return;
+      }
+
+      const resolvedToken = authStateRef.current?.token || token;
+      if (!hasResearchAccess(currentUser)) {
+        setResearchAccessState({
+          status: "forbidden",
+          token: resolvedToken,
+          message: "当前账号未被授予 Research 访问权限，请联系管理员。"
+        });
+        setResearchState((current) => ({
+          ...current,
+          status: "idle",
+          users: [],
+          resources: [],
+          resourcesTotal: 0,
+          chats: [],
+          chatsTotal: 0,
+          statistics: null,
+          message: ""
+        }));
+        return;
+      }
+
+      setResearchAccessState({ status: "allowed", token: resolvedToken, message: "" });
+    } catch (error) {
+      if (researchAccessRequestRef.current !== requestId || !authStateRef.current?.token) {
+        return;
+      }
+      setResearchAccessState({
+        status: "error",
+        token: authStateRef.current.token,
+        message: error.message || "无法验证 Research 访问权限"
+      });
+    }
   }
 
   async function loadResearchData(tabOverride = researchTab, authOverride = authState, filtersOverride = researchFilters, options = {}) {
@@ -2579,9 +2678,17 @@ function App() {
         }));
       }
     } catch (error) {
+      const permissionDenied = isResearchPermissionDenied(error);
+      if (permissionDenied) {
+        setResearchAccessState({
+          status: "forbidden",
+          token: authStateRef.current?.token || token,
+          message: "当前账号未被授予 Research 访问权限，请联系管理员。"
+        });
+      }
       setResearchState((current) => ({
         ...current,
-        status: "error",
+        status: permissionDenied ? "forbidden" : "error",
         message: getResearchErrorMessage(error)
       }));
     }
@@ -3106,6 +3213,7 @@ function App() {
         )
       ) : activeNav === "Research" ? (
         <ResearchPage
+          accessState={researchAccessState}
           authState={authState}
           filters={researchFilters}
           onExportFilteredChats={exportFilteredResearchChats}
@@ -3117,6 +3225,7 @@ function App() {
           onLoadMoreChats={loadMoreResearchChats}
           onLoadMoreResources={loadMoreResearchResources}
           onRefresh={() => loadResearchData(researchTab, authState, researchFilters)}
+          onRetryAccess={() => loadResearchAccess(authState)}
           onSelectLoadedChats={selectLoadedResearchChats}
           onSelectLoadedResources={selectLoadedResearchResources}
           onTabChange={setResearchTab}
@@ -4456,6 +4565,7 @@ function EngineQueryEntryBody({ entry, mediaProxyUrl }) {
 }
 
 function ResearchPage({
+  accessState,
   authState,
   filters,
   onExportFilteredChats,
@@ -4467,6 +4577,7 @@ function ResearchPage({
   onLoadMoreChats,
   onLoadMoreResources,
   onRefresh,
+  onRetryAccess,
   onSelectLoadedChats,
   onSelectLoadedResources,
   onTabChange,
@@ -4533,6 +4644,64 @@ function ResearchPage({
           <button className="primary-button" onClick={onLogin} type="button">
             <UserRound size={16} />
             <span>登录</span>
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  const accessStatus = state.status === "forbidden" ? "forbidden" : accessState?.status;
+
+  if (accessStatus === "idle" || accessStatus === "checking") {
+    return (
+      <section className="research-login-page">
+        <div className="research-login-card">
+          <div className="research-login-icon">
+            <LockKeyhole size={24} />
+          </div>
+          <div className="research-login-copy">
+            <h1>正在检查 Research 权限</h1>
+            <p>正在读取当前账号的访问权限。</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (accessStatus === "forbidden") {
+    return (
+      <section className="research-login-page">
+        <div className="research-login-card">
+          <div className="research-login-icon">
+            <LockKeyhole size={24} />
+          </div>
+          <div className="research-login-copy">
+            <h1>无 Research 访问权限</h1>
+            <p>{accessState?.message || "当前账号未被授予 Research 访问权限，请联系管理员。"}</p>
+          </div>
+          <button className="primary-button" onClick={onRetryAccess} type="button">
+            <RotateCcw size={16} />
+            <span>重新检查</span>
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  if (accessStatus === "error") {
+    return (
+      <section className="research-login-page">
+        <div className="research-login-card">
+          <div className="research-login-icon">
+            <TriangleAlert size={24} />
+          </div>
+          <div className="research-login-copy">
+            <h1>无法验证 Research 权限</h1>
+            <p>{accessState?.message || "请检查网络后重试。"}</p>
+          </div>
+          <button className="primary-button" onClick={onRetryAccess} type="button">
+            <RotateCcw size={16} />
+            <span>重试</span>
           </button>
         </div>
       </section>
@@ -7085,13 +7254,18 @@ function toggleId(ids, id) {
   return current.includes(normalizedId) ? current.filter((item) => item !== normalizedId) : [...current, normalizedId];
 }
 
+function isResearchPermissionDenied(error) {
+  const message = String(error?.message || "");
+  return Number(error?.status || error?.statusCode) === 403 || message.includes("403") || /research access denied/i.test(message);
+}
+
 function getResearchErrorMessage(error) {
   const message = String(error?.message || "");
-  if (message.includes("401") || message.toLowerCase().includes("research admin login required")) {
+  if (isResearchPermissionDenied(error)) {
     return "当前账号没有 Research 访问权限，请确认已授予 research.access";
   }
-  if (message.includes("403")) {
-    return "当前账号无权访问所选 Research 数据";
+  if (message.includes("401") || message.toLowerCase().includes("research admin login required")) {
+    return "当前账号没有 Research 访问权限，请确认已授予 research.access";
   }
   return message || "无法读取 Research 数据";
 }
