@@ -18,6 +18,7 @@ const {
   getVideoConcurrency
 } = require("./gpuScheduler.cjs");
 const { buildVideoFilters } = require("./videoFilters.cjs");
+const { createUploadHistoryDuplicateResult, createUploadHistoryStore } = require("./uploadHistory.cjs");
 
 const APP_NAME = "DL Studio";
 const INFERA_API_BASE_URL = process.env.INFERA_API_BASE_URL || process.env.VITE_INFERA_API_BASE_URL || "https://api.infera.cn/api/infera";
@@ -57,6 +58,7 @@ const RAW_DATA_VIDEO_UPLOAD_PATH = "/memory/raw-data/videos";
 const RAW_DATA_RESUMABLE_UPLOAD_PATH = "/memory/raw-data/videos/resumable";
 const RAW_DATA_DEDUPLICATE_PATH = "/memory/raw-data/videos/deduplicate";
 const RAW_DATA_RESUMABLE_SESSION_FILE = "raw-data-upload-sessions.json";
+const UPLOAD_HISTORY_FILE = "upload-history.json";
 const RESUMABLE_UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 const DEFAULT_RESUMABLE_PART_SIZE_BYTES = 8 * 1024 * 1024;
 const UPLOAD_CONTROL_IDLE_TIMEOUT_MS = 120000;
@@ -95,6 +97,7 @@ app.setName(APP_NAME);
 
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 let mainLogFilePath = null;
+let uploadHistoryStore = null;
 let fileLoggerInitialized = false;
 let logSessionHeaderWritten = false;
 let lastLoggedBatchState = null;
@@ -113,6 +116,36 @@ function getMainLogFilePath() {
     mainLogFilePath = path.join(app.getPath("userData"), "logs", "main.log");
   }
   return mainLogFilePath;
+}
+
+function getUploadHistoryStore() {
+  if (!uploadHistoryStore) {
+    uploadHistoryStore = createUploadHistoryStore(path.join(app.getPath("userData"), UPLOAD_HISTORY_FILE));
+  }
+  return uploadHistoryStore;
+}
+
+function recordCompletedUploadHistory({ fileName, filePath, kind, result, sha256, sizeBytes, startTimestampMs, uploadId, userKey }) {
+  try {
+    return getUploadHistoryStore().recordSuccess({
+      fileName,
+      filePath,
+      kind,
+      result,
+      sha256,
+      sizeBytes,
+      startTimestampMs,
+      userKey
+    });
+  } catch (historyError) {
+    logWarn("Upload completed but history persistence failed", {
+      error: summarizeError(historyError),
+      fileName,
+      kind,
+      uploadId
+    });
+    return null;
+  }
 }
 
 function formatLogArg(value) {
@@ -1771,7 +1804,7 @@ function abortResumableUploadSession(uploadRecord) {
   }
 }
 
-async function uploadResumableVideo({ config, fields, filePath, fileName, jobId, sender, token, uploadId }) {
+async function uploadResumableVideo({ config, fields, filePath, fileName, historyUserKey, jobId, sender, token, uploadId }) {
   const stats = fs.statSync(filePath);
   const sessionKey = getRawDataUploadSessionKey({ fileName, filePath, kind: config.kind, stats });
   const speedMeter = createTransferSpeedMeter();
@@ -1877,6 +1910,41 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
     }
     sendProgress("uploading", { bytesUploaded: 0, message: "正在校验文件" });
     const sha256 = await hashFileSha256({ filePath, uploadRecord });
+    sendProgress("uploading", { bytesUploaded: 0, message: "正在检查上传历史", sha256 });
+    const completedFromHistory = getUploadHistoryStore().findCompleted({
+      filePath,
+      kind: config.kind,
+      sha256,
+      sizeBytes: stats.size,
+      startTimestampMs: fields.start_timestamp_ms ?? fields.captured_at_ms,
+      userKey: historyUserKey
+    });
+    if (completedFromHistory) {
+      if (sessions[sessionKey]?.uploadToken) {
+        await requestUploadJson({
+          body: { uploadToken: sessions[sessionKey].uploadToken },
+          retry: false,
+          token,
+          uploadRecord,
+          url: resolveInferaUrl(`${config.resumablePath}/abort`)
+        }).catch(() => undefined);
+        removeRawDataUploadSession(sessionKey);
+      }
+      uploadRecord.bytesUploaded = stats.size;
+      uploadRecord.phase = "completed";
+      sendProgress("processing", {
+        bytesUploaded: stats.size,
+        message: "视频已在上传历史中，跳过重复上传",
+        percent: 100,
+        sha256,
+        uploadHistoryDuplicate: true
+      });
+      return {
+        historyMatched: true,
+        result: createUploadHistoryDuplicateResult(completedFromHistory),
+        sha256
+      };
+    }
     await waitUntilUploadCanSend(uploadRecord);
     if (config.deduplicatePath) {
       uploadRecord.phase = "checking";
@@ -1889,6 +1957,17 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
         url: resolveInferaUrl(config.deduplicatePath)
       });
       if (duplicate?.duplicate && duplicate.archive) {
+        recordCompletedUploadHistory({
+          fileName,
+          filePath,
+          kind: config.kind,
+          result: duplicate.archive,
+          sha256,
+          sizeBytes: stats.size,
+          startTimestampMs: fields.start_timestamp_ms ?? fields.captured_at_ms,
+          uploadId,
+          userKey: historyUserKey
+        });
         if (sessions[sessionKey]?.uploadToken) {
           await requestUploadJson({
             body: { uploadToken: sessions[sessionKey].uploadToken },
@@ -1905,7 +1984,7 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
           message: "文件已存在，跳过上传",
           percent: 100
         });
-        return duplicate.archive;
+        return { historyMatched: false, result: duplicate.archive, sha256 };
       }
     } else {
       uploadRecord.phase = "initializing";
@@ -2020,8 +2099,19 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
       url: resolveInferaUrl(`${config.resumablePath}/complete`)
     });
     uploadRecord.phase = "completed";
+    recordCompletedUploadHistory({
+      fileName,
+      filePath,
+      kind: config.kind,
+      result,
+      sha256,
+      sizeBytes: stats.size,
+      startTimestampMs: fields.start_timestamp_ms ?? fields.captured_at_ms,
+      uploadId,
+      userKey: historyUserKey
+    });
     removeRawDataUploadSession(sessionKey);
-    return result;
+    return { historyMatched: false, result, sha256 };
   } finally {
     activeUploadRequests.delete(uploadId);
   }
@@ -2029,15 +2119,6 @@ async function uploadResumableVideo({ config, fields, filePath, fileName, jobId,
 
 async function uploadInferaVideo(payload = {}, sender) {
   const filePath = String(payload.path || payload.filePath || "");
-  if (!filePath || !fs.existsSync(filePath)) {
-    throw new Error("找不到要上传的视频文件");
-  }
-
-  const stats = fs.statSync(filePath);
-  if (!stats.isFile()) {
-    throw new Error("只能上传文件");
-  }
-
   if (!payload.token) {
     throw new Error("请先登录后上传");
   }
@@ -2046,14 +2127,44 @@ async function uploadInferaVideo(payload = {}, sender) {
   const uploadPath = payload.uploadPath || WEB_VIDEO_UPLOAD_PATH;
   const resumableConfig = getResumableVideoUploadConfig(uploadPath);
   const isRawDataUpload = resumableConfig?.kind === "raw-data";
+  const historyKind = resumableConfig?.kind || "multipart";
+  const historyUserKey = String(payload.historyUserKey || payload.userId || "").trim();
+  const uploadTimestampMs = normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms ?? payload.capturedAtMs ?? payload.captured_at_ms);
+  const expectedSizeBytes = Math.max(0, Number(payload.sizeBytes || payload.totalBytes) || 0);
+  const fileName = payload.fileName || (filePath ? path.basename(filePath) : "video");
+  if (!filePath || !fs.existsSync(filePath)) {
+    const completedFromHistory = getUploadHistoryStore().findCompleted({
+      filePath,
+      kind: historyKind,
+      sha256: payload.sha256,
+      sizeBytes: expectedSizeBytes,
+      startTimestampMs: uploadTimestampMs,
+      userKey: historyUserKey
+    });
+    if (completedFromHistory) {
+      logInfo("Upload reconciled from history after local file cleanup", {
+        fileName,
+        historyCompletedAt: completedFromHistory.completedAt,
+        uploadId,
+        uploadPath
+      });
+      return createUploadHistoryDuplicateResult(completedFromHistory);
+    }
+    throw new Error("找不到要上传的视频文件");
+  }
+
+  const stats = fs.statSync(filePath);
+  if (!stats.isFile()) {
+    throw new Error("只能上传文件");
+  }
+
   logInfo("Upload started", {
-    fileName: payload.fileName || path.basename(filePath),
+    fileName,
     sizeBytes: stats.size,
     uploadId,
     uploadPath,
     uploadType: resumableConfig?.kind || "multipart"
   });
-  const uploadTimestampMs = normalizeUploadTimestamp(payload.startTimestampMs ?? payload.start_timestamp_ms ?? payload.capturedAtMs ?? payload.captured_at_ms);
   const fields = isRawDataUpload
     ? { captured_at_ms: uploadTimestampMs }
     : { start_timestamp_ms: uploadTimestampMs };
@@ -2069,31 +2180,38 @@ async function uploadInferaVideo(payload = {}, sender) {
   }
 
   try {
-    const result = resumableConfig
+    const outcome = resumableConfig
       ? await uploadResumableVideo({
           config: resumableConfig,
           fields,
-          fileName: payload.fileName || path.basename(filePath),
+          fileName,
           filePath,
+          historyUserKey,
           jobId: payload.jobId,
           sender,
           token: payload.token,
           uploadId
         })
-      : await runUploadOperationWithRetry(() =>
-          uploadMultipart({
-            fields,
-            fileName: payload.fileName || path.basename(filePath),
-            filePath,
-            jobId: payload.jobId,
-            sender,
-            token: payload.token,
-            uploadId,
-            url: resolveInferaUrl(uploadPath)
-          })
-        );
+      : {
+          historyMatched: false,
+          result: await runUploadOperationWithRetry(() =>
+            uploadMultipart({
+              fields,
+              fileName,
+              filePath,
+              jobId: payload.jobId,
+              sender,
+              token: payload.token,
+              uploadId,
+              url: resolveInferaUrl(uploadPath)
+            })
+          ),
+          sha256: ""
+        };
+    const result = outcome.result;
     logInfo("Upload completed", {
-      fileName: payload.fileName || path.basename(filePath),
+      fileName,
+      historyMatched: Boolean(outcome.historyMatched),
       sizeBytes: stats.size,
       uploadId,
       uploadPath
@@ -2102,7 +2220,7 @@ async function uploadInferaVideo(payload = {}, sender) {
   } catch (error) {
     logError("Upload failed", {
       error: summarizeError(error),
-      fileName: payload.fileName || path.basename(filePath),
+      fileName,
       sizeBytes: stats.size,
       uploadId,
       uploadPath

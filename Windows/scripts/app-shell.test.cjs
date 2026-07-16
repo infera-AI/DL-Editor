@@ -1,6 +1,8 @@
 const assert = require("assert");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const { createUploadHistoryDuplicateResult, createUploadHistoryStore } = require("../src/main/uploadHistory.cjs");
 
 const root = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(root, "..");
@@ -83,6 +85,12 @@ assert.match(main, /uploadRecord\.phase = "completing"/);
 assert.match(main, /removeRawDataUploadSession\(uploadRecord\.sessionKey\)/);
 assert.match(main, /function uploadResumableVideo/);
 assert.match(main, /function uploadResumableVideoPart/);
+assert.match(main, /UPLOAD_HISTORY_FILE/);
+assert.match(main, /getUploadHistoryStore/);
+assert.match(main, /Upload reconciled from history after local file cleanup/);
+assert.match(app, /upload_history_duplicate/);
+assert.match(app, /const shouldClearLocal =\s*typeof shouldClearLocalOnComplete === "function"/);
+assert.doesNotMatch(app, /duplicateFromHistory \|\|/);
 assert.match(main, /startTimestampMs/);
 assert.match(main, /config\.resumablePath/);
 assert.match(main, /function getUploadHttpErrorMessage/);
@@ -162,7 +170,7 @@ assert.match(app, /accountName && accountName !== displayName/);
 assert.match(app, /function getAuthInitial/);
 assert.match(app, /className="profile-initial"/);
 assert.match(app, /getAuthInitial\(accountName\)/);
-assert.match(app, /<span>\{displayName \|\| APP_NAME\}<\/span>/);
+assert.match(app, /displayName \|\| APP_NAME/);
 assert.doesNotMatch(app, /Infera User/);
 assert.doesNotMatch(app, /authState\?\.avatar \?/);
 assert.match(app, /className="top-nav"/);
@@ -211,6 +219,18 @@ assert.ok(app.includes('const normalizedBase = INFERA_API_BASE_URL.replace(/\\/+
 assert.ok(app.includes('const normalizedPath = rawPath.replace(/^\\/+/, "");'));
 assert.ok(app.includes('return new URL(normalizedPath, `${normalizedBase}/`).toString();'));
 assert.match(app, /\/auth\/login/);
+assert.match(app, /function sendInferaEmailVerificationCode/);
+assert.match(app, /function createInferaEmailVerificationToken/);
+assert.match(app, /function loginToInferaWithEmailCode/);
+assert.match(app, /function resetInferaPassword/);
+assert.match(app, /\/verification\/codes/);
+assert.match(app, /\/verification\/tokens/);
+assert.match(app, /\/auth\/login\/email\//);
+assert.match(app, /\/auth\/password\/reset/);
+assert.match(app, /验证码登录/);
+assert.match(app, /忘记密码/);
+assert.match(app, /reset_password/);
+assert.match(app, /verificationCode/);
 assert.match(app, /type: inferIdentifierType\(identifier\)/);
 assert.match(app, /refreshToken/);
 assert.match(app, /Authorization/);
@@ -242,6 +262,16 @@ assert.match(app, /exportDownload/);
 assert.match(app, /research-download-notice/);
 assert.match(app, /再次下载/);
 assert.match(styles, /\.research-download-notice/);
+assert.match(app, /function fetchResearchDailyExportPreview/);
+assert.match(app, /function createResearchDailyExport/);
+assert.match(app, /function fetchResearchDailyExportStatus/);
+assert.match(app, /\/assets\/videos\/daily-exports/);
+assert.match(app, /function ResearchBatchExportModal/);
+assert.match(app, />Batch export</);
+assert.match(app, /"Start export"/);
+assert.match(app, /research-batch-export-summary/);
+assert.match(styles, /\.research-batch-export-panel/);
+assert.match(styles, /\.research-batch-export-status/);
 assert.match(app, /const pageSize = 14/);
 assert.match(app, /research-modal-body/);
 assert.match(app, /Authorization/);
@@ -428,7 +458,7 @@ assert.match(app, /DL Engine/);
 assert.match(app, /Research Resources/);
 assert.doesNotMatch(app, /researchUnlocked/);
 assert.match(app, /name="identifier"/);
-assert.match(app, /autoComplete="username"/);
+assert.match(app, /autoComplete=\{usesEmailCode \? "email" : "username"\}/);
 assert.match(app, /type="password"/);
 assert.match(styles, /\.splash-screen/);
 assert.match(styles, /\.profile-button/);
@@ -443,6 +473,10 @@ assert.match(styles, /\.profile-initial/);
 assert.match(styles, /place-items: center/);
 assert.doesNotMatch(styles, /\.profile-initial\s*\{[^}]*background:/s);
 assert.match(styles, /\.login-account-identity/);
+assert.match(styles, /\.login-method-switch/);
+assert.match(styles, /\.login-code-button/);
+assert.match(styles, /\.login-recovery-link/);
+assert.match(styles, /\.login-status\.success/);
 assert.match(styles, /\.placeholder-page/);
 assert.match(styles, /\.engine-page/);
 assert.match(styles, /\.engine-gate/);
@@ -505,5 +539,58 @@ assert.match(styles, /\.login-status/);
 assert.match(styles, /\.login-dialog/);
 assert.match(styles, /@keyframes splash-logo/);
 assert.match(styles, /@keyframes splash-exit/);
+
+const uploadHistoryTestDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "dl-upload-history-"));
+const uploadHistoryTestPath = path.join(uploadHistoryTestDirectory, "upload-history.json");
+try {
+  const sha256 = "a".repeat(64);
+  const store = createUploadHistoryStore(uploadHistoryTestPath, { platform: "win32" });
+  const recorded = store.recordSuccess({
+    fileName: "2026_07_16_10_00_00.mp4",
+    filePath: "C:\\DL\\2026_07_16_10_00_00.mp4",
+    kind: "web-video",
+    result: { upload_group: "web-resumable-test", ignored_secret: "not-persisted" },
+    sha256,
+    sizeBytes: 1234,
+    startTimestampMs: 1784176800000,
+    userKey: "23"
+  });
+  assert.equal(recorded.sha256, sha256);
+  store.recordSuccess({
+    ...recorded,
+    result: { upload_group: "web-resumable-test" }
+  });
+  const backupSha256 = "c".repeat(64);
+  store.recordSuccess({
+    ...recorded,
+    kind: "raw-data",
+    result: { raw_data_id: 99 },
+    sha256: backupSha256
+  });
+  const reloaded = createUploadHistoryStore(uploadHistoryTestPath, { platform: "win32" });
+  assert.equal(reloaded.findCompleted({ kind: "web-video", sha256, sizeBytes: 1234, userKey: "23" })?.result?.upload_group, "web-resumable-test");
+  assert.ok(reloaded.findCompleted({
+    filePath: "c:\\dl\\2026_07_16_10_00_00.mp4",
+    kind: "web-video",
+    sizeBytes: 1234,
+    startTimestampMs: 1784176800000,
+    userKey: "23"
+  }));
+  assert.equal(reloaded.findCompleted({ kind: "web-video", sha256, sizeBytes: 1234, userKey: "24" }), null);
+  assert.equal(reloaded.findCompleted({ kind: "raw-data", sha256: backupSha256, sizeBytes: 1234, userKey: "23" })?.result?.raw_data_id, 99);
+  assert.equal(reloaded.findCompleted({
+    filePath: "C:\\DL\\2026_07_16_10_00_00.mp4",
+    kind: "web-video",
+    sha256: "b".repeat(64),
+    sizeBytes: 1234,
+    userKey: "23"
+  }), null);
+  assert.equal(createUploadHistoryDuplicateResult(recorded).upload_history_duplicate, true);
+  const persistedHistory = JSON.parse(fs.readFileSync(uploadHistoryTestPath, "utf8"));
+  assert.equal(persistedHistory.records.length, 2);
+  assert.equal(persistedHistory.records.find((entry) => entry.kind === "web-video").result.ignored_secret, undefined);
+} finally {
+  fs.rmSync(uploadHistoryTestDirectory, { force: true, recursive: true });
+}
 
 console.log("App shell behavior check passed.");

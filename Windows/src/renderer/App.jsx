@@ -350,7 +350,7 @@ function isInferaUnauthorizedError(error) {
 }
 
 function isInferaAuthEndpoint(path) {
-  return /^\/?auth\/(?:login|refresh)\/?(?:\?|$)/i.test(String(path || ""));
+  return /^\/?auth\/(?:login(?:\/email)?|refresh)\/?(?:\?|$)/i.test(String(path || ""));
 }
 
 function setInferaAuthController(controller) {
@@ -681,6 +681,60 @@ async function loginToInfera({ identifier, password }) {
   });
 }
 
+async function sendInferaEmailVerificationCode(email, purpose) {
+  const account = String(email || "").trim().toLowerCase();
+  return requestInfera("/verification/codes", {
+    method: "POST",
+    body: {
+      account,
+      purpose,
+      channel: "email"
+    }
+  });
+}
+
+async function createInferaEmailVerificationToken({ email, purpose, verificationCode }) {
+  const account = String(email || "").trim().toLowerCase();
+  const verification = await requestInfera("/verification/tokens", {
+    method: "POST",
+    body: {
+      account,
+      purpose,
+      channel: "email",
+      code: String(verificationCode || "").trim()
+    }
+  });
+  const verificationToken = verification?.verification_token;
+  if (!verificationToken) {
+    throw new Error("验证码校验响应缺少 verification token");
+  }
+  return { account, verificationToken };
+}
+
+async function loginToInferaWithEmailCode({ email, verificationCode }) {
+  const { account, verificationToken } = await createInferaEmailVerificationToken({
+    email,
+    purpose: "login",
+    verificationCode
+  });
+  return requestInfera("/auth/login/email/", {
+    method: "POST",
+    body: { email: account, verificationToken }
+  });
+}
+
+async function resetInferaPassword({ email, password, verificationCode }) {
+  const { account, verificationToken } = await createInferaEmailVerificationToken({
+    email,
+    purpose: "reset_password",
+    verificationCode
+  });
+  return requestInfera("/auth/password/reset", {
+    method: "POST",
+    body: { email: account, password, verificationToken }
+  });
+}
+
 async function fetchCurrentUser(token) {
   return requestInfera("/users/me", { token });
 }
@@ -929,6 +983,26 @@ async function exportResearchChats(token, payload) {
   });
 }
 
+async function fetchResearchDailyExportPreview(token, userId, dateKey) {
+  return fetchResearchResources(
+    token,
+    { from: dateKey, status: "", to: dateKey, userId },
+    { limit: 1, offset: 0 }
+  );
+}
+
+async function createResearchDailyExport(token, payload) {
+  return requestInfera(buildResearchPath("/assets/videos/daily-exports"), {
+    method: "POST",
+    token,
+    body: payload
+  });
+}
+
+async function fetchResearchDailyExportStatus(token, jobId) {
+  return requestInfera(buildResearchPath(`/assets/videos/daily-exports/${encodeURIComponent(jobId)}`), { token });
+}
+
 function getResearchDownloadFilename(disposition, fallback = "research-export.zip") {
   const text = String(disposition || "");
   const utf8Match = text.match(/filename\*=UTF-8''([^;]+)/i);
@@ -1161,8 +1235,16 @@ function App() {
   const [enginePassword, setEnginePassword] = useState("");
   const [engineError, setEngineError] = useState("");
   const [authState, setAuthState] = useState(readStoredAuth);
-  const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
+  const [loginForm, setLoginForm] = useState({
+    identifier: "",
+    method: "password",
+    password: "",
+    confirmPassword: "",
+    remember: true,
+    verificationCode: ""
+  });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
+  const [loginCodeStatus, setLoginCodeStatus] = useState({ status: "idle", message: "", cooldown: 0 });
   const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
   const [cloudRepositoryDateKey, setCloudRepositoryDateKey] = useState(() => getLocalDateKey());
   const [cloudRepositoryMediaFilterId, setCloudRepositoryMediaFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID);
@@ -1342,6 +1424,14 @@ function App() {
   }, [authState]);
 
   useEffect(() => {
+    if (loginCodeStatus.cooldown <= 0) return undefined;
+    const timer = window.setTimeout(() => {
+      setLoginCodeStatus((current) => ({ ...current, cooldown: Math.max(0, current.cooldown - 1) }));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [loginCodeStatus.cooldown]);
+
+  useEffect(() => {
     const controller = {
       getAuth: () => authStateRef.current,
       onRefreshed: (nextAuth, previousAuth) => {
@@ -1365,7 +1455,10 @@ function App() {
         setLoginForm((current) => ({
           ...current,
           identifier: current.identifier || getAuthAccountName(previousAuth),
-          password: ""
+          method: "password",
+          password: "",
+          confirmPassword: "",
+          verificationCode: ""
         }));
         setLoginStatus({ status: "error", message: INFERA_AUTH_EXPIRED_MESSAGE });
         setNotice(INFERA_AUTH_EXPIRED_MESSAGE);
@@ -2062,9 +2155,16 @@ function App() {
           result = await uploadInferaVideoWithAuthRefresh({
             durationSeconds: job.duration,
             durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
+            historyUserKey:
+              authStateRef.current?.userId ||
+              authStateRef.current?.accountName ||
+              authStateRef.current?.email ||
+              "",
             jobId: job.id,
             path: job.uploadPath,
             fileName: job.uploadName,
+            sha256: job.sha256,
+            sizeBytes: job.sizeBytes || job.size || job.totalBytes,
             startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
             uploadId,
             uploadPath: endpoint
@@ -2090,12 +2190,15 @@ function App() {
           });
           continue;
         }
+        const duplicateFromHistory = Boolean(result?.upload_history_duplicate);
         const shouldClearLocal =
           typeof shouldClearLocalOnComplete === "function" ? Boolean(shouldClearLocalOnComplete(job)) : Boolean(autoClearLocal);
         const cleared = shouldClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isBackup ? "source" : "output")) : { deleted: false };
         completed += 1;
         const uploadedAt = new Date().toISOString();
-        const doneMessage = getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
+        const doneMessage = duplicateFromHistory
+          ? getUploadHistoryDoneMessage(cleared, isBackup ? "backup" : "upload")
+          : getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
         setUploadState((current) => {
           const now = Date.now();
           const currentItem = current.items.find((item) => item.jobId === job.id);
@@ -2510,16 +2613,98 @@ function App() {
     });
   }
 
-  async function submitLogin() {
-    const identifier = loginForm.identifier.trim();
-    if (!identifier || !loginForm.password) {
-      setLoginStatus({ status: "error", message: "请输入账号和密码" });
+  function updateLoginForm(changes) {
+    if (Object.prototype.hasOwnProperty.call(changes, "identifier") && changes.identifier !== loginForm.identifier) {
+      setLoginCodeStatus({ status: "idle", message: "", cooldown: 0 });
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "method")) {
+      setLoginStatus({ status: "idle", message: "" });
+      if (changes.method === "reset" || loginForm.method === "reset") {
+        setLoginCodeStatus({ status: "idle", message: "", cooldown: 0 });
+      }
+    }
+    setLoginForm((current) => ({ ...current, ...changes }));
+  }
+
+  async function sendLoginCode() {
+    const email = loginForm.identifier.trim().toLowerCase();
+    if (!EMAIL_IDENTIFIER_PATTERN.test(email)) {
+      setLoginCodeStatus({ status: "error", message: "请输入有效的邮箱地址", cooldown: 0 });
       return;
     }
 
-    setLoginStatus({ status: "checking", message: "正在登录..." });
+    if (loginCodeStatus.status === "sending" || loginCodeStatus.cooldown > 0) return;
+
+    setLoginCodeStatus({ status: "sending", message: "正在发送验证码...", cooldown: 0 });
     try {
-      const result = await loginToInfera({ identifier, password: loginForm.password });
+      const purpose = loginForm.method === "reset" ? "reset_password" : "login";
+      const result = await sendInferaEmailVerificationCode(email, purpose);
+      setLoginForm((current) => ({ ...current, identifier: email, verificationCode: "" }));
+      setLoginCodeStatus({
+        status: "sent",
+        message: "验证码已发送，请检查邮箱",
+        cooldown: Math.max(1, Number(result?.cooldown_seconds) || 60)
+      });
+    } catch (error) {
+      setLoginCodeStatus({ status: "error", message: error.message || "验证码发送失败", cooldown: 0 });
+    }
+  }
+
+  async function submitLogin() {
+    const method = loginForm.method === "code" || loginForm.method === "reset" ? loginForm.method : "password";
+    const identifier = method === "password" ? loginForm.identifier.trim() : loginForm.identifier.trim().toLowerCase();
+    if (!identifier) {
+      setLoginStatus({ status: "error", message: method === "code" ? "请输入邮箱" : "请输入账号" });
+      return;
+    }
+    if (method !== "password" && !EMAIL_IDENTIFIER_PATTERN.test(identifier)) {
+      setLoginStatus({ status: "error", message: "请输入有效的邮箱地址" });
+      return;
+    }
+    if (method !== "password" && !loginForm.verificationCode.trim()) {
+      setLoginStatus({ status: "error", message: "请输入邮箱验证码" });
+      return;
+    }
+    if (method === "password" && !loginForm.password) {
+      setLoginStatus({ status: "error", message: "请输入密码" });
+      return;
+    }
+    if (method === "reset" && loginForm.password.length < 4) {
+      setLoginStatus({ status: "error", message: "新密码至少需要 4 个字符" });
+      return;
+    }
+    if (method === "reset" && loginForm.password !== loginForm.confirmPassword) {
+      setLoginStatus({ status: "error", message: "两次输入的密码不一致" });
+      return;
+    }
+
+    setLoginStatus({
+      status: "checking",
+      message: method === "reset" ? "正在重置密码..." : method === "code" ? "正在验证验证码..." : "正在登录..."
+    });
+    try {
+      if (method === "reset") {
+        await resetInferaPassword({
+          email: identifier,
+          password: loginForm.password,
+          verificationCode: loginForm.verificationCode
+        });
+        setLoginCodeStatus({ status: "idle", message: "", cooldown: 0 });
+        setLoginForm((current) => ({
+          ...current,
+          identifier,
+          method: "password",
+          password: "",
+          confirmPassword: "",
+          verificationCode: ""
+        }));
+        setLoginStatus({ status: "success", message: "密码已重置，请使用新密码登录" });
+        return;
+      }
+
+      const result = method === "code"
+        ? await loginToInferaWithEmailCode({ email: identifier, verificationCode: loginForm.verificationCode })
+        : await loginToInfera({ identifier, password: loginForm.password });
       const nextAuth = normalizeAuthPayload(result, identifier);
       if (!nextAuth.token) {
         throw new Error("登录响应缺少 token");
@@ -2534,7 +2719,14 @@ function App() {
       authStateRef.current = nextAuth;
       setAuthState(nextAuth);
       setLoginStatus({ status: "idle", message: "" });
-      setLoginForm((current) => ({ ...current, identifier, password: "" }));
+      setLoginCodeStatus({ status: "idle", message: "", cooldown: 0 });
+      setLoginForm((current) => ({
+        ...current,
+        identifier,
+        password: "",
+        confirmPassword: "",
+        verificationCode: ""
+      }));
       setShowLogin(false);
 
       if (activeNav === "Cloud") {
@@ -2545,7 +2737,7 @@ function App() {
     } catch (error) {
       setLoginStatus({
         status: "error",
-        message: error.message || "登录验证失败"
+        message: error.message || (method === "reset" ? "密码重置失败" : "登录验证失败")
       });
     }
   }
@@ -3277,10 +3469,12 @@ function App() {
         <LoginDialog
           authState={authState}
           form={loginForm}
+          loginCodeStatus={loginCodeStatus}
           loginStatus={loginStatus}
-          onChange={(changes) => setLoginForm((current) => ({ ...current, ...changes }))}
+          onChange={updateLoginForm}
           onClose={() => setShowLogin(false)}
           onLogout={logout}
+          onSendCode={sendLoginCode}
           onSubmit={submitLogin}
         />
       )}
@@ -4604,6 +4798,7 @@ function ResearchPage({
   const users = state.users || [];
   const [activeResourceId, setActiveResourceId] = useState("");
   const [activeChatId, setActiveChatId] = useState("");
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
   const selectedResourceCount = state.selectedResourceIds?.length || 0;
   const selectedChatCount = state.selectedChatIds?.length || 0;
   const loadedResourceCount = state.resources?.length || 0;
@@ -4803,6 +4998,7 @@ function ResearchPage({
             activeItem={activeResource}
             hasMore={loadedResourceCount < Number(state.resourcesTotal || 0)}
             items={state.resources}
+            onBatchExport={() => setBatchExportOpen(true)}
             onExportFiltered={onExportFilteredResources}
             onExportSelected={onExportSelectedResources}
             onLoadMore={onLoadMoreResources}
@@ -4814,6 +5010,14 @@ function ResearchPage({
           />
         )}
       </div>
+      {batchExportOpen && (
+        <ResearchBatchExportModal
+          defaultUserId={filters.userId}
+          onClose={() => setBatchExportOpen(false)}
+          token={authState.token}
+          users={users}
+        />
+      )}
     </section>
   );
 }
@@ -4850,11 +5054,155 @@ function ResearchFilters({ filters, onChange, showStatus, users }) {
   );
 }
 
+function ResearchBatchExportModal({ defaultUserId, onClose, token, users }) {
+  const [form, setForm] = useState({ date: getLocalDateKey(), userId: String(defaultUserId || "") });
+  const [preview, setPreview] = useState({ audioCount: 0, message: "Select a user and date to check the available videos.", status: "idle", total: 0, videoCount: 0 });
+  const [job, setJob] = useState(null);
+  const [running, setRunning] = useState(false);
+  const mountedRef = useRef(true);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setJob(null);
+    if (!form.userId || !form.date) {
+      setPreview({ audioCount: 0, message: "Select a user and date to check the available videos.", status: "idle", total: 0, videoCount: 0 });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setPreview((current) => ({ ...current, message: "Checking available videos...", status: "loading" }));
+    fetchResearchDailyExportPreview(token, form.userId, form.date)
+      .then((result) => {
+        if (cancelled) return;
+        const videoCount = Number(result?.video_count || 0);
+        const audioCount = Number(result?.audio_count || 0);
+        const total = Number(result?.total || 0);
+        setPreview({
+          audioCount,
+          message: total > 0
+            ? `Found ${formatResearchNumber(videoCount)} videos and ${formatResearchNumber(audioCount)} audio assets ready to export.`
+            : "No parsed media is available for this user and date.",
+          status: "ready",
+          total,
+          videoCount
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setPreview({ audioCount: 0, message: getResearchErrorMessage(error), status: "error", total: 0, videoCount: 0 });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.date, form.userId, token]);
+
+  async function startExport() {
+    if (running || preview.total <= 0 || !form.userId || !form.date) return;
+    setRunning(true);
+    setJob({ asset_count: preview.total, status: "PENDING" });
+    try {
+      let nextJob = await createResearchDailyExport(token, {
+        date: form.date,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai",
+        user_id: Number(form.userId)
+      });
+      while (mountedRef.current) {
+        setJob(nextJob);
+        if (nextJob?.status === "READY") return;
+        if (nextJob?.status === "FAILED") {
+          throw new Error(nextJob.error_message || "Daily export failed");
+        }
+        if (!nextJob?.job_id) {
+          throw new Error("Daily export did not return a job id");
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        if (!mountedRef.current) return;
+        nextJob = await fetchResearchDailyExportStatus(token, nextJob.job_id);
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        setJob({ error_message: getResearchErrorMessage(error), status: "FAILED" });
+      }
+    } finally {
+      if (mountedRef.current) setRunning(false);
+    }
+  }
+
+  const jobStatus = String(job?.status || "").toUpperCase();
+  const statusMessage = jobStatus === "READY"
+    ? `${job.cached ? "Cached package" : "Package ready"}. ${formatResearchNumber(job.asset_count)} assets${Number(job.size_bytes) > 0 ? `, ${formatBytes(job.size_bytes)}` : ""}. The download link is ready.`
+    : jobStatus === "FAILED"
+      ? job.error_message || "Daily export failed"
+      : jobStatus === "PROCESSING"
+        ? `Packaging ${formatResearchNumber(job.asset_count)} assets. This dialog will update automatically.`
+        : jobStatus === "PENDING"
+          ? `Queued ${formatResearchNumber(job.asset_count)} assets. This dialog will update automatically.`
+          : preview.message;
+  const isError = jobStatus === "FAILED" || preview.status === "error";
+
+  return (
+    <div className="research-modal" onClick={onClose}>
+      <div className="research-modal-panel research-batch-export-panel" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <h2>Batch export</h2>
+          <button className="ghost-button" onClick={onClose} type="button">Close</button>
+        </header>
+        <div className="research-modal-body">
+          <div className="research-batch-export-form">
+            <label>
+              <span>User *</span>
+              <select disabled={running} onChange={(event) => setForm((current) => ({ ...current, userId: event.target.value }))} required value={form.userId}>
+                <option value="">Select a user</option>
+                {(users || []).map((user) => (
+                  <option key={user.user_id || user.id} value={user.user_id || user.id}>
+                    {user.label || `User ${user.user_id || user.id}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Date *</span>
+              <input disabled={running} onChange={(event) => setForm((current) => ({ ...current, date: event.target.value }))} required type="date" value={form.date} />
+            </label>
+          </div>
+          <div className="research-batch-export-summary" aria-live="polite">
+            <div><span>Videos</span><strong>{preview.status === "loading" || preview.status === "idle" ? "--" : formatResearchNumber(preview.videoCount)}</strong></div>
+            <div><span>Audio</span><strong>{preview.status === "loading" || preview.status === "idle" ? "--" : formatResearchNumber(preview.audioCount)}</strong></div>
+            <div><span>Total assets</span><strong>{preview.status === "loading" || preview.status === "idle" ? "--" : formatResearchNumber(preview.total)}</strong></div>
+          </div>
+          <div className={`research-batch-export-status ${isError ? "error" : ""}`} aria-live="polite">{statusMessage}</div>
+          {jobStatus === "READY" && job.download_url && (
+            <a className="secondary-button research-batch-export-download" download={job.filename || "research-videos.zip"} href={job.download_url} rel="noreferrer">
+              <Download size={16} />
+              <span>Download {job.filename || "research-videos.zip"}</span>
+            </a>
+          )}
+        </div>
+        <footer>
+          <span>Parsed media only</span>
+          <div className="research-batch-export-actions">
+            <button className="ghost-button" onClick={onClose} type="button">Cancel</button>
+            <button className="primary-button" disabled={running || preview.status !== "ready" || preview.total <= 0} onClick={startExport} type="button">
+              {running ? (jobStatus === "PROCESSING" ? "Packaging" : "Queued") : "Start export"}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
 function ResearchResourcesView({
   activeId,
   activeItem,
   hasMore,
   items,
+  onBatchExport,
   onExportFiltered,
   onExportSelected,
   onLoadMore,
@@ -4872,6 +5220,7 @@ function ResearchResourcesView({
         <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded</button>
         <button className="primary-button" onClick={onExportSelected} type="button">Export selected</button>
         <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered</button>
+        <button className="primary-button" onClick={onBatchExport} type="button">Batch export</button>
       </div>
       <div className="research-workspace">
         <div className="research-gallery">
@@ -5936,8 +6285,13 @@ function SplashScreen() {
   );
 }
 
-function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout, onSubmit }) {
+function LoginDialog({ authState, form, loginCodeStatus, loginStatus, onChange, onClose, onLogout, onSendCode, onSubmit }) {
   const isChecking = loginStatus.status === "checking";
+  const isSendingCode = loginCodeStatus.status === "sending";
+  const isCodeLogin = form.method === "code";
+  const isResetPassword = form.method === "reset";
+  const usesEmailCode = isCodeLogin || isResetPassword;
+  const isBusy = isChecking || isSendingCode;
   const displayName = getAuthDisplayName(authState);
   const accountName = getAuthAccountName(authState);
 
@@ -5955,8 +6309,8 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
         <div className="dialog-heading login-heading">
           <UserRound size={18} />
           <div>
-            <strong>登录</strong>
-            <span>{displayName || APP_NAME}</span>
+            <strong>{isResetPassword ? "重置密码" : "登录"}</strong>
+            <span>{isResetPassword ? "通过邮箱验证码确认身份" : displayName || APP_NAME}</span>
           </div>
         </div>
         {authState?.token && (
@@ -5977,51 +6331,165 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
             onSubmit();
           }}
         >
+          {!isResetPassword && (
+            <div aria-label="登录方式" className="login-method-switch" role="group">
+              <button
+                className={!isCodeLogin ? "active" : ""}
+                disabled={isBusy}
+                onClick={() => onChange({ method: "password", password: "", verificationCode: "" })}
+                type="button"
+              >
+                密码登录
+              </button>
+              <button
+                className={isCodeLogin ? "active" : ""}
+                disabled={isBusy}
+                onClick={() => onChange({ method: "code", password: "", verificationCode: "" })}
+                type="button"
+              >
+                验证码登录
+              </button>
+            </div>
+          )}
           <label className="login-field">
-            <span>账号</span>
-            <div className="login-input-wrap">
+            <span>{usesEmailCode ? "邮箱" : "账号"}</span>
+            <div className={`login-input-wrap ${usesEmailCode ? "has-action" : ""}`}>
               <Mail size={15} />
               <input
-                autoComplete="username"
-                disabled={isChecking}
+                autoComplete={usesEmailCode ? "email" : "username"}
+                disabled={isBusy}
                 name="identifier"
-                onChange={(event) => onChange({ identifier: event.target.value })}
-                placeholder="邮箱或手机号"
-                type="text"
+                onChange={(event) => onChange({ identifier: event.target.value, verificationCode: "" })}
+                placeholder={usesEmailCode ? "输入邮箱" : "邮箱或手机号"}
+                type={usesEmailCode ? "email" : "text"}
                 value={form.identifier}
               />
+              {usesEmailCode && (
+                <button
+                  className="login-code-button"
+                  disabled={isBusy || loginCodeStatus.cooldown > 0}
+                  onClick={onSendCode}
+                  type="button"
+                >
+                  {loginCodeStatus.cooldown > 0
+                    ? `${loginCodeStatus.cooldown}s`
+                    : isSendingCode
+                      ? "发送中"
+                      : "发送验证码"}
+                </button>
+              )}
             </div>
           </label>
           <label className="login-field">
-            <span>密码</span>
+            <span>{usesEmailCode ? "验证码" : "密码"}</span>
             <div className="login-input-wrap">
               <LockKeyhole size={15} />
-              <input
-                autoComplete="current-password"
-                disabled={isChecking}
-                onChange={(event) => onChange({ password: event.target.value })}
-                placeholder="••••••••"
-                type="password"
-                value={form.password}
-              />
+              {usesEmailCode ? (
+                <input
+                  autoComplete="one-time-code"
+                  disabled={isBusy}
+                  inputMode="numeric"
+                  onChange={(event) => onChange({ verificationCode: event.target.value })}
+                  placeholder="输入邮箱验证码"
+                  type="text"
+                  value={form.verificationCode}
+                />
+              ) : (
+                <input
+                  autoComplete="current-password"
+                  disabled={isBusy}
+                  onChange={(event) => onChange({ password: event.target.value })}
+                  placeholder="••••••••"
+                  type="password"
+                  value={form.password}
+                />
+              )}
             </div>
           </label>
-          <label className="login-remember">
-            <input
-              checked={form.remember}
-              disabled={isChecking}
-              onChange={(event) => onChange({ remember: event.target.checked })}
-              type="checkbox"
-            />
-            <span>记住登录</span>
-          </label>
+          {isResetPassword && (
+            <>
+              <label className="login-field">
+                <span>新密码</span>
+                <div className="login-input-wrap">
+                  <LockKeyhole size={15} />
+                  <input
+                    autoComplete="new-password"
+                    disabled={isBusy}
+                    onChange={(event) => onChange({ password: event.target.value })}
+                    placeholder="至少 4 个字符"
+                    type="password"
+                    value={form.password}
+                  />
+                </div>
+              </label>
+              <label className="login-field">
+                <span>确认密码</span>
+                <div className="login-input-wrap">
+                  <LockKeyhole size={15} />
+                  <input
+                    autoComplete="new-password"
+                    disabled={isBusy}
+                    onChange={(event) => onChange({ confirmPassword: event.target.value })}
+                    placeholder="再次输入新密码"
+                    type="password"
+                    value={form.confirmPassword}
+                  />
+                </div>
+              </label>
+            </>
+          )}
+          {isResetPassword ? (
+            <div className="login-recovery-link">
+              <button
+                disabled={isBusy}
+                onClick={() => onChange({ method: "password", password: "", confirmPassword: "", verificationCode: "" })}
+                type="button"
+              >
+                返回登录
+              </button>
+            </div>
+          ) : (
+            <label className="login-remember">
+              <input
+                checked={form.remember}
+                disabled={isBusy}
+                onChange={(event) => onChange({ remember: event.target.checked })}
+                type="checkbox"
+              />
+              <span>记住登录</span>
+            </label>
+          )}
+          {!usesEmailCode && (
+            <div className="login-recovery-link">
+              <button
+                disabled={isBusy}
+                onClick={() => onChange({ method: "reset", password: "", confirmPassword: "", verificationCode: "" })}
+                type="button"
+              >
+                忘记密码？
+              </button>
+            </div>
+          )}
+          {usesEmailCode && loginCodeStatus.message && (
+            <div className={`login-status ${loginCodeStatus.status === "error" ? "error" : loginCodeStatus.status === "sending" ? "checking" : ""}`}>
+              {loginCodeStatus.message}
+            </div>
+          )}
           {loginStatus.message && <div className={`login-status ${loginStatus.status}`}>{loginStatus.message}</div>}
           <div className="dialog-actions login-actions">
-            <button className="ghost-button" disabled={isChecking} onClick={onClose} type="button">
+            <button className="ghost-button" disabled={isBusy} onClick={onClose} type="button">
               取消
             </button>
-            <button className="primary-button" disabled={isChecking} type="submit">
-              {isChecking ? "登录中" : "登录"}
+            <button className="primary-button" disabled={isBusy} type="submit">
+              {isChecking
+                ? isResetPassword
+                  ? "重置中"
+                  : isCodeLogin
+                    ? "验证中"
+                    : "登录中"
+                : isResetPassword
+                  ? "重置密码"
+                  : "登录"}
             </button>
           </div>
         </form>
@@ -6526,6 +6994,7 @@ function createTransferTask(job, { auto = false, autoClearLocal = false, kind = 
     path: isBackup ? uploadPath : job.path || uploadPath,
     percent: 0,
     sourceJobId: job.id || "",
+    sha256: job.sha256 || "",
     speedBytesPerSecond: 0,
     startTimeMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
     status: "queued",
@@ -6570,6 +7039,7 @@ function createJobFromTransferTask(task) {
     path: task.path,
     size: task.totalBytes,
     sizeBytes: task.totalBytes,
+    sha256: task.sha256 || "",
     sourceJobId: task.sourceJobId,
     startTimeMs: task.startTimeMs,
     totalBytes: task.totalBytes,
@@ -6664,6 +7134,7 @@ function applyTransferProgress(queue, progress) {
       elapsedMs: status === "paused" ? item.elapsedMs : item.startedAt ? Math.max(Number(item.elapsedMs) || 0, Date.now() - item.startedAt) : item.elapsedMs,
       message: normalizeUploadProgressMessage(progress.message, status) || item.message,
       percent: clampPercent(progress.percent),
+      sha256: progress.sha256 || item.sha256 || "",
       speedBytesPerSecond: status === "uploading" ? Number(progress.speedBytesPerSecond) || 0 : 0,
       status,
       totalBytes
@@ -6710,6 +7181,17 @@ function getUploadDoneMessage(clearResult, operation = "upload") {
   }
 
   return operation === "backup" ? "备份完成" : "上传完成";
+}
+
+function getUploadHistoryDoneMessage(clearResult, operation = "upload") {
+  const operationLabel = operation === "backup" ? "备份" : "上传";
+  if (clearResult?.deleted) {
+    return `检测到历史${operationLabel}记录，本地文件已清除`;
+  }
+  if (clearResult?.error) {
+    return `检测到历史${operationLabel}记录，已标记完成；本地文件清除失败：${clearResult.error}`;
+  }
+  return `检测到历史${operationLabel}记录，已标记完成`;
 }
 
 function getTransferSuccessPatch({ clearTarget, cleared, isBackup, result, timestamp, uploadPath }) {
