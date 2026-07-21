@@ -143,7 +143,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-07-14",
+  updatedAt: "2026-07-21",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -929,6 +929,136 @@ async function exportResearchChats(token, payload) {
   });
 }
 
+async function fetchResearchExportCount(token, filters, maxAssets = 2000) {
+  const params = getResearchListParams(filters, { includeStatus: true });
+  delete params.limit;
+  delete params.offset;
+  delete params.start_ms;
+  delete params.end_ms;
+  params.max_assets = maxAssets;
+  return requestInfera(buildResearchPath("/assets/videos/export-count", params), { token });
+}
+
+async function createResearchDailyExport(token, payload) {
+  return requestInfera(buildResearchPath("/assets/videos/daily-exports"), {
+    method: "POST",
+    token,
+    body: payload
+  });
+}
+
+async function fetchResearchDailyExport(token, jobId) {
+  return requestInfera(buildResearchPath(`/assets/videos/daily-exports/${encodeURIComponent(jobId)}`), { token });
+}
+
+async function fetchResearchSimulationSessions(token, subjectUserId) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions`), { token });
+}
+
+async function fetchResearchSimulationSession(token, subjectUserId, sessionCode) {
+  return requestInfera(
+    buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions/${encodeURIComponent(sessionCode)}`),
+    { token }
+  );
+}
+
+function createResearchSimulationStreamId() {
+  return `research-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function consumeResearchSseResponse(response, onEvent) {
+  if (!response.body) throw new Error("Research simulation stream returned no body.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const dispatch = (block) => {
+    if (!block.trim()) return;
+    let eventName = "message";
+    const dataLines = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
+    if (!dataLines.length) return;
+    const text = dataLines.join("\n");
+    let data = { text };
+    try { data = JSON.parse(text); } catch {}
+    onEvent({ event: eventName, data });
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() || "";
+    blocks.forEach(dispatch);
+    if (done) break;
+  }
+  dispatch(buffer);
+}
+
+async function streamResearchSimulationInput(token, subjectUserId, sessionCode, body, onEvent) {
+  const path = buildResearchPath(
+    `/simulations/users/${encodeURIComponent(subjectUserId)}/sessions/${encodeURIComponent(sessionCode || "new")}/input/stream`
+  );
+  const attempt = async (accessToken) => {
+    let streamError = null;
+    const handleEvent = (message) => {
+      const eventName = message?.event || "message";
+      const data = message?.data || {};
+      if (eventName === "error" || eventName === "stream_error") {
+        streamError = new Error(data.message || "Unable to complete the Research simulation");
+        return;
+      }
+      onEvent(message);
+    };
+    if (
+      typeof dlEditor.streamResearchSimulation === "function" &&
+      typeof dlEditor.onResearchSimulationStreamEvent === "function"
+    ) {
+      const streamId = createResearchSimulationStreamId();
+      const unsubscribe = dlEditor.onResearchSimulationStreamEvent(streamId, handleEvent);
+      try {
+        await dlEditor.streamResearchSimulation({ streamId, path, token: accessToken, body });
+      } finally {
+        unsubscribe?.();
+      }
+      if (streamError) throw streamError;
+      return;
+    }
+
+    const response = await fetch(resolveInferaUrl(path), {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let detail = text;
+      try {
+        const payload = JSON.parse(text);
+        detail = payload?.message || payload?.detail || text;
+      } catch {}
+      throw createInferaHttpError(response.status, detail);
+    }
+    await consumeResearchSseResponse(response, handleEvent);
+    if (streamError) throw streamError;
+  };
+
+  const currentAuth = inferaAuthController?.getAuth?.();
+  const effectiveToken = currentAuth?.token || token;
+  try {
+    await attempt(effectiveToken);
+  } catch (error) {
+    if (!isInferaUnauthorizedError(error)) throw error;
+    const nextAuth = await refreshInferaAuth();
+    await attempt(nextAuth.token);
+  }
+}
+
 function getResearchDownloadFilename(disposition, fallback = "research-export.zip") {
   const text = String(disposition || "");
   const utf8Match = text.match(/filename\*=UTF-8''([^;]+)/i);
@@ -1128,7 +1258,61 @@ function shortResearchDateKey(value) {
 }
 
 function getResearchUserLabel(user) {
-  return user?.label || user?.nickname || user?.name || `User ${user?.user_id || user?.id || "-"}`;
+  const userId = user?.user_id || user?.id || "-";
+  const name = String(user?.nickname || user?.name || "").trim() || `User ${userId}`;
+  const parsedCount = user?.parsed_asset_count ?? user?.parsed_video_count ?? 0;
+  return `${name} (ID ${userId} · parsed ${formatResearchNumber(parsedCount)} · chats ${formatResearchNumber(user?.chat_session_count || 0)})`;
+}
+
+function getResearchEvidenceKind(evidence) {
+  const type = String(evidence?.evidence_type || "").trim().toLowerCase();
+  const mime = String(evidence?.mime || "").trim().toLowerCase();
+  const variant = String(evidence?.metadata?.display_variant || "").trim().toLowerCase();
+  const mediaUrl = String(evidence?.media_url || "").toLowerCase();
+  if (mime.startsWith("image/") || ["image", "frame", "keyframe", "snapshot", "still"].includes(type) || variant.includes("frame")) return "image";
+  if (mime.startsWith("audio/") || type === "audio" || /\.(mp3|m4a|ogg|opus|wav)(?:[?#]|$)/.test(mediaUrl)) return "audio";
+  if (mime.startsWith("video/") || type === "video" || variant.includes("video") || /\.(mp4|mov|m4v|webm)(?:[?#]|$)/.test(mediaUrl)) return "video";
+  return "text";
+}
+
+function formatResearchEvidenceOffset(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "";
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}` : `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function getResearchEvidenceTimeLabel(evidence) {
+  const metadataLabel = String(evidence?.metadata?.time_label || "").trim();
+  if (metadataLabel) return metadataLabel;
+  const start = formatResearchEvidenceOffset(evidence?.start_ms);
+  const end = formatResearchEvidenceOffset(evidence?.end_ms);
+  return start && end && start !== end ? `${start} - ${end}` : start || end;
+}
+
+async function resolveResearchEvidenceUrl(token, rawUrl) {
+  const normalized = String(rawUrl || "").trim();
+  if (!normalized) return "";
+  try {
+    const url = new URL(normalized, resolveInferaUrl("/"));
+    const keyframe = url.pathname.match(/^\/memory\/keyframes\/(\d+)\/content\/?$/);
+    if (keyframe) return resolveResearchSignedUrl(token, buildResearchPath(`/keyframes/${keyframe[1]}/content`));
+    const asset = url.pathname.match(/^\/memory\/assets\/(\d+)\/clip\/?$/);
+    if (asset) {
+      return resolveResearchSignedUrl(token, buildResearchPath(`/assets/${asset[1]}/video`, {
+        start_ms: url.searchParams.get("start_ms"),
+        end_ms: url.searchParams.get("end_ms")
+      }));
+    }
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    return resolveResearchSignedUrl(token, normalized);
+  } catch {
+    return "";
+  }
 }
 
 function App() {
@@ -2661,6 +2845,14 @@ function App() {
           statistics,
           message: ""
         }));
+      } else if (tabOverride === "simulation") {
+        const users = await usersPromise;
+        setResearchState((current) => ({
+          ...current,
+          status: "ready",
+          users: normalizeResearchItems(users),
+          message: ""
+        }));
       } else {
         const [users, resources] = await Promise.all([usersPromise, fetchResearchResources(token, filtersOverride, { offset })]);
         const resourceItems = normalizeResearchItems(resources);
@@ -2776,7 +2968,7 @@ function App() {
           ? await exportResearchChats(token, {
               ...commonPayload,
               session_ids: selectAll ? [] : selectedIds.map(Number),
-              max_sessions: 500,
+              max_sessions: 2000,
               start_ms: dateParams.start_ms,
               end_ms: dateParams.end_ms,
               include_evidences: true
@@ -2785,7 +2977,7 @@ function App() {
               ...commonPayload,
               asset_ids: selectAll ? [] : selectedIds.map(Number),
               delivery: "oss",
-              max_assets: 500,
+              max_assets: 2000,
               parse_status: researchFilters.status || null,
               date_start_ms: dateParams.date_start_ms,
               date_end_ms: dateParams.date_end_ms,
@@ -4604,6 +4796,8 @@ function ResearchPage({
   const users = state.users || [];
   const [activeResourceId, setActiveResourceId] = useState("");
   const [activeChatId, setActiveChatId] = useState("");
+  const [showBatchExport, setShowBatchExport] = useState(false);
+  const [exportAllState, setExportAllState] = useState({ open: false, status: "idle", data: null, message: "" });
   const selectedResourceCount = state.selectedResourceIds?.length || 0;
   const selectedChatCount = state.selectedChatIds?.length || 0;
   const loadedResourceCount = state.resources?.length || 0;
@@ -4635,15 +4829,34 @@ function ResearchPage({
   const tabs = [
     ["resources", "Resources"],
     ["chats", "Chats"],
+    ["simulation", "Simulation"],
     ["statistics", "Statistics"]
   ];
-  const title = tab === "chats" ? "Agent Chats" : tab === "statistics" ? "User Statistics" : "Research Resources";
+  const title = tab === "chats" ? "Agent Chats" : tab === "simulation" ? "Research Simulation" : tab === "statistics" ? "User Statistics" : "Research Resources";
   const meta =
     tab === "chats"
       ? `${loadedChatCount}${state.chatsTotal > loadedChatCount ? ` / ${state.chatsTotal}` : ""} chats loaded · Selected ${selectedChatCount} chats`
+      : tab === "simulation"
+        ? "Use a provider's data context without writing to their chat history"
       : tab === "statistics"
         ? `${state.statistics?.users?.length || 0} users counted`
         : `${loadedResourceCount}${state.resourcesTotal > loadedResourceCount ? ` / ${state.resourcesTotal}` : ""} files loaded · Selected ${selectedResourceCount} items`;
+
+  async function openExportAllModal() {
+    setExportAllState({ open: true, status: "loading", data: null, message: "Checking matching resources..." });
+    try {
+      const data = await fetchResearchExportCount(authState.token, filters, 2000);
+      setExportAllState({ open: true, status: "ready", data, message: "" });
+    } catch (error) {
+      setExportAllState({ open: true, status: "error", data: null, message: error.message || "Unable to count matching resources" });
+    }
+  }
+
+  async function confirmExportAll() {
+    setExportAllState((current) => ({ ...current, status: "exporting" }));
+    await onExportFilteredResources();
+    setExportAllState({ open: false, status: "idle", data: null, message: "" });
+  }
 
   if (!authState?.token) {
     return (
@@ -4742,6 +4955,8 @@ function ResearchPage({
                 ? `${state.chatsTotal || 0} chats · selected ${selectedChatCount}`
                 : tab === "statistics"
                   ? `${state.statistics?.users?.length || 0} users`
+                  : tab === "simulation"
+                    ? "Researcher-owned test conversations"
                   : `${state.resourcesTotal || 0} files · selected ${selectedResourceCount}`}
             </span>
           </div>
@@ -4757,7 +4972,7 @@ function ResearchPage({
           </button>
         </header>
 
-        {tab !== "statistics" && <ResearchFilters filters={filters} onChange={onFilterChange} showStatus={tab === "resources"} users={users} />}
+        {(tab === "resources" || tab === "chats") && <ResearchFilters filters={filters} onChange={onFilterChange} showStatus={tab === "resources"} users={users} />}
 
         {state.status === "error" && (
           <div className="repository-alert">
@@ -4794,7 +5009,10 @@ function ResearchPage({
             onSelectLoaded={onSelectLoadedChats}
             onToggle={onToggleChat}
             selectedIds={state.selectedChatIds}
+            token={authState.token}
           />
+        ) : tab === "simulation" ? (
+          <ResearchSimulationView token={authState.token} users={users} />
         ) : tab === "statistics" ? (
           <ResearchStatisticsView data={state.statistics} />
         ) : (
@@ -4803,7 +5021,8 @@ function ResearchPage({
             activeItem={activeResource}
             hasMore={loadedResourceCount < Number(state.resourcesTotal || 0)}
             items={state.resources}
-            onExportFiltered={onExportFilteredResources}
+            onBatchExport={() => setShowBatchExport(true)}
+            onExportFiltered={openExportAllModal}
             onExportSelected={onExportSelectedResources}
             onLoadMore={onLoadMoreResources}
             onSelectItem={setActiveResourceId}
@@ -4814,6 +5033,21 @@ function ResearchPage({
           />
         )}
       </div>
+      {showBatchExport && (
+        <ResearchBatchExportModal
+          initialUserId={filters.userId}
+          onClose={() => setShowBatchExport(false)}
+          token={authState.token}
+          users={users}
+        />
+      )}
+      {exportAllState.open && (
+        <ResearchExportAllModal
+          onClose={() => setExportAllState({ open: false, status: "idle", data: null, message: "" })}
+          onConfirm={confirmExportAll}
+          state={exportAllState}
+        />
+      )}
     </section>
   );
 }
@@ -4825,7 +5059,7 @@ function ResearchFilters({ filters, onChange, showStatus, users }) {
         <option value="">All users</option>
         {users.map((user) => (
           <option key={user.user_id || user.id} value={user.user_id || user.id}>
-            {user.label || `User ${user.user_id || user.id}`}
+            {getResearchUserLabel(user)}
           </option>
         ))}
       </select>
@@ -4850,11 +5084,320 @@ function ResearchFilters({ filters, onChange, showStatus, users }) {
   );
 }
 
+function ResearchExportAllModal({ onClose, onConfirm, state }) {
+  const data = state.data || {};
+  const total = Number(data.total || 0);
+  const estimated = Number(data.estimated_export_count || 0);
+  const busy = state.status === "loading" || state.status === "exporting";
+  const message = state.status === "error"
+    ? state.message
+    : state.status === "loading"
+      ? "Checking matching resources..."
+      : data.truncated
+        ? `${formatResearchNumber(total)} assets match. The most recent ${formatResearchNumber(estimated)} will be exported because each export is limited to ${formatResearchNumber(data.max_assets || 2000)}.`
+        : total > 0
+          ? `${formatResearchNumber(total)} assets match the current filters and will be exported.`
+          : "No parsed media matches the current filters.";
+  return (
+    <div className="research-modal" onClick={busy ? undefined : onClose}>
+      <div className="research-modal-panel research-export-modal" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <h2>Export all matching resources</h2>
+          <button className="ghost-button" disabled={busy} onClick={onClose} type="button">Close</button>
+        </header>
+        <div className="research-modal-body">
+          <div className="research-export-summary">
+            <div><span>Videos</span><strong>{state.status === "loading" ? "--" : formatResearchNumber(data.video_count)}</strong></div>
+            <div><span>Audio</span><strong>{state.status === "loading" ? "--" : formatResearchNumber(data.audio_count)}</strong></div>
+            <div><span>Will export</span><strong>{state.status === "loading" ? "--" : formatResearchNumber(estimated)}</strong></div>
+          </div>
+          <div className={`research-export-status ${state.status === "error" ? "error" : ""}`}>{message}</div>
+        </div>
+        <footer>
+          <span>Uses the current filters · maximum 2,000 assets</span>
+          <div>
+            <button className="ghost-button" disabled={busy} onClick={onClose} type="button">Cancel</button>
+            <button className="primary-button" disabled={state.status !== "ready" || estimated <= 0} onClick={onConfirm} type="button">
+              {state.status === "exporting" ? "Exporting" : "Export"}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ResearchBatchExportModal({ initialUserId, onClose, token, users }) {
+  const [userId, setUserId] = useState(initialUserId || "");
+  const [date, setDate] = useState(() => getLocalDateKey());
+  const [includeMedia, setIncludeMedia] = useState(true);
+  const [countState, setCountState] = useState({ status: "idle", total: 0, video: 0, audio: 0, message: "" });
+  const [jobState, setJobState] = useState({ status: "idle", data: null, message: "" });
+  const running = jobState.status === "running";
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!userId || !date) {
+      setCountState({ status: "idle", total: 0, video: 0, audio: 0, message: "Select a user and date to check available resources." });
+      return undefined;
+    }
+    setCountState({ status: "loading", total: 0, video: 0, audio: 0, message: "Checking available resources..." });
+    fetchResearchResources(token, { userId, from: date, to: date }, { limit: 1, offset: 0 })
+      .then((data) => {
+        if (cancelled) return;
+        const total = Number(data?.total || 0);
+        const video = Number(data?.video_count || 0);
+        const audio = Number(data?.audio_count || 0);
+        setCountState({
+          status: "ready",
+          total,
+          video,
+          audio,
+          message: total > 0 ? `Found ${formatResearchNumber(video)} videos and ${formatResearchNumber(audio)} audio assets.` : "No parsed media is available for this user and date."
+        });
+      })
+      .catch((error) => {
+        if (!cancelled) setCountState({ status: "error", total: 0, video: 0, audio: 0, message: error.message || "Unable to count resources" });
+      });
+    return () => { cancelled = true; };
+  }, [date, token, userId]);
+
+  async function startExport() {
+    if (!userId || !date || countState.total <= 0 || running) return;
+    setJobState({ status: "running", data: null, message: "Queuing export..." });
+    try {
+      let data = await createResearchDailyExport(token, {
+        user_id: Number(userId),
+        date,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai",
+        include_media: includeMedia
+      });
+      while (data.status !== "READY") {
+        if (data.status === "FAILED") throw new Error(data.error_message || "Batch export failed");
+        const mode = data.include_media === false ? "parsed data only" : "media and parsed data";
+        setJobState({ status: "running", data, message: `${data.status === "PROCESSING" ? "Packaging" : "Queued"} ${formatResearchNumber(data.asset_count)} assets (${mode}).` });
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        data = await fetchResearchDailyExport(token, data.job_id);
+      }
+      await saveResearchDownload(data, data.filename || "research-daily-export.zip");
+      const mode = data.include_media === false ? "parsed data only" : "media and parsed data";
+      setJobState({
+        status: "ready",
+        data,
+        message: `${data.cached ? "Cached package" : "Package ready"}: ${mode}. ${formatResearchNumber(data.asset_count)} assets, ${formatBytes(data.size_bytes) || "0 B"}.`
+      });
+    } catch (error) {
+      setJobState({ status: "error", data: null, message: error.message || "Batch export failed" });
+    }
+  }
+
+  return (
+    <div className="research-modal" onClick={running ? undefined : onClose}>
+      <div className="research-modal-panel research-export-modal" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <h2>Batch export</h2>
+          <button className="ghost-button" disabled={running} onClick={onClose} type="button">Close</button>
+        </header>
+        <div className="research-modal-body">
+          <div className="research-batch-fields">
+            <label><span>User *</span><select disabled={running} onChange={(event) => setUserId(event.target.value)} value={userId}>
+              <option value="">Select a user</option>
+              {users.map((user) => <option key={user.user_id || user.id} value={user.user_id || user.id}>{getResearchUserLabel(user)}</option>)}
+            </select></label>
+            <label><span>Date *</span><input disabled={running} onChange={(event) => setDate(event.target.value)} type="date" value={date} /></label>
+          </div>
+          <div className="research-export-summary">
+            <div><span>Videos</span><strong>{countState.status === "loading" ? "--" : formatResearchNumber(countState.video)}</strong></div>
+            <div><span>Audio</span><strong>{countState.status === "loading" ? "--" : formatResearchNumber(countState.audio)}</strong></div>
+            <div><span>Total assets</span><strong>{countState.status === "loading" ? "--" : formatResearchNumber(countState.total)}</strong></div>
+          </div>
+          <label className="research-export-media-option">
+            <input checked={includeMedia} disabled={running} onChange={(event) => setIncludeMedia(event.target.checked)} type="checkbox" />
+            <span><strong>Include video and audio files</strong><small>Turn this off to export metadata and parsed data only.</small></span>
+          </label>
+          <div className={`research-export-status ${countState.status === "error" || jobState.status === "error" ? "error" : ""}`}>
+            {jobState.status === "idle" ? countState.message : jobState.message}
+          </div>
+          {jobState.status === "ready" && jobState.data?.download_url && (
+            <a className="secondary-button research-export-download" download={jobState.data.filename} href={jobState.data.download_url} rel="noreferrer">Download {jobState.data.filename}</a>
+          )}
+        </div>
+        <footer>
+          <span>Parsed media only</span>
+          <div>
+            <button className="ghost-button" disabled={running} onClick={onClose} type="button">Cancel</button>
+            <button className="primary-button" disabled={running || countState.status !== "ready" || countState.total <= 0} onClick={startExport} type="button">
+              {running ? "Packaging" : "Start export"}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ResearchSimulationView({ token, users }) {
+  const [subjectUserId, setSubjectUserId] = useState("");
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionCode, setActiveSessionCode] = useState("new");
+  const [session, setSession] = useState(null);
+  const [question, setQuestion] = useState("");
+  const [thinkingLevel, setThinkingLevel] = useState("0");
+  const [draftAnswer, setDraftAnswer] = useState("");
+  const [status, setStatus] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const messagesRef = useRef(null);
+
+  useEffect(() => {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight });
+  }, [draftAnswer, session?.messages]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSessions([]);
+    setActiveSessionCode("new");
+    setSession(null);
+    setDraftAnswer("");
+    if (!subjectUserId) {
+      setStatus("");
+      return undefined;
+    }
+    setStatus("Loading conversations...");
+    fetchResearchSimulationSessions(token, subjectUserId)
+      .then((data) => {
+        if (!cancelled) {
+          setSessions(normalizeResearchItems(data));
+          setStatus("");
+        }
+      })
+      .catch((error) => { if (!cancelled) setStatus(error.message || "Unable to load simulations"); });
+    return () => { cancelled = true; };
+  }, [subjectUserId]);
+
+  async function loadSession(sessionCode) {
+    if (!subjectUserId || streaming) return;
+    setStatus("Loading conversation...");
+    try {
+      const data = await fetchResearchSimulationSession(token, subjectUserId, sessionCode);
+      setActiveSessionCode(sessionCode);
+      setSession(data);
+      setDraftAnswer("");
+      setStatus("");
+    } catch (error) {
+      setStatus(error.message || "Unable to load the conversation");
+    }
+  }
+
+  function startNewSession() {
+    if (streaming) return;
+    setActiveSessionCode("new");
+    setSession(null);
+    setDraftAnswer("");
+    setStatus("");
+  }
+
+  async function submitQuestion(event) {
+    event.preventDefault();
+    const normalizedQuestion = question.trim();
+    if (!subjectUserId || !normalizedQuestion || streaming) return;
+    const requestId = createResearchSimulationStreamId();
+    const existingMessages = Array.isArray(session?.messages) ? session.messages : [];
+    setSession((current) => ({ ...(current || {}), messages: [...existingMessages, { role: "user", content: normalizedQuestion, evidences: [] }] }));
+    setQuestion("");
+    setDraftAnswer("");
+    setStreaming(true);
+    setStatus("Preparing your answer...");
+    let resolvedSessionCode = activeSessionCode || "new";
+    try {
+      await streamResearchSimulationInput(
+        token,
+        subjectUserId,
+        resolvedSessionCode,
+        { client_request_id: requestId, question_text: normalizedQuestion, top_k: 3, thinking_level: Number(thinkingLevel) || 0 },
+        ({ event: eventName, data }) => {
+          if (eventName === "session" && data?.session_code) {
+            resolvedSessionCode = data.session_code;
+            setActiveSessionCode(data.session_code);
+          } else if (eventName === "status") {
+            setStatus(data?.text || data?.stage || "Working...");
+          } else if (eventName === "delta") {
+            setDraftAnswer((current) => current + (data?.text || ""));
+          } else if (eventName === "done" && data?.session) {
+            resolvedSessionCode = data.session.session_code || resolvedSessionCode;
+            setActiveSessionCode(resolvedSessionCode);
+            setSession(data.session);
+            setDraftAnswer("");
+          }
+        }
+      );
+      const list = await fetchResearchSimulationSessions(token, subjectUserId);
+      setSessions(normalizeResearchItems(list));
+      if (resolvedSessionCode !== "new") {
+        setSession(await fetchResearchSimulationSession(token, subjectUserId, resolvedSessionCode));
+        setActiveSessionCode(resolvedSessionCode);
+      }
+      setStatus("");
+    } catch (error) {
+      setStatus(error.message || "Unable to complete the conversation");
+    } finally {
+      setStreaming(false);
+      setDraftAnswer("");
+    }
+  }
+
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  return (
+    <section className="research-simulation-view">
+      <aside className="research-simulation-sidebar">
+        <div className="research-simulation-toolbar">
+          <select disabled={streaming} onChange={(event) => setSubjectUserId(event.target.value)} value={subjectUserId}>
+            <option value="">Select data provider</option>
+            {users.map((user) => <option key={user.user_id || user.id} value={user.user_id || user.id}>{getResearchUserLabel(user)}</option>)}
+          </select>
+          <button className="primary-button" disabled={streaming || !subjectUserId} onClick={startNewSession} type="button">New</button>
+        </div>
+        <div className="research-simulation-sessions">
+          {!subjectUserId ? <div className="research-preview-empty">Select a data provider</div> : sessions.length === 0 ? <div className="research-preview-empty">No saved simulations for this provider</div> : sessions.map((item) => (
+            <button className={item.session_code === activeSessionCode ? "active" : ""} key={item.session_code} onClick={() => loadSession(item.session_code)} type="button">
+              <strong>{item.title || item.latest_question || "Untitled conversation"}</strong>
+              <span>{item.update_time ? new Date(item.update_time).toLocaleString() : ""}</span>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <div className="research-simulation-chat">
+        <header>
+          <div>
+            <h2>{activeSessionCode === "new" ? "New research simulation" : session?.title || session?.latest_question || "Research simulation"}</h2>
+            {activeSessionCode !== "new" && <span className="research-chat-id" title={activeSessionCode}>Chat ID: {activeSessionCode}</span>}
+            <span>The data provider is fixed when a new session starts. Switch providers to browse their conversations.</span>
+          </div>
+        </header>
+        <div className="research-simulation-messages" ref={messagesRef}>
+          {!messages.length && !draftAnswer ? (
+            <div className="research-preview-empty">{subjectUserId ? "Start a new conversation with this provider's data context." : "Select a data provider, then start a conversation."}</div>
+          ) : (
+            <>
+              {messages.map((message, index) => <ResearchChatMessage key={message.message_id || message.id || `${message.role}-${index}`} message={message} token={token} />)}
+              {streaming && <div className="research-chat-message-row assistant"><article className="research-chat-message assistant streaming"><p>{draftAnswer || "..."}</p></article></div>}
+            </>
+          )}
+        </div>
+        <form className="research-simulation-composer" onSubmit={submitQuestion}>
+          <textarea disabled={streaming || !subjectUserId} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask the agent as this data provider..." value={question} />
+          <div><span>{status}</span><select disabled={streaming} onChange={(event) => setThinkingLevel(event.target.value)} value={thinkingLevel}><option value="0">Fast</option><option value="1">Balanced</option><option value="2">Deep</option></select><button className="primary-button" disabled={streaming || !subjectUserId || !question.trim()} type="submit">{streaming ? "Working" : "Send"}</button></div>
+        </form>
+      </div>
+    </section>
+  );
+}
+
 function ResearchResourcesView({
   activeId,
   activeItem,
   hasMore,
   items,
+  onBatchExport,
   onExportFiltered,
   onExportSelected,
   onLoadMore,
@@ -4871,7 +5414,8 @@ function ResearchResourcesView({
       <div className="research-actions">
         <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded</button>
         <button className="primary-button" onClick={onExportSelected} type="button">Export selected</button>
-        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered</button>
+        <button className="ghost-button" onClick={onExportFiltered} type="button">Export all</button>
+        <button className="ghost-button" onClick={onBatchExport} type="button">Batch export</button>
       </div>
       <div className="research-workspace">
         <div className="research-gallery">
@@ -5136,7 +5680,8 @@ function ResearchChatsView({
   onSelectItem,
   onSelectLoaded,
   onToggle,
-  selectedIds
+  selectedIds,
+  token
 }) {
   const selected = new Set((selectedIds || []).map(String));
   return (
@@ -5174,7 +5719,7 @@ function ResearchChatsView({
             </>
           )}
         </div>
-        <ResearchChatDetail item={activeItem} />
+        <ResearchChatDetail item={activeItem} token={token} />
       </div>
     </section>
   );
@@ -5263,7 +5808,7 @@ function ResearchFeedbackPreview({ messages }) {
   );
 }
 
-function ResearchChatDetail({ item }) {
+function ResearchChatDetail({ item, token }) {
   if (!item) {
     return (
       <aside className="research-detail chat-detail">
@@ -5273,17 +5818,19 @@ function ResearchChatDetail({ item }) {
   }
 
   const messages = Array.isArray(item.messages) ? item.messages : [];
+  const chatId = item.session_code || getResearchChatId(item);
   return (
     <aside className="research-detail chat-detail">
       <header>
         <div>
           <h2>{item.title || item.latest_question || item.session_code || `Session ${getResearchChatId(item)}`}</h2>
+          <p className="research-chat-id" title={String(chatId)}>Chat ID: {chatId}</p>
           <p>{[`User ${item.user_id || "-"}`, `${item.message_count || messages.length} messages`].join(" · ")}</p>
         </div>
       </header>
       <div className="research-chat-messages">
         {messages.length ? (
-          messages.map((message) => <ResearchChatMessage key={message.message_id || message.id || `${message.role}-${message.create_time}`} message={message} />)
+          messages.map((message) => <ResearchChatMessage key={message.message_id || message.id || `${message.role}-${message.create_time}`} message={message} token={token} />)
         ) : (
           <div className="research-preview-empty">No messages</div>
         )}
@@ -5292,26 +5839,71 @@ function ResearchChatDetail({ item }) {
   );
 }
 
-function ResearchChatMessage({ message }) {
+function ResearchChatMessage({ message, token }) {
   const role = String(message.role || "message").toLowerCase();
   const feedbackRating = normalizeResearchFeedbackRating(message.feedback_rating);
   const evidenceCount = Array.isArray(message.evidences) ? message.evidences.length : 0;
   return (
-    <article className={`research-chat-message ${role}`}>
-      <div className="research-chat-message-meta">
-        <strong>{role}</strong>
-        <span>{formatResearchDateTime(message.create_time)}</span>
-        {message.message_group && <span>{message.message_group}</span>}
-        {evidenceCount > 0 && <span>{evidenceCount} evidences</span>}
-      </div>
-      <p>{message.content || ""}</p>
-      {feedbackRating && (
-        <div className={`research-chat-feedback ${feedbackRating}`}>
-          <strong>Feedback: {feedbackRating === "like" ? "Like" : "Dislike"}</strong>
-          {message.feedback_text && <span>{message.feedback_text}</span>}
-          {message.feedback_at && <small>{formatResearchDateTime(message.feedback_at)}</small>}
-        </div>
-      )}
+    <div className={`research-chat-message-row ${role}`}>
+      <article className={`research-chat-message ${role}`}>
+        <p>{message.content || ""}</p>
+        {evidenceCount > 0 && <ResearchEvidenceList evidences={message.evidences} token={token} />}
+        {feedbackRating && (
+          <div className={`research-chat-feedback ${feedbackRating}`}>
+            <strong>Feedback: {feedbackRating === "like" ? "Like" : "Dislike"}</strong>
+            {message.feedback_text && <span>{message.feedback_text}</span>}
+            {message.feedback_at && <small>{formatResearchDateTime(message.feedback_at)}</small>}
+          </div>
+        )}
+      </article>
+      {message.create_time && <time className="research-chat-message-time" dateTime={message.create_time}>{formatResearchDateTime(message.create_time)}</time>}
+    </div>
+  );
+}
+
+function ResearchEvidenceList({ evidences, token }) {
+  return (
+    <section className="research-evidence-list">
+      <div className="research-evidence-list-title">Evidence · {evidences.length}</div>
+      {evidences.map((evidence, index) => (
+        <ResearchEvidenceCard evidence={evidence} key={evidence.evidence_id || evidence.id || index} token={token} />
+      ))}
+    </section>
+  );
+}
+
+function ResearchEvidenceCard({ evidence, token }) {
+  const [urls, setUrls] = useState({ cover: "", media: "" });
+  const kind = getResearchEvidenceKind(evidence);
+  const type = String(evidence?.evidence_type || kind || "text");
+  const title = String(evidence?.title || evidence?.description || `${type} evidence`);
+  const content = String(evidence?.content_text || "").trim();
+  const description = String(evidence?.description || "").trim();
+  const timeLabel = getResearchEvidenceTimeLabel(evidence);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      resolveResearchEvidenceUrl(token, evidence?.media_url),
+      resolveResearchEvidenceUrl(token, evidence?.cover_url)
+    ]).then(([media, cover]) => {
+      if (!cancelled) setUrls({ media, cover });
+    }).catch(() => {
+      if (!cancelled) setUrls({ media: "", cover: "" });
+    });
+    return () => { cancelled = true; };
+  }, [evidence?.cover_url, evidence?.media_url, token]);
+
+  const imageUrl = urls.media || urls.cover;
+  return (
+    <article className={`research-evidence-card ${kind}`}>
+      <header><span>{type}</span><strong title={title}>{title}</strong>{timeLabel && <small>{timeLabel}</small>}</header>
+      {kind === "image" && imageUrl && <a href={imageUrl} rel="noreferrer" target="_blank"><img alt={title} loading="lazy" src={imageUrl} /></a>}
+      {kind === "video" && urls.media && <video controls playsInline poster={urls.cover || undefined} preload="metadata" src={urls.media} />}
+      {kind === "audio" && urls.media && <audio controls preload="metadata" src={urls.media} />}
+      {content && <p>{content}</p>}
+      {!content && kind === "text" && description && <p>{description}</p>}
+      {description && description !== content && description !== title && <div>{description}</div>}
     </article>
   );
 }

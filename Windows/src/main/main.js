@@ -49,6 +49,7 @@ let engineMediaProxyServer = null;
 let engineMediaProxyUrl = "";
 let engineMediaProxyStartPromise = null;
 const activeEngineQaStreams = new Map();
+const activeResearchSimulationStreams = new Map();
 
 const VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv"];
 const WEB_VIDEO_UPLOAD_PATH = "/memory/assets/web-video/events";
@@ -824,6 +825,87 @@ function cancelAllEngineQaStreams() {
     controller.abort();
   }
   activeEngineQaStreams.clear();
+}
+
+async function streamResearchSimulation(event, payload = {}) {
+  const streamId = String(payload.streamId || "");
+  const requestPath = String(payload.path || "");
+  if (!/^[A-Za-z0-9_.:-]{8,120}$/.test(streamId)) {
+    throw new Error("Invalid Research simulation stream id.");
+  }
+  if (!/^\/admin\/research\/simulations\/users\/\d+\/sessions\/[^/?#]+\/input\/stream$/.test(requestPath)) {
+    throw new Error("Invalid Research simulation stream path.");
+  }
+  if (!payload.token) {
+    throw new Error("Research simulation requires an access token.");
+  }
+
+  const sender = event.sender;
+  const channel = `infera:research-simulation-stream:event:${streamId}`;
+  const controller = new AbortController();
+  activeResearchSimulationStreams.set(streamId, controller);
+  const emit = (message) => {
+    if (!sender.isDestroyed()) sender.send(channel, message);
+  };
+
+  try {
+    const response = await fetch(resolveInferaUrl(requestPath), {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${payload.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload.body || {}),
+      redirect: "follow",
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      const result = parseJsonSafely(text);
+      throw new Error(getInferaHttpErrorMessage(response.status, result?.message || result?.detail || text));
+    }
+    if (!response.body) throw new Error("Research simulation stream returned no body.");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const drained = drainEngineSseBuffer(buffer);
+      buffer = drained.remaining;
+      drained.messages.forEach((message) => emit(parseEngineSseMessage(message)));
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) emit(parseEngineSseMessage(buffer));
+    emit({ event: "stream_closed", data: { ok: true } });
+    return { ok: true };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      emit({ event: "stream_cancelled", data: { message: "cancelled" } });
+      return { ok: false, cancelled: true };
+    }
+    emit({ event: "stream_error", data: { message: error.message || "Research simulation stream failed." } });
+    throw error;
+  } finally {
+    activeResearchSimulationStreams.delete(streamId);
+  }
+}
+
+function cancelResearchSimulationStream(streamId) {
+  const normalizedId = String(streamId || "");
+  const controller = activeResearchSimulationStreams.get(normalizedId);
+  if (!controller) return { cancelled: false };
+  controller.abort();
+  activeResearchSimulationStreams.delete(normalizedId);
+  return { cancelled: true };
+}
+
+function cancelAllResearchSimulationStreams() {
+  for (const controller of activeResearchSimulationStreams.values()) controller.abort();
+  activeResearchSimulationStreams.clear();
 }
 
 function parseJsonSafely(value) {
@@ -3785,6 +3867,7 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   cancelAllEngineQaStreams();
+  cancelAllResearchSimulationStreams();
   stopEngineMediaProxy();
 });
 
@@ -3906,6 +3989,8 @@ ipcMain.handle("updates:check", async () => {
 });
 
 ipcMain.handle("infera:request", async (_event, payload) => requestInfera(payload));
+ipcMain.handle("infera:research-simulation-stream", async (event, payload) => streamResearchSimulation(event, payload));
+ipcMain.handle("infera:research-simulation-stream:cancel", async (_event, streamId) => cancelResearchSimulationStream(streamId));
 ipcMain.handle("infera:upload-video", async (event, payload) => uploadInferaVideo(payload, event.sender));
 ipcMain.handle("infera:cancel-upload", async (_event, uploadId) => cancelInferaUpload(uploadId));
 ipcMain.handle("infera:pause-upload", async (_event, uploadId) => pauseInferaUpload(uploadId));
