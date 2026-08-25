@@ -76,6 +76,7 @@ const RESEARCH_SIGNED_URL_CACHE_TTL_MS = 20 * 60 * 1000;
 const RESEARCH_SIGNED_URL_CACHE_MAX = 600;
 const RESEARCH_SIGNED_URL_CONCURRENCY = 8;
 const INFERA_AUTH_EXPIRED_MESSAGE = "登录已过期，请重新登录";
+const CONVERSATION_QUERY_MODES = new Set(["agent", "plain"]);
 const RESEARCH_RESOURCE_STATUSES = [
   { id: "", label: "All statuses" },
   { id: "PARSED", label: "PARSED" },
@@ -143,7 +144,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-07-21",
+  updatedAt: "2026-08-25",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -966,8 +967,8 @@ function createResearchSimulationStreamId() {
   return `research-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function consumeResearchSseResponse(response, onEvent) {
-  if (!response.body) throw new Error("Research simulation stream returned no body.");
+async function consumeInferaSseResponse(response, onEvent) {
+  if (!response.body) throw new Error("Conversation stream returned no body.");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1044,7 +1045,100 @@ async function streamResearchSimulationInput(token, subjectUserId, sessionCode, 
       } catch {}
       throw createInferaHttpError(response.status, detail);
     }
-    await consumeResearchSseResponse(response, handleEvent);
+    await consumeInferaSseResponse(response, handleEvent);
+    if (streamError) throw streamError;
+  };
+
+  const currentAuth = inferaAuthController?.getAuth?.();
+  const effectiveToken = currentAuth?.token || token;
+  try {
+    await attempt(effectiveToken);
+  } catch (error) {
+    if (!isInferaUnauthorizedError(error)) throw error;
+    const nextAuth = await refreshInferaAuth();
+    await attempt(nextAuth.token);
+  }
+}
+
+function normalizeConversationQueryMode(queryMode) {
+  return CONVERSATION_QUERY_MODES.has(queryMode) ? queryMode : "agent";
+}
+
+function buildConversationPath(path, queryMode) {
+  const mode = normalizeConversationQueryMode(queryMode);
+  return `${path}${String(path).includes("?") ? "&" : "?"}query_mode=${encodeURIComponent(mode)}`;
+}
+
+async function fetchConversationSessions(token, queryMode) {
+  return requestInfera(buildConversationPath("/conversation/sessions", queryMode), { token });
+}
+
+async function fetchConversationSession(token, sessionCode, queryMode) {
+  return requestInfera(
+    buildConversationPath(`/conversation/sessions/${encodeURIComponent(sessionCode)}`, queryMode),
+    { token }
+  );
+}
+
+function createConversationStreamId(queryMode) {
+  return `conversation-${normalizeConversationQueryMode(queryMode)}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createConversationRequestId(queryMode) {
+  return `${normalizeConversationQueryMode(queryMode)}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function streamConversationInput(token, sessionCode, queryMode, body, onEvent) {
+  const mode = normalizeConversationQueryMode(queryMode);
+  const path = `/conversation/sessions/${encodeURIComponent(sessionCode || "new")}/input/mode/${mode}/stream`;
+  const attempt = async (accessToken) => {
+    let streamError = null;
+    const handleEvent = (message) => {
+      const eventName = message?.event || "message";
+      const data = message?.data || {};
+      if (eventName === "error" || eventName === "stream_error") {
+        streamError = new Error(data.message || "对话请求失败");
+        streamError.code = data.code || "";
+        streamError.retryable = Boolean(data.retryable);
+        return;
+      }
+      onEvent(message);
+    };
+
+    if (
+      typeof dlEditor.streamConversation === "function" &&
+      typeof dlEditor.onConversationStreamEvent === "function"
+    ) {
+      const streamId = createConversationStreamId(mode);
+      const unsubscribe = dlEditor.onConversationStreamEvent(streamId, handleEvent);
+      try {
+        await dlEditor.streamConversation({ streamId, path, token: accessToken, body });
+      } finally {
+        unsubscribe?.();
+      }
+      if (streamError) throw streamError;
+      return;
+    }
+
+    const response = await fetch(resolveInferaUrl(path), {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let detail = text;
+      try {
+        const payload = JSON.parse(text);
+        detail = payload?.message || payload?.detail || text;
+      } catch {}
+      throw createInferaHttpError(response.status, detail);
+    }
+    await consumeInferaSseResponse(response, handleEvent);
     if (streamError) throw streamError;
   };
 
@@ -1307,6 +1401,23 @@ async function resolveResearchEvidenceUrl(token, rawUrl) {
         start_ms: url.searchParams.get("start_ms"),
         end_ms: url.searchParams.get("end_ms")
       }));
+    }
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    return resolveResearchSignedUrl(token, normalized);
+  } catch {
+    return "";
+  }
+}
+
+async function resolveConversationEvidenceUrl(token, rawUrl) {
+  const normalized = String(rawUrl || "").trim();
+  if (!normalized || !token) return "";
+  try {
+    const url = new URL(normalized, resolveInferaUrl("/"));
+    const isProtectedMemoryMedia = /\/memory\/(?:keyframes\/\d+\/content|assets\/\d+\/clip)\/?$/i.test(url.pathname);
+    if (isProtectedMemoryMedia) {
+      const result = await requestInfera(url.toString(), { token, responseType: "redirect" });
+      return result?.url || "";
     }
     if (/^https?:\/\//i.test(normalized)) return normalized;
     return resolveResearchSignedUrl(token, normalized);
@@ -3403,9 +3514,18 @@ function App() {
           onSpaceChange={changeCloudSpace}
           repositoryState={repositoryState}
         />
+      ) : activeNav === "Delphi" ? (
+        <ConversationWorkspace
+          allowModeSwitch
+          authState={authState}
+          onLogin={() => setShowLogin(true)}
+          queryMode="plain"
+          subtitle="Memory conversation"
+          title="Delphi"
+        />
       ) : activeNav === "Engine" ? (
         engineUnlocked ? (
-          <EngineWorkspace onLock={lockEngine} />
+          <EngineWorkspace authState={authState} onLock={lockEngine} onLogin={() => setShowLogin(true)} />
         ) : (
           <EngineGate
             error={engineError}
@@ -3777,7 +3897,463 @@ function EngineMediaPreview({ mediaProxyUrl, rawRef }) {
   );
 }
 
-function EngineWorkspace({ onLock }) {
+function normalizeConversationSessions(result, queryMode) {
+  const items = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.items)
+      ? result.items
+      : Array.isArray(result?.sessions)
+        ? result.sessions
+        : [];
+  const mode = normalizeConversationQueryMode(queryMode);
+  return items.filter((item) => {
+    const itemMode = item?.query_mode === "agent" ? "agent" : "plain";
+    return itemMode === mode;
+  });
+}
+
+function getConversationTitle(item, fallback = "新对话") {
+  return String(item?.title || item?.latest_question || "").trim() || fallback;
+}
+
+function formatConversationTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = false, onLogin, queryMode, subtitle, title }) {
+  const [selectedQueryMode, setSelectedQueryMode] = useState(() => normalizeConversationQueryMode(queryMode));
+  const mode = allowModeSwitch ? selectedQueryMode : normalizeConversationQueryMode(queryMode);
+  const token = authState?.token || "";
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionCode, setActiveSessionCode] = useState("new");
+  const [session, setSession] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [thinkingLevel, setThinkingLevel] = useState("1");
+  const [listState, setListState] = useState({ status: "idle", message: "" });
+  const [sessionState, setSessionState] = useState({ status: "idle", message: "" });
+  const [streaming, setStreaming] = useState(false);
+  const [streamStatus, setStreamStatus] = useState("");
+  const [streamTurn, setStreamTurn] = useState(null);
+  const messagesRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSessions([]);
+    setActiveSessionCode("new");
+    setSession(null);
+    setStreamTurn(null);
+    setStreamStatus("");
+    if (!token) {
+      setListState({ status: "idle", message: "" });
+      return undefined;
+    }
+
+    setListState({ status: "loading", message: "" });
+    fetchConversationSessions(token, mode)
+      .then((result) => {
+        if (cancelled) return;
+        const nextSessions = normalizeConversationSessions(result, mode);
+        setSessions(nextSessions);
+        setListState({ status: "ready", message: "" });
+        if (nextSessions[0]?.session_code) {
+          setActiveSessionCode(nextSessions[0].session_code);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setListState({ status: "error", message: error.message || "会话列表加载失败" });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, token]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!token || !activeSessionCode || activeSessionCode === "new" || streaming) {
+      if (activeSessionCode === "new") {
+        setSession(null);
+        setSessionState({ status: "idle", message: "" });
+      }
+      return undefined;
+    }
+
+    setSessionState({ status: "loading", message: "" });
+    fetchConversationSession(token, activeSessionCode, mode)
+      .then((result) => {
+        if (!cancelled) {
+          setSession(result);
+          setSessionState({ status: "ready", message: "" });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setSession(null);
+          setSessionState({ status: "error", message: error.message || "会话加载失败" });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionCode, mode, streaming, token]);
+
+  useEffect(() => {
+    const element = messagesRef.current;
+    if (!element) return;
+    const frame = window.requestAnimationFrame(() => {
+      element.scrollTop = element.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeSessionCode, session?.messages?.length, streamTurn?.answer]);
+
+  function startNewConversation() {
+    if (streaming) return;
+    setActiveSessionCode("new");
+    setSession(null);
+    setSessionState({ status: "idle", message: "" });
+    setStreamTurn(null);
+    setStreamStatus("");
+    setDraft("");
+  }
+
+  async function refreshConversationSessions(preferredSessionCode = activeSessionCode) {
+    if (!token) return;
+    try {
+      const result = await fetchConversationSessions(token, mode);
+      const nextSessions = normalizeConversationSessions(result, mode);
+      setSessions(nextSessions);
+      setListState({ status: "ready", message: "" });
+      if (
+        preferredSessionCode &&
+        preferredSessionCode !== "new" &&
+        nextSessions.some((item) => item.session_code === preferredSessionCode)
+      ) {
+        setActiveSessionCode(preferredSessionCode);
+      }
+    } catch (error) {
+      setListState({ status: "error", message: error.message || "会话列表加载失败" });
+    }
+  }
+
+  async function submitConversation(event) {
+    event.preventDefault();
+    const question = draft.trim();
+    if (!question || streaming) return;
+    if (!token) {
+      onLogin?.();
+      return;
+    }
+
+    const requestId = createConversationRequestId(mode);
+    let resolvedSessionCode = activeSessionCode || "new";
+    let completedSession = null;
+    setDraft("");
+    setStreaming(true);
+    setStreamStatus("正在准备回答");
+    setStreamTurn({
+      answer: "",
+      candidateEvidences: [],
+      error: "",
+      evidences: [],
+      question,
+      requestId
+    });
+
+    try {
+      await streamConversationInput(
+        token,
+        resolvedSessionCode,
+        mode,
+        {
+          client_request_id: requestId,
+          question_text: question,
+          query_mode: mode,
+          thinking_level: Number(thinkingLevel) || 0,
+          top_k: 3
+        },
+        ({ event: eventName, data }) => {
+          if (eventName === "queue") {
+            const position = Number(data?.position || 0);
+            setStreamStatus(position > 0 ? `排队中 · 前方 ${position} 个请求` : "排队中");
+            return;
+          }
+          if (eventName === "status") {
+            setStreamStatus(data?.text || data?.stage || "正在处理");
+            return;
+          }
+          if (eventName === "session" && data?.session_code) {
+            resolvedSessionCode = data.session_code;
+            setActiveSessionCode(data.session_code);
+            return;
+          }
+          if (eventName === "candidate_evidence") {
+            setStreamTurn((current) => current ? {
+              ...current,
+              candidateEvidences: Array.isArray(data?.evidences) ? data.evidences : []
+            } : current);
+            return;
+          }
+          if (eventName === "selected_evidence") {
+            setStreamTurn((current) => current ? {
+              ...current,
+              evidences: Array.isArray(data?.evidences) ? data.evidences : current.evidences
+            } : current);
+            return;
+          }
+          if (eventName === "delta") {
+            const text = String(data?.text || "");
+            setStreamTurn((current) => current ? { ...current, answer: `${current.answer || ""}${text}` } : current);
+            return;
+          }
+          if (eventName === "final") {
+            setStreamTurn((current) => current ? {
+              ...current,
+              answer: String(data?.answer || current.answer || ""),
+              evidences: Array.isArray(data?.evidences) ? data.evidences : current.evidences
+            } : current);
+            return;
+          }
+          if (eventName === "done") {
+            if (data?.session) {
+              completedSession = data.session;
+              resolvedSessionCode = data.session.session_code || resolvedSessionCode;
+              setSession(data.session);
+              setSessionState({ status: "ready", message: "" });
+            }
+            setStreamStatus("回答完成");
+          }
+        }
+      );
+
+      if (!completedSession && resolvedSessionCode !== "new") {
+        completedSession = await fetchConversationSession(token, resolvedSessionCode, mode);
+        setSession(completedSession);
+        setSessionState({ status: "ready", message: "" });
+      }
+      if (completedSession) {
+        setStreamTurn(null);
+      }
+      await refreshConversationSessions(resolvedSessionCode);
+    } catch (error) {
+      const message = error.message || "对话请求失败";
+      setStreamStatus(message);
+      setStreamTurn((current) => current ? { ...current, error: message } : current);
+    } finally {
+      setStreaming(false);
+    }
+  }
+
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const activeSummary = sessions.find((item) => item.session_code === activeSessionCode);
+  const activeTitle = activeSessionCode === "new"
+    ? "新对话"
+    : getConversationTitle(session || activeSummary, activeSessionCode);
+  const activeSubtitle = allowModeSwitch
+    ? mode === "agent"
+      ? "DL Engine Agent memory conversation"
+      : "Direct memory conversation"
+    : subtitle;
+
+  return (
+    <section className={`conversation-workspace ${embedded ? "embedded" : ""}`}>
+      <aside className="conversation-sidebar">
+        <header className="conversation-sidebar-head">
+          <button className="engine-icon-button" disabled={streaming} onClick={startNewConversation} title="新建对话" type="button">
+            <Plus size={16} />
+          </button>
+          <div>
+            <strong>{title}</strong>
+            <span>{mode === "agent" ? "Agent sessions" : "Plain sessions"}</span>
+          </div>
+          <button className="engine-icon-button" disabled={!token || streaming} onClick={() => refreshConversationSessions()} title="刷新会话" type="button">
+            <RotateCcw size={15} />
+          </button>
+        </header>
+        <div className="conversation-session-list">
+          {!token ? (
+            <div className="conversation-sidebar-empty">登录后查看会话</div>
+          ) : listState.status === "loading" ? (
+            <div className="conversation-sidebar-empty">正在加载会话</div>
+          ) : listState.status === "error" ? (
+            <div className="conversation-sidebar-empty error">{listState.message}</div>
+          ) : sessions.length === 0 ? (
+            <div className="conversation-sidebar-empty">还没有{mode === "agent" ? " Agent" : " Plain"}对话</div>
+          ) : (
+            sessions.map((item) => (
+              <button
+                className={item.session_code === activeSessionCode ? "conversation-session active" : "conversation-session"}
+                disabled={streaming}
+                key={item.session_code}
+                onClick={() => {
+                  setActiveSessionCode(item.session_code);
+                  setSession(null);
+                  setStreamTurn(null);
+                  setStreamStatus("");
+                }}
+                type="button"
+              >
+                <Sparkles size={15} />
+                <span>
+                  <strong>{getConversationTitle(item)}</strong>
+                  <small>{formatConversationTime(item.update_time)}</small>
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </aside>
+
+      <div className="conversation-main">
+        <header className="conversation-header">
+          <div>
+            <strong>{activeTitle}</strong>
+            <span>{activeSubtitle}</span>
+          </div>
+          {allowModeSwitch ? (
+            <div aria-label="Delphi conversation mode" className="conversation-mode-switch" role="tablist">
+              {["plain", "agent"].map((item) => (
+                <button
+                  aria-selected={mode === item}
+                  className={mode === item ? "active" : ""}
+                  disabled={streaming}
+                  key={item}
+                  onClick={() => {
+                    setSelectedQueryMode(item);
+                    setDraft("");
+                    setStreamStatus("");
+                  }}
+                  role="tab"
+                  type="button"
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className={`conversation-mode-badge ${mode}`}>{mode}</span>
+          )}
+        </header>
+
+        <div className="conversation-messages" ref={messagesRef}>
+          {!token ? (
+            <div className="conversation-empty-state">
+              <UserRound size={24} />
+              <strong>登录后使用 {title}</strong>
+              <span>会话和消息会按当前账号隔离。</span>
+              <button className="primary-button" onClick={onLogin} type="button">登录</button>
+            </div>
+          ) : sessionState.status === "loading" && !streamTurn ? (
+            <div className="conversation-empty-state">正在加载对话</div>
+          ) : sessionState.status === "error" && !streamTurn ? (
+            <div className="conversation-empty-state error">{sessionState.message}</div>
+          ) : messages.length === 0 && !streamTurn ? (
+            <div className="conversation-empty-state">
+              <Sparkles size={24} />
+              <strong>{mode === "agent" ? "开始 Agent 对话" : "开始 Plain 对话"}</strong>
+              <span>{mode === "agent" ? "由 DL Engine Agent 检索记忆并生成回答。" : "直接检索记忆上下文并生成回答。"}</span>
+            </div>
+          ) : (
+            <>
+              {messages.map((message, index) => (
+                <ConversationMessage
+                  key={message.id || `${message.role}-${message.create_time || index}`}
+                  message={message}
+                  token={token}
+                />
+              ))}
+              {streamTurn && <ConversationStreamTurn status={streamStatus} token={token} turn={streamTurn} />}
+            </>
+          )}
+        </div>
+
+        <form className="conversation-composer" onSubmit={submitConversation}>
+          <textarea
+            disabled={!token || streaming}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder={token ? "输入问题，Enter 发送，Shift + Enter 换行" : "请先登录"}
+            rows={2}
+            value={draft}
+          />
+          <div className="conversation-composer-footer">
+            <span title={streamStatus}>{streamStatus}</span>
+            <div>
+              <select disabled={!token || streaming} onChange={(event) => setThinkingLevel(event.target.value)} value={thinkingLevel}>
+                <option value="0">Fast</option>
+                <option value="1">Balanced</option>
+                <option value="2">Deep</option>
+                <option value="3">Max</option>
+              </select>
+              <button className="primary-button" disabled={!token || streaming || !draft.trim()} type="submit">
+                {streaming ? <Activity size={15} /> : <Play size={15} />}
+                <span>{streaming ? "Working" : "Send"}</span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </section>
+  );
+}
+
+function ConversationMessage({ message, token }) {
+  const role = String(message?.role || "assistant").toLowerCase();
+  const evidences = Array.isArray(message?.evidences) ? message.evidences : [];
+  return (
+    <div className={`conversation-message-row ${role}`}>
+      <article className={`conversation-message ${role}`}>
+        {role !== "user" && <Sparkles size={15} />}
+        <div>
+          <p>{message?.content || ""}</p>
+          {evidences.length > 0 && <ResearchEvidenceList evidences={evidences} resolveUrl={resolveConversationEvidenceUrl} token={token} />}
+          {message?.processing_status === "FAILED" && message?.processing_error && (
+            <span className="conversation-message-error">{message.processing_error}</span>
+          )}
+        </div>
+      </article>
+      {message?.create_time && <time dateTime={message.create_time}>{formatConversationTime(message.create_time)}</time>}
+    </div>
+  );
+}
+
+function ConversationStreamTurn({ status, token, turn }) {
+  const evidences = turn.evidences.length > 0 ? turn.evidences : turn.candidateEvidences;
+  return (
+    <>
+      <div className="conversation-message-row user pending">
+        <article className="conversation-message user"><div><p>{turn.question}</p></div></article>
+      </div>
+      <div className="conversation-message-row assistant pending">
+        <article className={`conversation-message assistant ${turn.error ? "error" : "streaming"}`}>
+          <Sparkles size={15} />
+          <div>
+            <p>{turn.answer || (turn.error ? turn.error : status || "正在处理...")}</p>
+            {evidences.length > 0 && <ResearchEvidenceList evidences={evidences} resolveUrl={resolveConversationEvidenceUrl} token={token} />}
+            {turn.error && turn.answer && <span className="conversation-message-error">{turn.error}</span>}
+          </div>
+        </article>
+      </div>
+    </>
+  );
+}
+
+function EngineWorkspace({ authState, onLock, onLogin }) {
   const [activeEngineTab, setActiveEngineTab] = useState("search");
   const [engineView, setEngineView] = useState("workspace");
   const [engineUseVespa, setEngineUseVespa] = useState(false);
@@ -4182,7 +4758,7 @@ function EngineWorkspace({ onLock }) {
       <header className="engine-main-toolbar">
         <div className="engine-toolbar-title">
           <strong>DL Engine</strong>
-          <span>{getEngineStatusDetail(engineStatus)}</span>
+          <span>{activeEngineTab === "query" ? "Infera agent conversation" : getEngineStatusDetail(engineStatus)}</span>
         </div>
         <div aria-label="Engine mode" className="engine-tabs" role="tablist">
           {["search", "query"].map((tab) => (
@@ -4203,16 +4779,20 @@ function EngineWorkspace({ onLock }) {
           ))}
         </div>
         <div className="engine-toolbar-actions">
-          <label className="engine-vespa-toggle">
-            <input checked={engineUseVespa} onChange={(event) => setEngineUseVespa(event.target.checked)} type="checkbox" />
-            <span>Vespa</span>
-          </label>
-          <button className="engine-icon-button" onClick={clearEngineWorkspace} title="刷新" type="button">
-            <RotateCcw size={16} />
-          </button>
-          <button className="engine-icon-button" onClick={runEngineTest} title="测试" type="button">
-            <Activity size={17} />
-          </button>
+          {activeEngineTab === "search" && (
+            <>
+              <label className="engine-vespa-toggle">
+                <input checked={engineUseVespa} onChange={(event) => setEngineUseVespa(event.target.checked)} type="checkbox" />
+                <span>Vespa</span>
+              </label>
+              <button className="engine-icon-button" onClick={clearEngineWorkspace} title="刷新" type="button">
+                <RotateCcw size={16} />
+              </button>
+              <button className="engine-icon-button" onClick={runEngineTest} title="测试" type="button">
+                <Activity size={17} />
+              </button>
+            </>
+          )}
           <button className="engine-icon-button danger" onClick={onLock} title="锁定" type="button">
             <LockKeyhole size={17} />
           </button>
@@ -4227,14 +4807,21 @@ function EngineWorkspace({ onLock }) {
           useVespa={engineUseVespa}
         />
       ) : (
-        <section className="engine-main">
+        <section className={`engine-main ${activeEngineTab === "query" ? "conversation-mode" : ""}`}>
           {activeEngineTab === "search" ? (
             <EngineSearchPanel engineMediaProxyUrl={engineMediaProxyUrl} engineStatus={engineStatus} entries={searchEvents} useVespa={engineUseVespa} />
           ) : (
-            <EngineQueryPanel engineMediaProxyUrl={engineMediaProxyUrl} engineStatus={engineStatus} entries={queryEvents} useVespa={engineUseVespa} />
+            <ConversationWorkspace
+              authState={authState}
+              embedded
+              onLogin={onLogin}
+              queryMode="agent"
+              subtitle="DL Engine Agent memory conversation"
+              title="Engine"
+            />
           )}
 
-          <form className="engine-input-bar" onSubmit={submitEnginePrompt}>
+          {activeEngineTab === "search" && <form className="engine-input-bar" onSubmit={submitEnginePrompt}>
             <label className="engine-input-wrap">
               {activeEngineTab === "search" ? <Search size={16} /> : <Sparkles size={16} />}
               <input
@@ -4249,7 +4836,7 @@ function EngineWorkspace({ onLock }) {
               {activeEngineTab === "search" ? <Search size={15} /> : <Play size={15} />}
               <span>{activeEngineTab === "search" ? "Search" : "Query"}</span>
             </button>
-          </form>
+          </form>}
         </section>
       )}
     </section>
@@ -5861,18 +6448,18 @@ function ResearchChatMessage({ message, token }) {
   );
 }
 
-function ResearchEvidenceList({ evidences, token }) {
+function ResearchEvidenceList({ evidences, resolveUrl = resolveResearchEvidenceUrl, token }) {
   return (
     <section className="research-evidence-list">
       <div className="research-evidence-list-title">Evidence · {evidences.length}</div>
       {evidences.map((evidence, index) => (
-        <ResearchEvidenceCard evidence={evidence} key={evidence.evidence_id || evidence.id || index} token={token} />
+        <ResearchEvidenceCard evidence={evidence} key={evidence.evidence_id || evidence.id || index} resolveUrl={resolveUrl} token={token} />
       ))}
     </section>
   );
 }
 
-function ResearchEvidenceCard({ evidence, token }) {
+function ResearchEvidenceCard({ evidence, resolveUrl, token }) {
   const [urls, setUrls] = useState({ cover: "", media: "" });
   const kind = getResearchEvidenceKind(evidence);
   const type = String(evidence?.evidence_type || kind || "text");
@@ -5884,15 +6471,15 @@ function ResearchEvidenceCard({ evidence, token }) {
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      resolveResearchEvidenceUrl(token, evidence?.media_url),
-      resolveResearchEvidenceUrl(token, evidence?.cover_url)
+      resolveUrl(token, evidence?.media_url),
+      resolveUrl(token, evidence?.cover_url)
     ]).then(([media, cover]) => {
       if (!cancelled) setUrls({ media, cover });
     }).catch(() => {
       if (!cancelled) setUrls({ media: "", cover: "" });
     });
     return () => { cancelled = true; };
-  }, [evidence?.cover_url, evidence?.media_url, token]);
+  }, [evidence?.cover_url, evidence?.media_url, resolveUrl, token]);
 
   const imageUrl = urls.media || urls.cover;
   return (
