@@ -144,7 +144,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-08-25",
+  updatedAt: "2026-08-26",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -287,7 +287,7 @@ function inferIdentifierType(identifier) {
   const value = String(identifier || "").trim();
   if (EMAIL_IDENTIFIER_PATTERN.test(value)) return "email";
   if (PHONE_IDENTIFIER_PATTERN.test(value)) return "phone";
-  return "";
+  return "username";
 }
 
 function getAuthenticationErrorMessage(error, fallback) {
@@ -692,7 +692,7 @@ async function loginToInfera({ identifier, password }) {
     method: "POST",
     body: {
       type: identifierType,
-      identifier: identifierType === "email" ? value.toLowerCase() : value,
+      identifier: value.toLowerCase(),
       password
     }
   });
@@ -2898,15 +2898,9 @@ function App() {
     }
 
     const rawIdentifier = loginForm.identifier.trim();
-    const identifierType = inferIdentifierType(rawIdentifier);
-    const identifier = identifierType === "email" ? rawIdentifier.toLowerCase() : rawIdentifier;
+    const identifier = rawIdentifier.toLowerCase();
     if (!identifier || !loginForm.password) {
       setLoginStatus({ status: "error", message: "请输入账号和密码" });
-      return;
-    }
-
-    if (!identifierType) {
-      setLoginStatus({ status: "error", message: "请输入有效的邮箱或手机号" });
       return;
     }
 
@@ -3640,21 +3634,6 @@ function App() {
           <UsageCard activeEncodingJob={activeEncodingJob} device={processingDevice} usage={systemUsage} />
 
           <AutomationOptions options={automationOptions} onChange={updateAutomationOption} />
-
-          <div className="actions">
-            <button className="primary-button" disabled={!canStart} onClick={startBatch} type="button">
-              <Play size={17} />
-              <span>开始处理</span>
-            </button>
-            <button className="ghost-button action-button" disabled={!isRunning || pauseTransitioning} onClick={togglePause} type="button">
-              {isPaused ? <Play size={16} /> : <Pause size={16} />}
-              <span>{isPaused ? "继续" : "暂停"}</span>
-            </button>
-            <button className="ghost-button danger-button" disabled={!isRunning} onClick={cancelBatch} type="button">
-              <CircleStop size={17} />
-              <span>取消</span>
-            </button>
-          </div>
         </aside>
 
         <section className="queue-panel">
@@ -3664,6 +3643,20 @@ function App() {
               <h2>处理队列</h2>
             </div>
             <div className="toolbar-actions">
+              <div className="actions queue-batch-actions">
+                <button className="primary-button" disabled={!canStart} onClick={startBatch} type="button">
+                  <Play size={17} />
+                  <span>开始处理</span>
+                </button>
+                <button className="ghost-button action-button" disabled={!isRunning || pauseTransitioning} onClick={togglePause} type="button">
+                  {isPaused ? <Play size={16} /> : <Pause size={16} />}
+                  <span>{isPaused ? "继续" : "暂停"}</span>
+                </button>
+                <button className="ghost-button danger-button" disabled={!isRunning} onClick={cancelBatch} type="button">
+                  <CircleStop size={17} />
+                  <span>取消</span>
+                </button>
+              </div>
               <button className="icon-button" disabled={isRunning || !canClearFinished} onClick={clearFinished} title="清除已完成" type="button">
                 <RotateCcw size={18} />
               </button>
@@ -7373,6 +7366,45 @@ function LoginDialog({
   const usesPassword = isRegister || loginMethod === "password";
   const displayName = getAuthDisplayName(authState);
   const accountName = getAuthAccountName(authState);
+  const isAuthenticated = Boolean(authState?.token);
+
+  if (isAuthenticated) {
+    return (
+      <div
+        className="modal-backdrop"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) {
+            onClose();
+          }
+        }}
+        role="presentation"
+      >
+        <section aria-modal="true" className="login-dialog" role="dialog">
+          <div className="dialog-heading login-heading">
+            <UserRound size={18} />
+            <div>
+              <strong>账号</strong>
+              <span>{displayName || APP_NAME}</span>
+            </div>
+          </div>
+          <div className="login-account">
+            <div className="login-account-identity">
+              <strong>{displayName}</strong>
+              {accountName && accountName !== displayName && <span>{accountName}</span>}
+            </div>
+            <button onClick={onLogout} type="button">
+              退出
+            </button>
+          </div>
+          <div className="dialog-actions login-actions">
+            <button className="ghost-button" onClick={onClose} type="button">
+              关闭
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -7389,7 +7421,7 @@ function LoginDialog({
           <UserRound size={18} />
           <div>
             <strong>{isRegister ? "注册" : "登录"}</strong>
-            <span>{authState?.token ? displayName || APP_NAME : isRegister ? `创建 ${APP_NAME} 账号` : APP_NAME}</span>
+            <span>{isRegister ? `创建 ${APP_NAME} 账号` : APP_NAME}</span>
           </div>
         </div>
         <div aria-label="账号操作" className="login-mode-switch" role="tablist">
@@ -7438,17 +7470,6 @@ function LoginDialog({
             </button>
           </div>
         )}
-        {authState?.token && (
-          <div className="login-account">
-            <div className="login-account-identity">
-              <strong>{displayName}</strong>
-              {accountName && accountName !== displayName && <span>{accountName}</span>}
-            </div>
-            <button onClick={onLogout} type="button">
-              退出
-            </button>
-          </div>
-        )}
         <form
           className="login-form"
           noValidate
@@ -7466,7 +7487,7 @@ function LoginDialog({
                 disabled={isBusy}
                 name="identifier"
                 onChange={(event) => onChange({ identifier: event.target.value })}
-                placeholder={usesEmailCode ? "邮箱地址" : "邮箱或手机号"}
+                placeholder={usesEmailCode ? "邮箱地址" : "邮箱、手机号或登录名"}
                 type={usesEmailCode ? "email" : "text"}
                 value={form.identifier}
               />

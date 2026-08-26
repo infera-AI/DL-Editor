@@ -3350,7 +3350,22 @@ button:disabled {
 }
 
 .toolbar-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 7px;
+}
+
+.queue-batch-actions {
+  display: flex;
+  flex: 0 0 auto;
+  grid-template-columns: none;
+}
+
+.queue-batch-actions .primary-button,
+.queue-batch-actions .ghost-button {
+  min-height: 36px;
+  padding: 0 12px;
+  white-space: nowrap;
 }
 
 .summary-strip {
