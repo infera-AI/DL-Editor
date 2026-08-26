@@ -290,6 +290,20 @@ function inferIdentifierType(identifier) {
   return "";
 }
 
+function getAuthenticationErrorMessage(error, fallback) {
+  const message = String(error?.message || "").trim();
+  if (/Account already exists/i.test(message)) return "该账号已注册，请直接登录";
+  if (/Invalid account or password/i.test(message)) return "账号或密码错误";
+  if (/Invalid account or verification token/i.test(message)) return "邮箱或验证码错误";
+  if (/User is disabled/i.test(message)) return "该账号已停用";
+  if (/verification code was sent too recently/i.test(message)) return "验证码发送过于频繁，请稍后重试";
+  if (/verification code is invalid or expired/i.test(message)) return "验证码错误或已过期，请重新获取";
+  if (/verification token is invalid or expired/i.test(message)) return "验证码验证已过期，请重新获取";
+  if (/Identifier cannot be blank|Type cannot be blank/i.test(message)) return "请输入有效的邮箱或手机号";
+  if (/Password cannot be blank/i.test(message)) return "请输入密码";
+  return message || fallback;
+}
+
 function unwrapInferaResult(payload) {
   if (!payload || typeof payload !== "object") {
     return payload;
@@ -351,7 +365,7 @@ function isInferaUnauthorizedError(error) {
 }
 
 function isInferaAuthEndpoint(path) {
-  return /^\/?auth\/(?:login|refresh)\/?(?:\?|$)/i.test(String(path || ""));
+  return /^\/?auth\/(?:login(?:\/email)?|register(?:\/email)?|refresh)\/?(?:\?|$)/i.test(String(path || ""));
 }
 
 function setInferaAuthController(controller) {
@@ -672,12 +686,58 @@ function normalizeAuthPayload(result, fallbackAccountName = "") {
 }
 
 async function loginToInfera({ identifier, password }) {
+  const value = String(identifier || "").trim();
+  const identifierType = inferIdentifierType(value);
   return requestInfera("/auth/login", {
     method: "POST",
     body: {
-      type: inferIdentifierType(identifier),
-      identifier: String(identifier || "").trim(),
+      type: identifierType,
+      identifier: identifierType === "email" ? value.toLowerCase() : value,
       password
+    }
+  });
+}
+
+async function loginToInferaWithEmailCode({ email, verificationToken }) {
+  return requestInfera("/auth/login/email/", {
+    method: "POST",
+    body: {
+      email: String(email || "").trim().toLowerCase(),
+      verificationToken
+    }
+  });
+}
+
+async function sendEmailVerificationCode(email, purpose) {
+  return requestInfera("/verification/codes", {
+    method: "POST",
+    body: {
+      account: String(email || "").trim().toLowerCase(),
+      purpose,
+      channel: "email"
+    }
+  });
+}
+
+async function createEmailVerificationToken(email, code, purpose) {
+  return requestInfera("/verification/tokens", {
+    method: "POST",
+    body: {
+      account: String(email || "").trim().toLowerCase(),
+      purpose,
+      channel: "email",
+      code: String(code || "").trim()
+    }
+  });
+}
+
+async function registerWithInfera({ email, password, verificationToken }) {
+  return requestInfera("/auth/register/email/", {
+    method: "POST",
+    body: {
+      email: String(email || "").trim().toLowerCase(),
+      password,
+      verificationToken
     }
   });
 }
@@ -1456,8 +1516,11 @@ function App() {
   const [enginePassword, setEnginePassword] = useState("");
   const [engineError, setEngineError] = useState("");
   const [authState, setAuthState] = useState(readStoredAuth);
-  const [loginForm, setLoginForm] = useState({ identifier: "", password: "", remember: true });
+  const [loginMode, setLoginMode] = useState("login");
+  const [loginMethod, setLoginMethod] = useState("password");
+  const [loginForm, setLoginForm] = useState({ identifier: "", password: "", confirmPassword: "", verificationCode: "", remember: true });
   const [loginStatus, setLoginStatus] = useState({ status: "idle", message: "" });
+  const [emailCodeCooldown, setEmailCodeCooldown] = useState(0);
   const [cloudSpaceId, setCloudSpaceId] = useState(CLOUD_SPACES[0].id);
   const [cloudRepositoryDateKey, setCloudRepositoryDateKey] = useState(() => getLocalDateKey());
   const [cloudRepositoryMediaFilterId, setCloudRepositoryMediaFilterId] = useState(CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID);
@@ -1637,6 +1700,14 @@ function App() {
   }, [authState]);
 
   useEffect(() => {
+    if (emailCodeCooldown <= 0) return undefined;
+    const timer = window.setTimeout(() => {
+      setEmailCodeCooldown((current) => Math.max(0, current - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [emailCodeCooldown]);
+
+  useEffect(() => {
     const controller = {
       getAuth: () => authStateRef.current,
       onRefreshed: (nextAuth, previousAuth) => {
@@ -1657,10 +1728,15 @@ function App() {
         window.localStorage?.removeItem(AUTH_STORAGE_KEY);
         authStateRef.current = null;
         setAuthState(null);
+        setLoginMode("login");
+        setLoginMethod("password");
+        setEmailCodeCooldown(0);
         setLoginForm((current) => ({
           ...current,
           identifier: current.identifier || getAuthAccountName(previousAuth),
-          password: ""
+          password: "",
+          confirmPassword: "",
+          verificationCode: ""
         }));
         setLoginStatus({ status: "error", message: INFERA_AUTH_EXPIRED_MESSAGE });
         setNotice(INFERA_AUTH_EXPIRED_MESSAGE);
@@ -2806,43 +2882,186 @@ function App() {
   }
 
   async function submitLogin() {
-    const identifier = loginForm.identifier.trim();
+    if (loginMethod === "code") {
+      await submitEmailCodeLogin();
+      return;
+    }
+
+    const rawIdentifier = loginForm.identifier.trim();
+    const identifierType = inferIdentifierType(rawIdentifier);
+    const identifier = identifierType === "email" ? rawIdentifier.toLowerCase() : rawIdentifier;
     if (!identifier || !loginForm.password) {
       setLoginStatus({ status: "error", message: "请输入账号和密码" });
+      return;
+    }
+
+    if (!identifierType) {
+      setLoginStatus({ status: "error", message: "请输入有效的邮箱或手机号" });
       return;
     }
 
     setLoginStatus({ status: "checking", message: "正在登录..." });
     try {
       const result = await loginToInfera({ identifier, password: loginForm.password });
-      const nextAuth = normalizeAuthPayload(result, identifier);
-      if (!nextAuth.token) {
-        throw new Error("登录响应缺少 token");
-      }
-
-      if (loginForm.remember) {
-        window.localStorage?.setItem(AUTH_STORAGE_KEY, JSON.stringify(nextAuth));
-      } else {
-        window.localStorage?.removeItem(AUTH_STORAGE_KEY);
-      }
-
-      authStateRef.current = nextAuth;
-      setAuthState(nextAuth);
-      setLoginStatus({ status: "idle", message: "" });
-      setLoginForm((current) => ({ ...current, identifier, password: "" }));
-      setShowLogin(false);
-
-      if (activeNav === "Cloud") {
-        loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
-      } else if (activeNav === "Research") {
-        loadResearchAccess(nextAuth);
-      }
+      completeAuthentication(result, identifier, "登录响应缺少 token");
     } catch (error) {
       setLoginStatus({
         status: "error",
-        message: error.message || "登录验证失败"
+        message: getAuthenticationErrorMessage(error, "登录验证失败")
       });
     }
+  }
+
+  async function submitEmailCodeLogin() {
+    const email = loginForm.identifier.trim().toLowerCase();
+    const verificationCode = loginForm.verificationCode.trim();
+    if (!email || !verificationCode) {
+      setLoginStatus({ status: "error", message: "请输入邮箱和验证码" });
+      return;
+    }
+    if (!EMAIL_IDENTIFIER_PATTERN.test(email)) {
+      setLoginStatus({ status: "error", message: "请输入有效的邮箱地址" });
+      return;
+    }
+
+    setLoginStatus({ status: "checking", message: "正在验证并登录..." });
+    try {
+      const verification = await createEmailVerificationToken(email, verificationCode, "login");
+      const verificationToken = verification?.verificationToken || verification?.verification_token || "";
+      if (!verificationToken) {
+        throw new Error("验证码验证响应缺少 verification token");
+      }
+      const result = await loginToInferaWithEmailCode({ email, verificationToken });
+      completeAuthentication(result, email, "登录响应缺少 token");
+    } catch (error) {
+      setLoginStatus({
+        status: "error",
+        message: getAuthenticationErrorMessage(error, "邮箱验证码登录失败")
+      });
+    }
+  }
+
+  async function sendEmailCode() {
+    const email = loginForm.identifier.trim().toLowerCase();
+    if (!EMAIL_IDENTIFIER_PATTERN.test(email)) {
+      setLoginStatus({ status: "error", message: "请先输入有效的邮箱地址" });
+      return;
+    }
+
+    setLoginStatus({ status: "sending", message: "正在发送验证码..." });
+    try {
+      const purpose = loginMode === "register" ? "register" : "login";
+      const result = await sendEmailVerificationCode(email, purpose);
+      const cooldownSeconds = Math.max(1, Number(result?.cooldownSeconds || result?.cooldown_seconds) || 60);
+      setLoginForm((current) => ({ ...current, identifier: email, verificationCode: "" }));
+      setEmailCodeCooldown(cooldownSeconds);
+      setLoginStatus({ status: "success", message: `验证码已发送至 ${email}` });
+    } catch (error) {
+      setLoginStatus({
+        status: "error",
+        message: getAuthenticationErrorMessage(error, "验证码发送失败")
+      });
+    }
+  }
+
+  async function submitRegister() {
+    const identifier = loginForm.identifier.trim().toLowerCase();
+    const verificationCode = loginForm.verificationCode.trim();
+    if (!identifier || !verificationCode || !loginForm.password || !loginForm.confirmPassword) {
+      setLoginStatus({ status: "error", message: "请输入邮箱、验证码、密码并确认密码" });
+      return;
+    }
+    if (!EMAIL_IDENTIFIER_PATTERN.test(identifier)) {
+      setLoginStatus({ status: "error", message: "请输入有效的邮箱地址" });
+      return;
+    }
+    if (loginForm.password !== loginForm.confirmPassword) {
+      setLoginStatus({ status: "error", message: "两次输入的密码不一致" });
+      return;
+    }
+
+    setLoginStatus({ status: "checking", message: "正在验证并注册..." });
+    try {
+      const verification = await createEmailVerificationToken(identifier, verificationCode, "register");
+      const verificationToken = verification?.verificationToken || verification?.verification_token || "";
+      if (!verificationToken) {
+        throw new Error("验证码验证响应缺少 verification token");
+      }
+      const result = await registerWithInfera({
+        email: identifier,
+        password: loginForm.password,
+        verificationToken
+      });
+      completeAuthentication(result, identifier, "注册响应缺少 token");
+      setNotice("注册成功，已自动登录");
+    } catch (error) {
+      setLoginStatus({
+        status: "error",
+        message: getAuthenticationErrorMessage(error, "注册失败")
+      });
+    }
+  }
+
+  function completeAuthentication(result, identifier, missingTokenMessage) {
+    const nextAuth = normalizeAuthPayload(result, identifier);
+    if (!nextAuth.token) {
+      throw new Error(missingTokenMessage);
+    }
+
+    if (loginForm.remember) {
+      window.localStorage?.setItem(AUTH_STORAGE_KEY, JSON.stringify(nextAuth));
+    } else {
+      window.localStorage?.removeItem(AUTH_STORAGE_KEY);
+    }
+
+    authStateRef.current = nextAuth;
+    setAuthState(nextAuth);
+    setLoginMode("login");
+    setLoginMethod("password");
+    setLoginStatus({ status: "idle", message: "" });
+    setEmailCodeCooldown(0);
+    setLoginForm((current) => ({ ...current, identifier, password: "", confirmPassword: "", verificationCode: "" }));
+    setShowLogin(false);
+
+    if (activeNav === "Cloud") {
+      loadCloudRepository(nextAuth, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
+    } else if (activeNav === "Research") {
+      loadResearchAccess(nextAuth);
+    }
+  }
+
+  function changeLoginMode(mode) {
+    setLoginMode(mode);
+    setLoginMethod("password");
+    setLoginStatus({ status: "idle", message: "" });
+    setEmailCodeCooldown(0);
+    setLoginForm((current) => ({ ...current, password: "", confirmPassword: "", verificationCode: "" }));
+  }
+
+  function changeLoginMethod(method) {
+    setLoginMethod(method);
+    setLoginStatus({ status: "idle", message: "" });
+    setEmailCodeCooldown(0);
+    setLoginForm((current) => ({ ...current, password: "", verificationCode: "" }));
+  }
+
+  function changeLoginForm(changes) {
+    if ((loginMode === "register" || loginMethod === "code") && Object.prototype.hasOwnProperty.call(changes, "identifier")) {
+      setEmailCodeCooldown(0);
+      if (loginStatus.status !== "checking" && loginStatus.status !== "sending") {
+        setLoginStatus({ status: "idle", message: "" });
+      }
+    }
+    setLoginForm((current) => ({ ...current, ...changes }));
+  }
+
+  function closeLoginDialog() {
+    setShowLogin(false);
+    setLoginMode("login");
+    setLoginMethod("password");
+    setLoginStatus({ status: "idle", message: "" });
+    setEmailCodeCooldown(0);
+    setLoginForm((current) => ({ ...current, password: "", confirmPassword: "", verificationCode: "" }));
   }
 
   function logout() {
@@ -3589,11 +3808,17 @@ function App() {
         <LoginDialog
           authState={authState}
           form={loginForm}
+          mode={loginMode}
           loginStatus={loginStatus}
-          onChange={(changes) => setLoginForm((current) => ({ ...current, ...changes }))}
-          onClose={() => setShowLogin(false)}
+          emailCodeCooldown={emailCodeCooldown}
+          loginMethod={loginMethod}
+          onChange={changeLoginForm}
+          onClose={closeLoginDialog}
+          onLoginMethodChange={changeLoginMethod}
           onLogout={logout}
-          onSubmit={submitLogin}
+          onModeChange={changeLoginMode}
+          onSendCode={sendEmailCode}
+          onSubmit={loginMode === "register" ? submitRegister : submitLogin}
         />
       )}
       </main>
@@ -7115,8 +7340,27 @@ function SplashScreen() {
   );
 }
 
-function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout, onSubmit }) {
+function LoginDialog({
+  authState,
+  form,
+  emailCodeCooldown,
+  loginMethod,
+  loginStatus,
+  mode,
+  onChange,
+  onClose,
+  onLoginMethodChange,
+  onLogout,
+  onModeChange,
+  onSendCode,
+  onSubmit
+}) {
   const isChecking = loginStatus.status === "checking";
+  const isSendingCode = loginStatus.status === "sending";
+  const isBusy = isChecking || isSendingCode;
+  const isRegister = mode === "register";
+  const usesEmailCode = isRegister || loginMethod === "code";
+  const usesPassword = isRegister || loginMethod === "password";
   const displayName = getAuthDisplayName(authState);
   const accountName = getAuthAccountName(authState);
 
@@ -7124,7 +7368,7 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
     <div
       className="modal-backdrop"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
+        if (!isBusy && event.target === event.currentTarget) {
           onClose();
         }
       }}
@@ -7134,10 +7378,56 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
         <div className="dialog-heading login-heading">
           <UserRound size={18} />
           <div>
-            <strong>登录</strong>
-            <span>{displayName || APP_NAME}</span>
+            <strong>{isRegister ? "注册" : "登录"}</strong>
+            <span>{authState?.token ? displayName || APP_NAME : isRegister ? `创建 ${APP_NAME} 账号` : APP_NAME}</span>
           </div>
         </div>
+        <div aria-label="账号操作" className="login-mode-switch" role="tablist">
+          <button
+            aria-selected={!isRegister}
+            className={`login-mode-button ${!isRegister ? "active" : ""}`}
+            disabled={isBusy}
+            onClick={() => onModeChange("login")}
+            role="tab"
+            type="button"
+          >
+            登录
+          </button>
+          <button
+            aria-selected={isRegister}
+            className={`login-mode-button ${isRegister ? "active" : ""}`}
+            disabled={isBusy}
+            onClick={() => onModeChange("register")}
+            role="tab"
+            type="button"
+          >
+            注册
+          </button>
+        </div>
+        {!isRegister && (
+          <div aria-label="登录方式" className="login-method-switch" role="tablist">
+            <button
+              aria-selected={loginMethod === "password"}
+              className={loginMethod === "password" ? "active" : ""}
+              disabled={isBusy}
+              onClick={() => onLoginMethodChange("password")}
+              role="tab"
+              type="button"
+            >
+              密码登录
+            </button>
+            <button
+              aria-selected={loginMethod === "code"}
+              className={loginMethod === "code" ? "active" : ""}
+              disabled={isBusy}
+              onClick={() => onLoginMethodChange("code")}
+              role="tab"
+              type="button"
+            >
+              邮箱验证码登录
+            </button>
+          </div>
+        )}
         {authState?.token && (
           <div className="login-account">
             <div className="login-account-identity">
@@ -7151,44 +7441,93 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
         )}
         <form
           className="login-form"
+          noValidate
           onSubmit={(event) => {
             event.preventDefault();
             onSubmit();
           }}
         >
           <label className="login-field">
-            <span>账号</span>
+            <span>{usesEmailCode ? "邮箱" : "账号"}</span>
             <div className="login-input-wrap">
               <Mail size={15} />
               <input
                 autoComplete="username"
-                disabled={isChecking}
+                disabled={isBusy}
                 name="identifier"
                 onChange={(event) => onChange({ identifier: event.target.value })}
-                placeholder="邮箱或手机号"
-                type="text"
+                placeholder={usesEmailCode ? "邮箱地址" : "邮箱或手机号"}
+                type={usesEmailCode ? "email" : "text"}
                 value={form.identifier}
               />
             </div>
           </label>
-          <label className="login-field">
-            <span>密码</span>
-            <div className="login-input-wrap">
-              <LockKeyhole size={15} />
-              <input
-                autoComplete="current-password"
-                disabled={isChecking}
-                onChange={(event) => onChange({ password: event.target.value })}
-                placeholder="••••••••"
-                type="password"
-                value={form.password}
-              />
+          {usesEmailCode && (
+            <div className="login-field">
+              <span>邮箱验证码</span>
+              <div className="login-code-row">
+                <div className="login-input-wrap">
+                  <LockKeyhole size={15} />
+                  <input
+                    aria-label="邮箱验证码"
+                    autoComplete="one-time-code"
+                    disabled={isBusy}
+                    inputMode="numeric"
+                    maxLength={16}
+                    name="verificationCode"
+                    onChange={(event) => onChange({ verificationCode: event.target.value })}
+                    placeholder="输入验证码"
+                    type="text"
+                    value={form.verificationCode}
+                  />
+                </div>
+                <button
+                  className="login-code-button"
+                  disabled={isBusy || emailCodeCooldown > 0}
+                  onClick={onSendCode}
+                  type="button"
+                >
+                  {isSendingCode ? "发送中" : emailCodeCooldown > 0 ? `${emailCodeCooldown}s 后重发` : "发送验证码"}
+                </button>
+              </div>
             </div>
-          </label>
+          )}
+          {usesPassword && (
+            <label className="login-field">
+              <span>密码</span>
+              <div className="login-input-wrap">
+                <LockKeyhole size={15} />
+                <input
+                  autoComplete={isRegister ? "new-password" : "current-password"}
+                  disabled={isBusy}
+                  onChange={(event) => onChange({ password: event.target.value })}
+                  placeholder="••••••••"
+                  type="password"
+                  value={form.password}
+                />
+              </div>
+            </label>
+          )}
+          {isRegister && (
+            <label className="login-field">
+              <span>确认密码</span>
+              <div className="login-input-wrap">
+                <LockKeyhole size={15} />
+                <input
+                  autoComplete="new-password"
+                  disabled={isBusy}
+                  onChange={(event) => onChange({ confirmPassword: event.target.value })}
+                  placeholder="再次输入密码"
+                  type="password"
+                  value={form.confirmPassword}
+                />
+              </div>
+            </label>
+          )}
           <label className="login-remember">
             <input
               checked={form.remember}
-              disabled={isChecking}
+              disabled={isBusy}
               onChange={(event) => onChange({ remember: event.target.checked })}
               type="checkbox"
             />
@@ -7196,11 +7535,11 @@ function LoginDialog({ authState, form, loginStatus, onChange, onClose, onLogout
           </label>
           {loginStatus.message && <div className={`login-status ${loginStatus.status}`}>{loginStatus.message}</div>}
           <div className="dialog-actions login-actions">
-            <button className="ghost-button" disabled={isChecking} onClick={onClose} type="button">
+            <button className="ghost-button" disabled={isBusy} onClick={onClose} type="button">
               取消
             </button>
-            <button className="primary-button" disabled={isChecking} type="submit">
-              {isChecking ? "登录中" : "登录"}
+            <button className="primary-button" disabled={isBusy} type="submit">
+              {isChecking ? (isRegister ? "注册中" : "登录中") : isRegister ? "注册并登录" : loginMethod === "code" ? "验证并登录" : "登录"}
             </button>
           </div>
         </form>

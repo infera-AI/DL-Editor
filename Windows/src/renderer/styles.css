@@ -4060,6 +4060,63 @@ button:disabled {
   font-size: 12px;
 }
 
+.login-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 3px;
+}
+
+.login-mode-button {
+  min-height: 30px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.login-mode-button.active {
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(17, 20, 19, 0.1);
+  color: var(--text);
+}
+
+.login-mode-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.login-method-switch {
+  display: flex;
+  gap: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.login-method-switch button {
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  padding: 0 1px 7px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.login-method-switch button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.login-method-switch button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 .login-account {
   display: flex;
   align-items: center;
@@ -4148,6 +4205,34 @@ button:disabled {
   outline: none;
 }
 
+.login-code-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.login-code-button {
+  min-width: 96px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 0 10px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+}
+
+.login-code-button:hover:not(:disabled) {
+  border-color: rgba(15, 118, 110, 0.42);
+  background: var(--accent-soft);
+}
+
+.login-code-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
 .login-remember {
   display: inline-flex;
   align-items: center;
@@ -4175,10 +4260,17 @@ button:disabled {
   line-height: 1.35;
 }
 
-.login-status.checking {
+.login-status.checking,
+.login-status.sending {
   border-color: rgba(154, 103, 0, 0.24);
   background: rgba(154, 103, 0, 0.07);
   color: var(--warning);
+}
+
+.login-status.success {
+  border-color: rgba(15, 118, 110, 0.24);
+  background: rgba(15, 118, 110, 0.07);
+  color: var(--accent-strong);
 }
 
 .login-status.error {
