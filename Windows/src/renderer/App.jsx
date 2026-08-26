@@ -2433,9 +2433,16 @@ function App() {
           result = await uploadInferaVideoWithAuthRefresh({
             durationSeconds: job.duration,
             durationMs: Math.max(0, Math.round((Number(job.duration) || 0) * 1000)) || undefined,
+            historyUserKey:
+              authStateRef.current?.userId ||
+              authStateRef.current?.accountName ||
+              authStateRef.current?.email ||
+              "",
             jobId: job.id,
             path: job.uploadPath,
             fileName: job.uploadName,
+            sha256: job.sha256,
+            sizeBytes: job.sizeBytes || job.size || job.totalBytes,
             startTimestampMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
             uploadId,
             uploadPath: endpoint
@@ -2461,12 +2468,15 @@ function App() {
           });
           continue;
         }
+        const duplicateFromHistory = Boolean(result?.upload_history_duplicate);
         const shouldClearLocal =
           typeof shouldClearLocalOnComplete === "function" ? Boolean(shouldClearLocalOnComplete(job)) : Boolean(autoClearLocal);
         const cleared = shouldClearLocal ? await clearUploadedLocalFile(job, clearLocalTarget || (isBackup ? "source" : "output")) : { deleted: false };
         completed += 1;
         const uploadedAt = new Date().toISOString();
-        const doneMessage = getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
+        const doneMessage = duplicateFromHistory
+          ? getUploadHistoryDoneMessage(cleared, isBackup ? "backup" : "upload")
+          : getUploadDoneMessage(cleared, isBackup ? "backup" : "upload");
         setUploadState((current) => {
           const now = Date.now();
           const currentItem = current.items.find((item) => item.jobId === job.id);
@@ -8044,6 +8054,7 @@ function createTransferTask(job, { auto = false, autoClearLocal = false, kind = 
     path: isBackup ? uploadPath : job.path || uploadPath,
     percent: 0,
     sourceJobId: job.id || "",
+    sha256: job.sha256 || "",
     speedBytesPerSecond: 0,
     startTimeMs: normalizeTimestamp(job.startTimeMs ?? job.modifiedAtMs),
     status: "queued",
@@ -8088,6 +8099,7 @@ function createJobFromTransferTask(task) {
     path: task.path,
     size: task.totalBytes,
     sizeBytes: task.totalBytes,
+    sha256: task.sha256 || "",
     sourceJobId: task.sourceJobId,
     startTimeMs: task.startTimeMs,
     totalBytes: task.totalBytes,
@@ -8182,6 +8194,7 @@ function applyTransferProgress(queue, progress) {
       elapsedMs: status === "paused" ? item.elapsedMs : item.startedAt ? Math.max(Number(item.elapsedMs) || 0, Date.now() - item.startedAt) : item.elapsedMs,
       message: normalizeUploadProgressMessage(progress.message, status) || item.message,
       percent: clampPercent(progress.percent),
+      sha256: progress.sha256 || item.sha256 || "",
       speedBytesPerSecond: status === "uploading" ? Number(progress.speedBytesPerSecond) || 0 : 0,
       status,
       totalBytes
@@ -8228,6 +8241,17 @@ function getUploadDoneMessage(clearResult, operation = "upload") {
   }
 
   return operation === "backup" ? "备份完成" : "上传完成";
+}
+
+function getUploadHistoryDoneMessage(clearResult, operation = "upload") {
+  const operationLabel = operation === "backup" ? "备份" : "上传";
+  if (clearResult?.deleted) {
+    return `检测到历史${operationLabel}记录，本地文件已清除`;
+  }
+  if (clearResult?.error) {
+    return `检测到历史${operationLabel}记录，已标记完成；本地文件清除失败：${clearResult.error}`;
+  }
+  return `检测到历史${operationLabel}记录，已标记完成`;
 }
 
 function getTransferSuccessPatch({ clearTarget, cleared, isBackup, result, timestamp, uploadPath }) {
