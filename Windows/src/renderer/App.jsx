@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Gauge,
   HardDrive,
+  HelpCircle,
   Info,
   LayoutGrid,
   List,
@@ -28,6 +29,7 @@ import {
   Mail,
   Moon,
   Pause,
+  Pencil,
   Play,
   Plus,
   RotateCcw,
@@ -69,7 +71,108 @@ const CLOUD_REPOSITORY_PAGE_SIZE = 100;
 const CLOUD_REPOSITORY_MAX_PAGES = 1000;
 const CLOUD_REPOSITORY_DEFAULT_MEDIA_FILTER_ID = "all";
 const CLOUD_REPOSITORY_DEFAULT_STATUS_FILTER_ID = "all_status";
-const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Engine", "Research"];
+const NAV_ITEMS = ["Editor", "Cloud", "Delphi", "Guess", "Engine", "Research"];
+const GUESS_VISIBLE_STATUSES = new Set(["pending", "confirmed", "corrected", "unsure"]);
+const GUESS_PAGE_SIZE = 100;
+const GUESS_LIST_PATH = "/memory/long-term/guesses";
+const GUESS_ITEMS_PATH = "/memory/long-term/items";
+const GUESS_REGISTRY_PATH = "/memory/long-term/registry";
+const GUESS_STATUS_FILTERS = [
+  { id: "all", label: "全部" },
+  { id: "pending", label: "待反馈" },
+  { id: "confirmed", label: "已确认" },
+  { id: "unsure", label: "不确定" }
+];
+const GUESS_TIME_FILTERS = [
+  { id: "all", label: "全部时间" },
+  { id: "today", label: "今天" },
+  { id: "7d", label: "近 7 天" },
+  { id: "30d", label: "近 30 天" },
+  { id: "custom", label: "自定义" }
+];
+const GUESS_VALUE_LABELS = {
+  avoid: "避免",
+  like: "喜欢",
+  likes: "喜欢",
+  prefer: "偏好",
+  preferred: "偏好",
+  dislike: "不喜欢",
+  dislikes: "不喜欢",
+  tolerate: "可以接受",
+  neutral: "中立",
+  hate: "很反感",
+  seek: "主动接近",
+  approach: "接近",
+  concise: "简洁",
+  balanced: "适中",
+  detailed: "详细",
+  adaptive: "按情况调整",
+  direct: "直接",
+  gentle: "委婉",
+  ask_first: "先问清楚",
+  best_effort: "尽量先答",
+  daily: "每天",
+  weekly: "每周",
+  monthly: "每月",
+  ad_hoc: "按需",
+  active: "进行中",
+  paused: "暂停",
+  completed: "已完成",
+  cancelled: "已取消",
+  canceled: "已取消",
+  dropped: "已放弃",
+  distant: "疏远",
+  ended: "已结束",
+  low: "低",
+  medium: "中",
+  high: "高",
+  urgent: "紧急",
+  employed: "在职",
+  self_employed: "自由职业",
+  student: "学生",
+  unemployed: "待业",
+  retired: "退休",
+  onsite: "现场办公",
+  remote: "远程",
+  hybrid: "混合办公",
+  office: "办公室",
+  home: "家里",
+  coworking: "共享办公",
+  cafe: "咖啡馆",
+  restaurant: "餐厅",
+  work: "工作",
+  study: "学习",
+  family: "家庭",
+  friend: "朋友",
+  true: "是",
+  false: "否"
+};
+const GUESS_ENUM_OPTIONS_BY_KEY = {
+  "style.answer.detail_level": ["concise", "balanced", "detailed", "adaptive"],
+  "style.report.detail_level": ["concise", "balanced", "detailed", "adaptive"],
+  "style.answer.directness": ["direct", "balanced", "gentle"],
+  "style.answer.question_clarification": ["ask_first", "best_effort", "adaptive"],
+  "preference.schedule.planning_cadence": ["daily", "weekly", "monthly", "ad_hoc"],
+  "goal_project.commitment.status": ["active", "paused", "completed", "cancelled"],
+  "goal_project.project.status": ["active", "paused", "completed", "cancelled"],
+  "goal_project.goal.priority": ["low", "medium", "high", "urgent"],
+  "identity.occupation.employment_status": ["employed", "self_employed", "student", "unemployed", "retired"],
+  "identity.occupation.work_mode": ["onsite", "remote", "hybrid"],
+  "identity.location.workplace_type": ["office", "home", "coworking", "hybrid"],
+  "relationship.person.status": ["active", "distant", "ended"]
+};
+const GUESS_TOKEN_FAMILIES = [
+  ["like", "prefer", "neutral", "tolerate", "dislike", "avoid"],
+  ["concise", "balanced", "detailed", "adaptive"],
+  ["direct", "gentle"],
+  ["ask_first", "best_effort"],
+  ["daily", "weekly", "monthly", "ad_hoc"],
+  ["active", "paused", "completed", "cancelled", "dropped"],
+  ["low", "medium", "high", "urgent"],
+  ["employed", "self_employed", "student", "unemployed", "retired"],
+  ["onsite", "remote", "hybrid"],
+  ["true", "false"]
+];
 const ENGINE_PASSWORD = "111111";
 const RESEARCH_PAGE_SIZE = 100;
 const RESEARCH_SIGNED_URL_CACHE_TTL_MS = 20 * 60 * 1000;
@@ -464,13 +567,30 @@ async function requestInfera(path, options = {}) {
   }
 }
 
-async function requestInferaRaw(path, { accept, method = "GET", token, body, responseType = "json", signal } = {}) {
+function mergeInferaRequestHeaders(headers, extraHeaders) {
+  if (!extraHeaders || typeof extraHeaders !== "object") {
+    return headers;
+  }
+
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    if (value === undefined || value === null || value === "") continue;
+    const name = String(key);
+    if (/^(authorization|accept|content-type)$/i.test(name) && headers[name]) continue;
+    headers[name] = String(value);
+  }
+  return headers;
+}
+
+async function requestInferaRaw(path, { accept, method = "GET", token, body, responseType = "json", signal, headers: extraHeaders } = {}) {
   if (typeof dlEditor.requestInfera === "function") {
-    const result = await dlEditor.requestInfera({ accept, path, method, token, body, responseType });
+    const result = await dlEditor.requestInfera({ accept, path, method, token, body, responseType, headers: extraHeaders });
     return responseType === "download" ? result : unwrapInferaResult(result);
   }
 
-  const headers = { Accept: accept || (responseType === "download" ? "application/json, application/zip" : "application/json") };
+  const headers = mergeInferaRequestHeaders(
+    { Accept: accept || (responseType === "download" ? "application/json, application/zip" : "application/json") },
+    extraHeaders
+  );
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
@@ -1120,6 +1240,399 @@ async function streamResearchSimulationInput(token, subjectUserId, sessionCode, 
   }
 }
 
+function createInferaIdempotencyKey(prefix) {
+  const unique = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${unique}`.slice(0, 128);
+}
+
+function isGuessConflictError(error) {
+  const status = Number(error?.status || error?.statusCode) || 0;
+  const message = String(error?.message || "");
+  const errorCode = String(error?.errorCode || error?.error_code || "");
+  return (
+    status === 409 ||
+    /\(409\)/.test(message) ||
+    /stale_row_version|guess_already_resolved|guess_support_stale|idempotency_key_reused/.test(errorCode) ||
+    /already been resolved|changed since it was read|supporting this guess changed/i.test(message)
+  );
+}
+
+function isVisibleGuess(guess) {
+  return GUESS_VISIBLE_STATUSES.has(String(guess?.status || ""));
+}
+
+function isGuessTextValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === "text" && typeof value.text === "string";
+}
+
+function isSimpleGuessValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === "value" && (value.value == null || ["string", "number", "boolean"].includes(typeof value.value));
+}
+
+function isPrimitiveGuessPart(value) {
+  return value == null || ["string", "number", "boolean"].includes(typeof value);
+}
+
+function getGuessListValueKey(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  for (const key of ["items", "value", "places", "venues", "restrictions"]) {
+    if (Array.isArray(value[key]) && value[key].every(isPrimitiveGuessPart)) return key;
+  }
+  return "";
+}
+
+function extractGuessItemPart(item) {
+  if (isPrimitiveGuessPart(item)) return item == null ? null : item;
+  if (!item || typeof item !== "object") return null;
+  if (item.status && item.status !== "active") return null;
+  if (item.value != null && isPrimitiveGuessPart(item.value)) return item.value;
+  if (typeof item.text === "string" && item.text) return item.text;
+  if (typeof item.name === "string" && item.name) return item.name;
+  if (typeof item.label === "string" && item.label) return item.label;
+  return null;
+}
+
+function toGuessClaimValue(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return value;
+  if (isSimpleGuessValue(value)) return value;
+  for (const key of ["items", "restrictions", "places", "venues"]) {
+    if (!Array.isArray(value[key])) continue;
+    const parts = value[key].map(extractGuessItemPart).filter((item) => item != null && item !== "");
+    if (parts.length) return { [key]: parts };
+  }
+  if ("value" in value && isPrimitiveGuessPart(value.value) && value.value != null && value.value !== "") {
+    return { value: value.value };
+  }
+  if (typeof value.text === "string" && value.text) return { text: value.text };
+  return value;
+}
+
+function normalizeGuessTokenKey(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function formatGuessToken(value) {
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "number") return String(value);
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  const key = normalizeGuessTokenKey(text);
+  if (key === "true" || key === "yes") return "是";
+  if (key === "false" || key === "no") return "否";
+  if (GUESS_VALUE_LABELS[key]) return GUESS_VALUE_LABELS[key];
+  if (/^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i.test(text)) return text.replace(/[_-]+/g, " ");
+  return text;
+}
+
+function uniqueGuessTokens(values) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const token = typeof value === "boolean" || typeof value === "number" ? String(value) : String(value).trim();
+    if (!token) continue;
+    const key = normalizeGuessTokenKey(token);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(token);
+  }
+  return result;
+}
+
+function splitGuessDraftList(text) {
+  return uniqueGuessTokens(
+    String(text ?? "")
+      .split(/[、,，]/)
+      .map((part) => part.trim())
+  );
+}
+
+function canonicalizeGuessToken(text, options = []) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return "";
+  const key = normalizeGuessTokenKey(trimmed);
+  for (const option of options) {
+    if (normalizeGuessTokenKey(option) === key) return String(option);
+    if (normalizeGuessTokenKey(formatGuessToken(option)) === key) return String(option);
+  }
+  for (const [canonical, label] of Object.entries(GUESS_VALUE_LABELS)) {
+    if (canonical === key || normalizeGuessTokenKey(label) === key) {
+      const matched = options.find((option) => normalizeGuessTokenKey(option) === canonical);
+      return matched == null ? canonical : String(matched);
+    }
+  }
+  return trimmed;
+}
+
+function parseGuessBoolean(text) {
+  const key = normalizeGuessTokenKey(canonicalizeGuessToken(text, ["true", "false"]));
+  if (["false", "no", "0"].includes(key) || key === normalizeGuessTokenKey("否")) return false;
+  if (["true", "yes", "1"].includes(key) || key === normalizeGuessTokenKey("是")) return true;
+  throw new Error("请选择是或否");
+}
+
+function getGuessValueTokens(value, seen) {
+  if (value == null || value === "") return [];
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return [value];
+  if (typeof value !== "object") return [];
+  const nextSeen = seen || new Set();
+  if (nextSeen.has(value)) return [];
+  nextSeen.add(value);
+  if (Array.isArray(value)) return uniqueGuessTokens(value.flatMap((item) => getGuessValueTokens(item, nextSeen)));
+  if (isSimpleGuessValue(value)) return value.value == null ? [] : [value.value];
+  const listKey = getGuessListValueKey(value);
+  if (listKey) return uniqueGuessTokens(value[listKey]);
+  for (const key of ["items", "value", "text", "label", "name", "place", "summary_text", "subject_text"]) {
+    if (value[key] == null || value[key] === "") continue;
+    const tokens = getGuessValueTokens(value[key], nextSeen);
+    if (tokens.length) return tokens;
+  }
+  return uniqueGuessTokens(Object.values(value).flatMap((item) => getGuessValueTokens(item, nextSeen)));
+}
+
+function formatGuessValue(value, seen) {
+  return uniqueGuessTokens(getGuessValueTokens(value, seen).map(formatGuessToken)).join("、");
+}
+
+function indexGuessRegistry(manifest) {
+  const map = {};
+  for (const entry of manifest?.keys || []) {
+    if (entry?.memory_key) map[entry.memory_key] = entry;
+  }
+  return map;
+}
+
+function collectRegistryCommonValues(entry) {
+  const values = [];
+  const vocab = entry?.value_vocabulary;
+  if (Array.isArray(vocab?.common_values)) values.push(...vocab.common_values);
+  if (vocab?.fields && typeof vocab.fields === "object") {
+    for (const field of Object.values(vocab.fields)) {
+      if (Array.isArray(field?.common_values)) values.push(...field.common_values);
+    }
+  }
+  return values;
+}
+
+function getGuessChoiceOptions(memoryKey, registryEntry, value) {
+  if (isSimpleGuessValue(value) && typeof value.value === "boolean") return ["true", "false"];
+  if (registryEntry?.claim_schema_name === "BooleanChoiceV1") return ["true", "false"];
+  const current = getGuessValueTokens(value).map((item) => String(item));
+  const family = GUESS_TOKEN_FAMILIES.find((group) => current.some((token) => group.includes(normalizeGuessTokenKey(token)))) || [];
+  const options = uniqueGuessTokens([
+    ...current,
+    ...(GUESS_ENUM_OPTIONS_BY_KEY[memoryKey] || []),
+    ...family,
+    ...collectRegistryCommonValues(registryEntry)
+  ]);
+  return options.slice(0, 36);
+}
+
+function getGuessDraftConfig(value) {
+  const claim = toGuessClaimValue(value);
+  if (isSimpleGuessValue(claim)) {
+    return { mode: "simple", text: claim.value == null ? "" : String(claim.value) };
+  }
+  if (isGuessTextValue(claim)) {
+    return { mode: "simple", text: claim.text };
+  }
+  const listKey = getGuessListValueKey(claim);
+  if (listKey) {
+    return { mode: "simple", text: claim[listKey].map((item) => String(item ?? "")).filter(Boolean).join("、") };
+  }
+  return { mode: "json", text: claim ? JSON.stringify(claim, null, 2) : "{\n  \n}" };
+}
+
+function getGuessDraftError(mode, text, originalValue) {
+  if (mode === "simple") {
+    const listKey = getGuessListValueKey(originalValue);
+    if (listKey) {
+      return splitGuessDraftList(text).length ? "" : "请至少选择或填写一项";
+    }
+    if (!String(text ?? "").trim()) {
+      return isSimpleGuessValue(originalValue) && typeof originalValue.value === "boolean"
+        ? "请选择是或否"
+        : "请选择或填写纠正后的值";
+    }
+    return "";
+  }
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return "请输入有效的 JSON 对象";
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "值需要是 JSON 对象";
+  } catch {
+    return "JSON 格式不正确";
+  }
+  return "";
+}
+
+function parseGuessValueDraft(mode, text, originalValue, options = []) {
+  const draftError = getGuessDraftError(mode, text, originalValue);
+  if (draftError) throw new Error(draftError);
+  if (mode === "simple") {
+    const listKey = getGuessListValueKey(originalValue);
+    if (listKey) {
+      const parts = splitGuessDraftList(text).map((part) => canonicalizeGuessToken(part, options)).filter(Boolean);
+      return { ...originalValue, [listKey]: parts };
+    }
+    if (isGuessTextValue(originalValue)) {
+      return { text: String(text ?? "").trim() };
+    }
+    if (isSimpleGuessValue(originalValue) && typeof originalValue.value === "boolean") {
+      return { value: parseGuessBoolean(text) };
+    }
+    const canonical = canonicalizeGuessToken(text, options);
+    if (isSimpleGuessValue(originalValue) && typeof originalValue.value === "number") {
+      const numeric = Number(canonical);
+      if (!Number.isFinite(numeric)) throw new Error("请输入有效数字");
+      return { value: numeric };
+    }
+    return { value: canonical };
+  }
+  const trimmed = String(text ?? "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error("JSON 格式不正确");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("值需要是 JSON 对象");
+  }
+  return parsed;
+}
+
+function getGuessStatusLabel(status) {
+  if (status === "pending") return "待反馈";
+  if (status === "confirmed" || status === "corrected") return "已确认";
+  if (status === "unsure") return "不确定";
+  return status || "";
+}
+
+function getGuessStatusRank(status) {
+  if (status === "pending") return 0;
+  if (status === "confirmed" || status === "corrected") return 1;
+  if (status === "unsure") return 2;
+  return 3;
+}
+
+function getGuessTimestamp(guess) {
+  const value = guess?.asked_at_ms ?? guess?.create_time ?? guess?.update_time ?? guess?.answered_at_ms;
+  if (value == null || value === "") return 0;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatGuessDate(guess) {
+  const timestamp = getGuessTimestamp(guess);
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  return year === new Date().getFullYear() ? `${month}月${day}日` : `${year}年${month}月${day}日`;
+}
+
+function sortGuessItems(items) {
+  return [...items].sort((left, right) => {
+    const rank = getGuessStatusRank(left.status) - getGuessStatusRank(right.status);
+    if (rank !== 0) return rank;
+    return getGuessTimestamp(right) - getGuessTimestamp(left) || Number(right.id || 0) - Number(left.id || 0);
+  });
+}
+
+function getLocalDayStartMs(daysAgo = 0) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() - daysAgo);
+  return date.getTime();
+}
+
+function getGuessTimeRange(timeFilter, from, to) {
+  if (timeFilter === "today") {
+    return { start: getLocalDayStartMs(0), end: getLocalDayStartMs(-1) - 1 };
+  }
+  if (timeFilter === "7d") {
+    return { start: getLocalDayStartMs(6), end: getLocalDayStartMs(-1) - 1 };
+  }
+  if (timeFilter === "30d") {
+    return { start: getLocalDayStartMs(29), end: getLocalDayStartMs(-1) - 1 };
+  }
+  if (timeFilter === "custom") {
+    const start = from ? new Date(`${from}T00:00:00`).getTime() : 0;
+    const end = to ? new Date(`${to}T23:59:59.999`).getTime() : Number.POSITIVE_INFINITY;
+    return {
+      start: Number.isFinite(start) ? start : 0,
+      end: Number.isFinite(end) ? end : Number.POSITIVE_INFINITY
+    };
+  }
+  return null;
+}
+
+function matchesGuessStatusFilter(guess, statusFilter) {
+  if (!statusFilter || statusFilter === "all") return true;
+  if (statusFilter === "confirmed") return guess.status === "confirmed" || guess.status === "corrected";
+  return guess.status === statusFilter;
+}
+
+function matchesGuessTimeFilter(guess, timeFilter, from, to) {
+  const range = getGuessTimeRange(timeFilter, from, to);
+  if (!range) return true;
+  const timestamp = getGuessTimestamp(guess);
+  if (!timestamp) return false;
+  return timestamp >= range.start && timestamp <= range.end;
+}
+
+function filterGuessItems(items, { status, time, from, to } = {}) {
+  return items.filter((item) => matchesGuessStatusFilter(item, status) && matchesGuessTimeFilter(item, time, from, to));
+}
+
+function getGuessPreview(guess, item) {
+  const value = item && !item.error ? item.value : guess?.corrected_value || guess?.proposed_value;
+  return formatGuessValue(toGuessClaimValue(value) || value);
+}
+
+function selectGuessAfterRemoval(remaining, removedId, previous) {
+  const index = previous.findIndex((row) => row.id === removedId);
+  const candidate = previous[index + 1] || previous[index - 1];
+  if (candidate && remaining.some((row) => row.id === candidate.id)) return candidate.id;
+  return remaining[0]?.id ?? null;
+}
+
+async function fetchLongTermMemoryGuesses(token, { limit = GUESS_PAGE_SIZE, cursor } = {}) {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (cursor) params.set("cursor", String(cursor));
+  return requestInfera(`${GUESS_LIST_PATH}?${params.toString()}`, { token });
+}
+
+async function fetchLongTermMemoryRegistry(token) {
+  return requestInfera(GUESS_REGISTRY_PATH, { token });
+}
+
+async function fetchLongTermMemoryItem(token, itemId) {
+  return requestInfera(`${GUESS_ITEMS_PATH}/${encodeURIComponent(itemId)}`, { token });
+}
+
+async function respondToLongTermMemoryGuess(token, guessId, body, idempotencyKey) {
+  return requestInfera(`${GUESS_LIST_PATH}/${encodeURIComponent(guessId)}/respond`, {
+    method: "POST",
+    token,
+    body,
+    headers: { "Idempotency-Key": idempotencyKey }
+  });
+}
+
 function normalizeConversationQueryMode(queryMode) {
   return CONVERSATION_QUERY_MODES.has(queryMode) ? queryMode : "agent";
 }
@@ -1550,6 +2063,7 @@ function App() {
   const automationEnqueueRunningRef = useRef(false);
   const autoLoginPromptedRef = useRef(false);
   const researchAccessRequestRef = useRef(0);
+  const guessRequestRef = useRef(0);
   const [repositoryState, setRepositoryState] = useState({
     status: "idle",
     spaceId: cloudSpaceId,
@@ -1586,6 +2100,16 @@ function App() {
     message: "",
     exportMessage: "",
     exportDownload: null
+  });
+  const [guessState, setGuessState] = useState({
+    status: "idle",
+    items: [],
+    itemMap: {},
+    registryMap: {},
+    selectedId: null,
+    nextCursor: null,
+    message: "",
+    notice: ""
   });
   const [startTimeEditor, setStartTimeEditor] = useState(null);
   const [showAppInfo, setShowAppInfo] = useState(false);
@@ -1806,6 +2330,14 @@ function App() {
 
     loadCloudRepository(authState, cloudSpaceId, cloudRepositoryDateKey, cloudRepositoryStatusFilterId);
   }, [activeNav, authState?.token, cloudRepositoryDateKey, cloudRepositoryStatusFilterId, cloudSpaceId]);
+
+  useEffect(() => {
+    if (activeNav !== "Guess") {
+      return;
+    }
+
+    loadGuesses(authState);
+  }, [activeNav, authState?.token]);
 
   useEffect(() => {
     if (activeNav !== "Research") {
@@ -3456,6 +3988,119 @@ function App() {
     }
   }
 
+  async function loadGuesses(authOverride = authState) {
+    const token = authOverride?.token;
+    const requestId = ++guessRequestRef.current;
+    if (!token) {
+      setGuessState({
+        status: "auth",
+        items: [],
+        itemMap: {},
+        registryMap: {},
+        selectedId: null,
+        nextCursor: null,
+        message: "请先登录后查看 Guess",
+        notice: ""
+      });
+      return;
+    }
+
+    setGuessState((current) => ({ ...current, status: "loading", message: "" }));
+    try {
+      const [page, registry] = await Promise.all([
+        fetchLongTermMemoryGuesses(token, { limit: GUESS_PAGE_SIZE }),
+        fetchLongTermMemoryRegistry(token).catch(() => null)
+      ]);
+      if (requestId !== guessRequestRef.current) return;
+      const items = sortGuessItems((page?.items || []).filter(isVisibleGuess));
+      const itemIds = [...new Set(items.map((guess) => guess.resulting_item_id).filter(Boolean))];
+      const itemEntries = await Promise.all(
+        itemIds.map(async (itemId) => {
+          try {
+            return [itemId, await fetchLongTermMemoryItem(token, itemId)];
+          } catch (error) {
+            return [itemId, { error: error.message || "无法读取这条记忆" }];
+          }
+        })
+      );
+      if (requestId !== guessRequestRef.current) return;
+      const itemMap = Object.fromEntries(itemEntries);
+      const registryMap = indexGuessRegistry(registry);
+      setGuessState((current) => ({
+        status: items.length ? "ready" : "empty",
+        items,
+        itemMap,
+        registryMap: Object.keys(registryMap).length ? registryMap : current.registryMap || {},
+        selectedId: items.some((item) => item.id === current.selectedId) ? current.selectedId : items[0]?.id ?? null,
+        nextCursor: page?.next_cursor ?? null,
+        message: "",
+        notice: ""
+      }));
+    } catch (error) {
+      if (requestId !== guessRequestRef.current) return;
+      setGuessState((current) => ({
+        ...current,
+        status: "error",
+        message: error.message || "无法读取 Guess"
+      }));
+    }
+  }
+
+  async function respondToGuess(guess, payload) {
+    const token = authState?.token;
+    if (!token) {
+      setShowLogin(true);
+      throw new Error("请先登录后再反馈 Guess");
+    }
+
+    try {
+      const result = await respondToLongTermMemoryGuess(
+        token,
+        guess.id,
+        {
+          response_type: payload.responseType,
+          expected_row_version: guess.row_version,
+          ...(payload.correctedValue ? { corrected_value: payload.correctedValue } : {}),
+          ...(payload.comment ? { comment: payload.comment } : {})
+        },
+        createInferaIdempotencyKey(`guess-respond-${guess.id}`)
+      );
+      const nextGuess = result?.guess;
+      const nextItem = result?.item;
+      setGuessState((current) => {
+        const previous = current.items;
+        const keepCurrent = nextGuess && isVisibleGuess(nextGuess);
+        const items = sortGuessItems(
+          keepCurrent
+            ? previous.map((row) => (row.id === guess.id ? nextGuess : row))
+            : previous.filter((row) => row.id !== guess.id)
+        );
+        const itemMap = { ...current.itemMap };
+        if (nextItem?.id) itemMap[nextItem.id] = nextItem;
+        return {
+          ...current,
+          status: items.length ? "ready" : "empty",
+          items,
+          itemMap,
+          selectedId: keepCurrent ? guess.id : selectGuessAfterRemoval(items, guess.id, previous),
+          notice: nextItem
+            ? "已写入记忆"
+            : nextGuess?.status === "rejected"
+              ? "已拒绝该推测"
+              : nextGuess?.status === "unsure"
+                ? "已标记为不确定"
+                : "已提交反馈"
+        };
+      });
+    } catch (error) {
+      if (isGuessConflictError(error)) {
+        await loadGuesses(authState);
+        throw new Error(error.message || "Guess 已变化，已重新加载");
+      }
+      throw error;
+    }
+  }
+
   function unlockEngine() {
     if (enginePassword === ENGINE_PASSWORD) {
       setEngineUnlocked(true);
@@ -3744,6 +4389,15 @@ function App() {
           queryMode="plain"
           subtitle="Memory conversation"
           title="Delphi"
+        />
+      ) : activeNav === "Guess" ? (
+        <GuessPage
+          authState={authState}
+          onLogin={() => setShowLogin(true)}
+          onRefresh={() => loadGuesses(authState)}
+          onRespond={respondToGuess}
+          onSelect={(guessId) => setGuessState((current) => ({ ...current, selectedId: guessId, notice: "" }))}
+          state={guessState}
         />
       ) : activeNav === "Engine" ? (
         engineUnlocked ? (
@@ -6865,6 +7519,488 @@ function ResearchStatistics({ data }) {
         )}
       </div>
     </section>
+  );
+}
+
+function displayGuessDraftField(text, options, multiple) {
+  const raw = String(text ?? "");
+  if (multiple) {
+    const parts = splitGuessDraftList(raw);
+    if (!parts.length) return raw;
+    return parts.map((part) => formatGuessToken(canonicalizeGuessToken(part, options) || part)).join("、");
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return raw;
+  return formatGuessToken(canonicalizeGuessToken(trimmed, options) || trimmed);
+}
+
+function GuessValueView({ value }) {
+  const tokens = getGuessValueTokens(value);
+  if (!tokens.length) return <p className="guess-value-preview">-</p>;
+  return (
+    <div className="guess-value-chips">
+      {tokens.map((token, index) => (
+        <span className="guess-value-chip" key={`${String(token)}-${index}`}>
+          {formatGuessToken(token)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function GuessChoiceChips({ disabled, onToggle, options, selected }) {
+  const selectedSet = new Set(selected.map((item) => normalizeGuessTokenKey(item)));
+  return (
+    <div className="guess-choice-chips">
+      {options.map((option) => {
+        const active = selectedSet.has(normalizeGuessTokenKey(option));
+        return (
+          <button
+            className={active ? "guess-choice-chip active" : "guess-choice-chip"}
+            disabled={disabled}
+            key={String(option)}
+            onClick={() => onToggle(option)}
+            type="button"
+          >
+            {formatGuessToken(option)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function GuessValueEditor({ disabled, mode, onChange, options, originalValue, text }) {
+  const multiple = Boolean(getGuessListValueKey(originalValue));
+  const showChips = mode === "simple" && options.length > 1;
+  const selected = multiple
+    ? splitGuessDraftList(text).map((item) => canonicalizeGuessToken(item, options) || item)
+    : [canonicalizeGuessToken(text, options) || String(text ?? "").trim()].filter(Boolean);
+
+  function toggleOption(option) {
+    if (multiple) {
+      const current = splitGuessDraftList(text).map((item) => canonicalizeGuessToken(item, options) || item);
+      const key = normalizeGuessTokenKey(option);
+      const exists = current.some((item) => normalizeGuessTokenKey(item) === key);
+      const next = exists
+        ? current.filter((item) => normalizeGuessTokenKey(item) !== key)
+        : [...current, option];
+      onChange(next.join("、"));
+      return;
+    }
+    onChange(String(option));
+  }
+
+  return (
+    <>
+      {showChips ? (
+        <>
+          <p className="guess-choice-hint">{multiple ? "点选更准确的项，可多选" : "点选更准确的值，不用自己猜该填什么"}</p>
+          <GuessChoiceChips disabled={disabled} onToggle={toggleOption} options={options} selected={selected} />
+        </>
+      ) : null}
+      {mode === "simple" ? (
+        <input
+          className="text-input"
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={showChips ? (multiple ? "也可填写其他项，用顿号分隔" : "也可填写其他说法") : undefined}
+          value={mode === "simple" ? displayGuessDraftField(text, options, multiple) : text}
+        />
+      ) : (
+        <textarea
+          className="text-input guess-json-input"
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          value={text}
+        />
+      )}
+    </>
+  );
+}
+
+function GuessPage({ authState, onLogin, onRefresh, onRespond, onSelect, state }) {
+  const allItems = sortGuessItems(state.items || []);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [timeFilter, setTimeFilter] = useState("all");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const items = filterGuessItems(allItems, { status: statusFilter, time: timeFilter, from: fromDate, to: toDate });
+  const pendingItems = items.filter((item) => item.status === "pending");
+  const resolvedItems = items.filter((item) => item.status === "confirmed" || item.status === "corrected");
+  const unsureItems = items.filter((item) => item.status === "unsure");
+  const pendingTotal = allItems.filter((item) => item.status === "pending").length;
+  const resolvedTotal = allItems.filter((item) => item.status === "confirmed" || item.status === "corrected").length;
+  const unsureTotal = allItems.filter((item) => item.status === "unsure").length;
+  const selected = items.find((item) => item.id === state.selectedId) || items[0] || null;
+  const relatedItem = selected?.resulting_item_id ? state.itemMap?.[selected.resulting_item_id] : null;
+  const isPending = selected?.status === "pending";
+  const isUnsure = selected?.status === "unsure";
+  const sourceValue = isPending ? selected?.proposed_value : relatedItem && !relatedItem.error ? relatedItem.value : selected?.corrected_value || selected?.proposed_value;
+  const claimValue = toGuessClaimValue(sourceValue);
+  const registryEntry = selected?.memory_key ? state.registryMap?.[selected.memory_key] : null;
+  const choiceOptions = getGuessChoiceOptions(selected?.memory_key, registryEntry, claimValue);
+  const [draftMode, setDraftMode] = useState("simple");
+  const [draftText, setDraftText] = useState("");
+  const [comment, setComment] = useState("");
+  const [correcting, setCorrecting] = useState(false);
+  const [busyAction, setBusyAction] = useState("");
+  const [formError, setFormError] = useState("");
+  const draftError = getGuessDraftError(draftMode, draftText, claimValue);
+  const canSubmitDraft = !draftError;
+
+  useEffect(() => {
+    const value = isPending ? selected?.proposed_value : relatedItem && !relatedItem.error ? relatedItem.value : selected?.corrected_value || selected?.proposed_value;
+    const draft = getGuessDraftConfig(value);
+    setDraftMode(draft.mode);
+    setDraftText(draft.text);
+    setComment("");
+    setCorrecting(false);
+    setBusyAction("");
+    setFormError("");
+  }, [isPending, relatedItem, selected?.corrected_value, selected?.id, selected?.proposed_value, selected?.row_version, relatedItem?.row_version]);
+
+  async function runAction(action, handler) {
+    setBusyAction(action);
+    setFormError("");
+    try {
+      await handler();
+    } catch (error) {
+      setFormError(error.message || "操作失败");
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  async function submitResponse(responseType) {
+    if (!selected) return;
+    let correctedValue;
+    if (responseType === "correct") {
+      if (draftError) throw new Error(draftError);
+      correctedValue = parseGuessValueDraft(draftMode, draftText, selected.proposed_value, choiceOptions);
+    }
+    await onRespond(selected, {
+      responseType,
+      correctedValue,
+      comment: comment.trim() || undefined
+    });
+    setCorrecting(false);
+  }
+
+  if (!authState?.token || state.status === "auth") {
+    return (
+      <section className="research-login-page">
+        <div className="research-login-card">
+          <div className="research-login-icon">
+            <LockKeyhole size={24} />
+          </div>
+          <div className="research-login-copy">
+            <h1>登录后查看 Guess</h1>
+            <p>使用当前账号查看系统推测，并对未反馈的条目做出选择。</p>
+          </div>
+          <button className="primary-button" onClick={onLogin} type="button">
+            <UserRound size={16} />
+            <span>登录</span>
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="guess-page">
+      <div className="guess-workspace">
+        <header className="guess-toolbar">
+          <div className="guess-toolbar-top">
+            <div className="guess-toolbar-copy">
+              <h1>Guess</h1>
+              <p>
+                {pendingTotal} 条待反馈
+                {resolvedTotal ? ` · ${resolvedTotal} 条已确认` : ""}
+                {unsureTotal ? ` · ${unsureTotal} 条不确定` : ""}
+                {items.length !== allItems.length ? ` · 当前显示 ${items.length} 条` : ""}
+              </p>
+            </div>
+            <button className="ghost-button" disabled={state.status === "loading"} onClick={onRefresh} type="button">
+              <RotateCcw size={15} />
+              <span>{state.status === "loading" ? "刷新中" : "刷新"}</span>
+            </button>
+          </div>
+          <div className="guess-filters">
+            <div className="guess-filter-chips" role="tablist" aria-label="按状态筛选">
+              {GUESS_STATUS_FILTERS.map((filter) => (
+                <button
+                  aria-selected={statusFilter === filter.id}
+                  className={statusFilter === filter.id ? "guess-filter-chip active" : "guess-filter-chip"}
+                  key={filter.id}
+                  onClick={() => setStatusFilter(filter.id)}
+                  type="button"
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+            <select
+              aria-label="按时间筛选"
+              className="guess-filter-select"
+              onChange={(event) => setTimeFilter(event.target.value)}
+              value={timeFilter}
+            >
+              {GUESS_TIME_FILTERS.map((filter) => (
+                <option key={filter.id} value={filter.id}>
+                  {filter.label}
+                </option>
+              ))}
+            </select>
+            {timeFilter === "custom" ? (
+              <>
+                <label className="guess-date-input">
+                  <span>从</span>
+                  <input onChange={(event) => setFromDate(event.target.value)} type="date" value={fromDate} />
+                </label>
+                <label className="guess-date-input">
+                  <span>到</span>
+                  <input onChange={(event) => setToDate(event.target.value)} type="date" value={toDate} />
+                </label>
+              </>
+            ) : null}
+          </div>
+        </header>
+
+        {state.status === "error" ? (
+          <div className="guess-empty">
+            <TriangleAlert size={28} />
+            <h2>无法读取 Guess</h2>
+            <p>{state.message || "请稍后重试。"}</p>
+            <button className="primary-button" onClick={onRefresh} type="button">
+              重新加载
+            </button>
+          </div>
+        ) : state.status === "loading" && !allItems.length ? (
+          <div className="guess-empty">
+            <Sparkles size={28} />
+            <h2>正在加载 Guess</h2>
+            <p>正在读取当前账号的推测和已写入记忆。</p>
+          </div>
+        ) : !allItems.length ? (
+          <div className="guess-empty">
+            <HelpCircle size={28} />
+            <h2>暂无 Guess</h2>
+            <p>后台会根据已有记忆自动生成推测。稍后刷新即可。</p>
+          </div>
+        ) : (
+          <div className="guess-body">
+            <aside className="guess-list">
+              {!items.length ? (
+                <p className="guess-list-empty">没有符合筛选条件的条目</p>
+              ) : (
+                <>
+                  {pendingItems.length > 0 && (
+                    <div className="guess-list-group">
+                      <span className="guess-list-label">待反馈</span>
+                      {pendingItems.map((guess) => (
+                        <GuessListButton
+                          active={selected?.id === guess.id}
+                          guess={guess}
+                          item={null}
+                          key={guess.id}
+                          onSelect={onSelect}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {resolvedItems.length > 0 && (
+                    <div className="guess-list-group">
+                      <span className="guess-list-label">已确认</span>
+                      {resolvedItems.map((guess) => (
+                        <GuessListButton
+                          active={selected?.id === guess.id}
+                          guess={guess}
+                          item={state.itemMap?.[guess.resulting_item_id]}
+                          key={guess.id}
+                          onSelect={onSelect}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {unsureItems.length > 0 && (
+                    <div className="guess-list-group">
+                      <span className="guess-list-label">不确定</span>
+                      {unsureItems.map((guess) => (
+                        <GuessListButton
+                          active={selected?.id === guess.id}
+                          guess={guess}
+                          item={null}
+                          key={guess.id}
+                          onSelect={onSelect}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </aside>
+
+            <section className="guess-detail">
+              {selected ? (
+                <>
+                  {formatGuessDate(selected) ? <p className="guess-detail-date">{formatGuessDate(selected)}</p> : null}
+                  <div className="guess-detail-head">
+                    <span className={`guess-status ${selected.status}`}>{getGuessStatusLabel(selected.status)}</span>
+                    <h2>{selected.question_text || "系统推测"}</h2>
+                  </div>
+                  {registryEntry?.description ? <p className="guess-key-hint">{registryEntry.description}</p> : null}
+                  {selected.rationale_text ? (
+                    <details className="guess-why" open>
+                      <summary>为什么会这么问</summary>
+                      <p>{selected.rationale_text}</p>
+                    </details>
+                  ) : null}
+
+                  {isPending ? (
+                    <div className="guess-editor">
+                      <label>{correcting ? "纠正后的值" : "推测值"}</label>
+                      {correcting ? (
+                        <>
+                          <GuessValueEditor
+                            disabled={Boolean(busyAction)}
+                            mode={draftMode}
+                            onChange={setDraftText}
+                            options={choiceOptions}
+                            originalValue={selected.proposed_value}
+                            text={draftText}
+                          />
+                          <label>备注（可选）</label>
+                          <input
+                            className="text-input"
+                            disabled={Boolean(busyAction)}
+                            maxLength={500}
+                            onChange={(event) => setComment(event.target.value)}
+                            placeholder="这次纠正的说明，保存后会显示在这里"
+                            value={comment}
+                          />
+                        </>
+                      ) : (
+                        <GuessValueView value={claimValue} />
+                      )}
+
+                      {formError && <p className="guess-error">{formError}</p>}
+                      {correcting && !formError && draftError && <p className="guess-error">{draftError}</p>}
+                      {state.notice && !formError && !(correcting && draftError) && <p className="guess-notice">{state.notice}</p>}
+
+                      <div className="guess-actions">
+                        {correcting ? (
+                          <>
+                            <button
+                              className="primary-button"
+                              disabled={Boolean(busyAction) || !canSubmitDraft}
+                              onClick={() => runAction("correct", () => submitResponse("correct"))}
+                              type="button"
+                            >
+                              <Pencil size={15} />
+                              <span>{busyAction === "correct" ? "提交中" : "提交纠正"}</span>
+                            </button>
+                            <button className="ghost-button" disabled={Boolean(busyAction)} onClick={() => setCorrecting(false)} type="button">
+                              取消
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              className="primary-button"
+                              disabled={Boolean(busyAction)}
+                              onClick={() => runAction("confirm", () => submitResponse("confirm"))}
+                              type="button"
+                            >
+                              <CheckCheck size={15} />
+                              <span>{busyAction === "confirm" ? "提交中" : "确认"}</span>
+                            </button>
+                            <button className="ghost-button" disabled={Boolean(busyAction)} onClick={() => setCorrecting(true)} type="button">
+                              <Pencil size={15} />
+                              <span>纠正</span>
+                            </button>
+                            <button
+                              className="ghost-button guess-danger-button"
+                              disabled={Boolean(busyAction)}
+                              onClick={() => runAction("reject", () => submitResponse("reject"))}
+                              type="button"
+                            >
+                              <span>{busyAction === "reject" ? "提交中" : "拒绝"}</span>
+                            </button>
+                            <button
+                              className="ghost-button"
+                              disabled={Boolean(busyAction)}
+                              onClick={() => runAction("unsure", () => submitResponse("unsure"))}
+                              type="button"
+                            >
+                              <HelpCircle size={15} />
+                              <span>{busyAction === "unsure" ? "提交中" : "不确定"}</span>
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ) : isUnsure ? (
+                    <div className="guess-editor unsure">
+                      <label>推测值</label>
+                      <GuessValueView value={claimValue} />
+                      {selected.response_text ? (
+                        <>
+                          <label>备注</label>
+                          <p className="guess-comment">{selected.response_text}</p>
+                        </>
+                      ) : null}
+                      {formError && <p className="guess-error">{formError}</p>}
+                      {state.notice && !formError && <p className="guess-notice">{state.notice}</p>}
+                    </div>
+                  ) : (
+                    <div className="guess-editor">
+                      <label>记忆值</label>
+                      {relatedItem?.error ? (
+                        <p className="guess-error">{relatedItem.error}</p>
+                      ) : !relatedItem ? (
+                        <p className="guess-empty-copy">这条推测还没有对应记忆。</p>
+                      ) : (
+                        <GuessValueView value={claimValue} />
+                      )}
+                      {selected.response_text ? (
+                        <>
+                          <label>备注</label>
+                          <p className="guess-comment">{selected.response_text}</p>
+                        </>
+                      ) : null}
+                      {formError && <p className="guess-error">{formError}</p>}
+                      {state.notice && !formError && <p className="guess-notice">{state.notice}</p>}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="guess-empty">
+                  <HelpCircle size={28} />
+                  <h2>选择一条 Guess</h2>
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function GuessListButton({ active, guess, item, onSelect }) {
+  const preview = guess.status === "pending" ? "" : getGuessPreview(guess, item);
+  const dateLabel = formatGuessDate(guess);
+  const className = ["guess-list-item", active ? "active" : "", guess.status === "unsure" ? "unsure" : ""].filter(Boolean).join(" ");
+  return (
+    <button className={className} onClick={() => onSelect(guess.id)} type="button">
+      {dateLabel ? <span className="guess-list-item-date">{dateLabel}</span> : null}
+      <span className="guess-list-item-main">
+        <span className={`guess-status ${guess.status}`}>{getGuessStatusLabel(guess.status)}</span>
+        <strong>{guess.question_text || formatGuessValue(guess.proposed_value) || "系统推测"}</strong>
+      </span>
+      {preview ? <span className="guess-list-item-preview">{preview}</span> : null}
+    </button>
   );
 }
 

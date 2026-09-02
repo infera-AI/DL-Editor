@@ -603,6 +603,19 @@ function getInferaHttpErrorMessage(statusCode, detail) {
   return `请求失败 (${Number(statusCode) || 0})${normalizedDetail ? `：${normalizedDetail}` : ""}`;
 }
 
+function assignInferaExtraHeaders(headers, extraHeaders) {
+  if (!extraHeaders || typeof extraHeaders !== "object") {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    if (value === undefined || value === null || value === "") continue;
+    const name = String(key);
+    if (/^(authorization|accept|content-type)$/i.test(name)) continue;
+    headers[name] = String(value);
+  }
+}
+
 async function requestInfera(payload = {}) {
   const method = String(payload.method || "GET").toUpperCase();
   const responseType = payload.responseType || "json";
@@ -614,6 +627,7 @@ async function requestInfera(payload = {}) {
   if (payload.token) {
     headers.Authorization = `Bearer ${payload.token}`;
   }
+  assignInferaExtraHeaders(headers, payload.headers);
   const requestUrl = resolveInferaUrl(payload.path);
 
   const response = await fetch(requestUrl, {
