@@ -49,6 +49,10 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import packageJson from "../../package.json";
 import appIconUrl from "../../build/icon.svg";
+import {
+  canUseQueryMode, conversationModeParameters, createQueryModeLoader,
+  normalizeConversationQueryMode, normalizeConversationSessions, queryModeHttpStatus
+} from "./conversation-modes.mjs";
 
 const APP_NAME = "DL Studio";
 const THEME_STORAGE_KEY = "dl-studio-theme";
@@ -179,7 +183,7 @@ const RESEARCH_SIGNED_URL_CACHE_TTL_MS = 20 * 60 * 1000;
 const RESEARCH_SIGNED_URL_CACHE_MAX = 600;
 const RESEARCH_SIGNED_URL_CONCURRENCY = 8;
 const INFERA_AUTH_EXPIRED_MESSAGE = "登录已过期，请重新登录";
-const CONVERSATION_QUERY_MODES = new Set(["agent", "plain"]);
+const fetchConversationQueryModes = createQueryModeLoader((path, options) => requestInfera(path, options));
 const RESEARCH_RESOURCE_STATUSES = [
   { id: "", label: "All statuses" },
   { id: "PARSED", label: "PARSED" },
@@ -247,7 +251,7 @@ const UPLOAD_STATUS_LABELS = {
 const APP_INFO = {
   name: "DL Studio",
   version: packageJson.version,
-  updatedAt: "2026-08-26",
+  updatedAt: "2026-09-05",
   engine: "FFmpeg / FFprobe",
   stack: "Electron + React"
 };
@@ -1631,10 +1635,6 @@ async function respondToLongTermMemoryGuess(token, guessId, body, idempotencyKey
     body,
     headers: { "Idempotency-Key": idempotencyKey }
   });
-}
-
-function normalizeConversationQueryMode(queryMode) {
-  return CONVERSATION_QUERY_MODES.has(queryMode) ? queryMode : "agent";
 }
 
 function buildConversationPath(path, queryMode) {
@@ -4779,21 +4779,6 @@ function EngineMediaPreview({ mediaProxyUrl, rawRef }) {
   );
 }
 
-function normalizeConversationSessions(result, queryMode) {
-  const items = Array.isArray(result)
-    ? result
-    : Array.isArray(result?.items)
-      ? result.items
-      : Array.isArray(result?.sessions)
-        ? result.sessions
-        : [];
-  const mode = normalizeConversationQueryMode(queryMode);
-  return items.filter((item) => {
-    const itemMode = item?.query_mode === "agent" ? "agent" : "plain";
-    return itemMode === mode;
-  });
-}
-
 function getConversationTitle(item, fallback = "新对话") {
   return String(item?.title || item?.latest_question || "").trim() || fallback;
 }
@@ -4825,6 +4810,44 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
   const [streamStatus, setStreamStatus] = useState("");
   const [streamTurn, setStreamTurn] = useState(null);
   const messagesRef = useRef(null);
+  const [modeCatalog, setModeCatalog] = useState(null);
+  const [modeState, setModeState] = useState({ status: "loading", message: "" });
+  const [modeReload, setModeReload] = useState(0);
+  const initializedModeToken = useRef("");
+  const viewRef = useRef({ token, mode });
+  viewRef.current = { token, mode };
+  const modeOptions = modeCatalog?.modes || [];
+  const modeOption = modeOptions.find((item) => item.mode === mode);
+  const canReadMode = canUseQueryMode(modeOption);
+  const modeReady = modeState.status === "ready" && canReadMode;
+  const modeLabel = modeOption?.label || mode;
+
+  useEffect(() => {
+    let cancelled = false;
+    setModeState({ status: token ? "loading" : "idle", message: "" });
+    if (!token) {
+      setModeCatalog(null);
+      initializedModeToken.current = "";
+      return undefined;
+    }
+    fetchConversationQueryModes(token).then(({ catalog, warning }) => {
+      if (cancelled) return;
+      setModeCatalog(catalog);
+      if (initializedModeToken.current !== token) {
+        initializedModeToken.current = token;
+        const preferred = catalog.modes.find((item) => item.mode === queryMode && canUseQueryMode(item))
+          || catalog.modes.find((item) => item.mode === catalog.default_mode && canUseQueryMode(item))
+          || catalog.modes.find(canUseQueryMode);
+        if (allowModeSwitch && preferred) {
+          setSelectedQueryMode((current) => catalog.modes.some((item) => item.mode === current && canUseQueryMode(item)) ? current : preferred.mode);
+        }
+      }
+      setModeState({ status: "ready", message: warning });
+    }).catch((error) => {
+      if (!cancelled) setModeState({ status: "error", message: error.message || "模式列表加载失败" });
+    });
+    return () => { cancelled = true; };
+  }, [allowModeSwitch, modeReload, queryMode, token]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4833,7 +4856,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
     setSession(null);
     setStreamTurn(null);
     setStreamStatus("");
-    if (!token) {
+    if (!token || !canReadMode) {
       setListState({ status: "idle", message: "" });
       return undefined;
     }
@@ -4858,11 +4881,11 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
     return () => {
       cancelled = true;
     };
-  }, [mode, token]);
+  }, [canReadMode, mode, token]);
 
   useEffect(() => {
     let cancelled = false;
-    if (!token || !activeSessionCode || activeSessionCode === "new" || streaming) {
+    if (!token || !canReadMode || !activeSessionCode || activeSessionCode === "new" || streaming) {
       if (activeSessionCode === "new") {
         setSession(null);
         setSessionState({ status: "idle", message: "" });
@@ -4888,7 +4911,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
     return () => {
       cancelled = true;
     };
-  }, [activeSessionCode, mode, streaming, token]);
+  }, [activeSessionCode, canReadMode, mode, streaming, token]);
 
   useEffect(() => {
     const element = messagesRef.current;
@@ -4910,9 +4933,10 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
   }
 
   async function refreshConversationSessions(preferredSessionCode = activeSessionCode) {
-    if (!token) return;
+    if (!token || !modeReady) return;
     try {
       const result = await fetchConversationSessions(token, mode);
+      if (viewRef.current.token !== token || viewRef.current.mode !== mode) return;
       const nextSessions = normalizeConversationSessions(result, mode);
       setSessions(nextSessions);
       setListState({ status: "ready", message: "" });
@@ -4924,6 +4948,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
         setActiveSessionCode(preferredSessionCode);
       }
     } catch (error) {
+      if (viewRef.current.token !== token || viewRef.current.mode !== mode) return;
       setListState({ status: "error", message: error.message || "会话列表加载失败" });
     }
   }
@@ -4931,7 +4956,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
   async function submitConversation(event) {
     event.preventDefault();
     const question = draft.trim();
-    if (!question || streaming) return;
+    if (!question || streaming || !modeReady) return;
     if (!token) {
       onLogin?.();
       return;
@@ -4961,8 +4986,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
           client_request_id: requestId,
           question_text: question,
           query_mode: mode,
-          thinking_level: Number(thinkingLevel) || 0,
-          top_k: 3
+          ...conversationModeParameters(modeOption, thinkingLevel)
         },
         ({ event: eventName, data }) => {
           if (eventName === "queue") {
@@ -5031,6 +5055,10 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
       const message = error.message || "对话请求失败";
       setStreamStatus(message);
       setStreamTurn((current) => current ? { ...current, error: message } : current);
+      if ([400, 404, 422].includes(queryModeHttpStatus(error)) || /query_mode|unsupported.*mode/i.test(message)) {
+        // Refresh discovery, but never resend the question in a different mode.
+        setModeReload((value) => value + 1);
+      }
     } finally {
       setStreaming(false);
     }
@@ -5042,9 +5070,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
     ? "新对话"
     : getConversationTitle(session || activeSummary, activeSessionCode);
   const activeSubtitle = allowModeSwitch
-    ? mode === "agent"
-      ? "DL Engine Agent memory conversation"
-      : "Direct memory conversation"
+    ? modeOption?.description || "请选择可用的问答模式"
     : subtitle;
 
   return (
@@ -5056,9 +5082,9 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
           </button>
           <div>
             <strong>{title}</strong>
-            <span>{mode === "agent" ? "Agent sessions" : "Plain sessions"}</span>
+            <span>{modeLabel} sessions</span>
           </div>
-          <button className="engine-icon-button" disabled={!token || streaming} onClick={() => refreshConversationSessions()} title="刷新会话" type="button">
+          <button className="engine-icon-button" disabled={!token || streaming || !modeReady} onClick={() => refreshConversationSessions()} title="刷新会话" type="button">
             <RotateCcw size={15} />
           </button>
         </header>
@@ -5070,7 +5096,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
           ) : listState.status === "error" ? (
             <div className="conversation-sidebar-empty error">{listState.message}</div>
           ) : sessions.length === 0 ? (
-            <div className="conversation-sidebar-empty">还没有{mode === "agent" ? " Agent" : " Plain"}对话</div>
+            <div className="conversation-sidebar-empty">还没有 {modeLabel} 对话</div>
           ) : (
             sessions.map((item) => (
               <button
@@ -5103,29 +5129,38 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
             <span>{activeSubtitle}</span>
           </div>
           {allowModeSwitch ? (
-            <div aria-label="Delphi conversation mode" className="conversation-mode-switch" role="tablist">
-              {["plain", "agent"].map((item) => (
-                <button
-                  aria-selected={mode === item}
-                  className={mode === item ? "active" : ""}
-                  disabled={streaming}
-                  key={item}
-                  onClick={() => {
-                    setSelectedQueryMode(item);
-                    setDraft("");
-                    setStreamStatus("");
-                  }}
-                  role="tab"
-                  type="button"
-                >
-                  {item}
-                </button>
-              ))}
+            <div className="conversation-mode-switch">
+              <select
+                aria-label={`${title} conversation mode`}
+                disabled={!token || streaming || modeState.status !== "ready"}
+                onChange={(event) => {
+                  startNewConversation();
+                  setSelectedQueryMode(event.target.value);
+                }}
+                title={modeOption?.description || "问答模式"}
+                value={mode}
+              >
+                {!modeOption && <option disabled value={mode}>{modeState.status === "loading" ? "正在加载模式…" : `${mode}（不可用）`}</option>}
+                {modeOptions.map((item) => (
+                  <option disabled={!canUseQueryMode(item)} key={item.mode} value={item.mode}>
+                    {item.label}{canUseQueryMode(item) ? "" : "（不可用）"}
+                  </option>
+                ))}
+              </select>
+              <button aria-label="刷新模式列表" disabled={!token || streaming || modeState.status === "loading"} onClick={() => setModeReload((value) => value + 1)} title="刷新模式列表" type="button">
+                <RotateCcw size={14} />
+              </button>
             </div>
           ) : (
             <span className={`conversation-mode-badge ${mode}`}>{mode}</span>
           )}
         </header>
+
+        {token && (modeState.message || (modeState.status === "ready" && !modeReady)) && (
+          <div className="conversation-mode-notice" role="status">
+            {modeState.message || "当前模式不可用，请选择其他模式或刷新列表。"}
+          </div>
+        )}
 
         <div className="conversation-messages" ref={messagesRef}>
           {!token ? (
@@ -5142,8 +5177,8 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
           ) : messages.length === 0 && !streamTurn ? (
             <div className="conversation-empty-state">
               <Sparkles size={24} />
-              <strong>{mode === "agent" ? "开始 Agent 对话" : "开始 Plain 对话"}</strong>
-              <span>{mode === "agent" ? "由 DL Engine Agent 检索记忆并生成回答。" : "直接检索记忆上下文并生成回答。"}</span>
+              <strong>开始 {modeLabel} 对话</strong>
+              <span>{modeOption?.description || "等待加载可用模式。"}</span>
             </div>
           ) : (
             <>
@@ -5161,7 +5196,7 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
 
         <form className="conversation-composer" onSubmit={submitConversation}>
           <textarea
-            disabled={!token || streaming}
+            disabled={!token || streaming || !modeReady}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -5176,13 +5211,13 @@ function ConversationWorkspace({ allowModeSwitch = false, authState, embedded = 
           <div className="conversation-composer-footer">
             <span title={streamStatus}>{streamStatus}</span>
             <div>
-              <select disabled={!token || streaming} onChange={(event) => setThinkingLevel(event.target.value)} value={thinkingLevel}>
+              {modeOption?.parameters?.thinking_level?.supported === true && <select aria-label="思考级别" disabled={!token || streaming || !modeReady} onChange={(event) => setThinkingLevel(event.target.value)} value={thinkingLevel}>
                 <option value="0">Fast</option>
                 <option value="1">Balanced</option>
                 <option value="2">Deep</option>
                 <option value="3">Max</option>
-              </select>
-              <button className="primary-button" disabled={!token || streaming || !draft.trim()} type="submit">
+              </select>}
+              <button className="primary-button" disabled={!token || streaming || !modeReady || !draft.trim()} type="submit">
                 {streaming ? <Activity size={15} /> : <Play size={15} />}
                 <span>{streaming ? "Working" : "Send"}</span>
               </button>
@@ -5694,6 +5729,7 @@ function EngineWorkspace({ authState, onLock, onLogin }) {
             <EngineSearchPanel engineMediaProxyUrl={engineMediaProxyUrl} engineStatus={engineStatus} entries={searchEvents} useVespa={engineUseVespa} />
           ) : (
             <ConversationWorkspace
+              allowModeSwitch
               authState={authState}
               embedded
               onLogin={onLogin}

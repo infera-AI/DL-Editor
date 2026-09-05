@@ -4,6 +4,19 @@ macOS desktop video downsampler built with Electron, React, FFmpeg, FFprobe, and
 
 ## Commands
 
+Conversation mode checks: `npm run test:conversation-modes` and `npm run test:app-shell`.
+
+Delphi and Engine Query discover modes from authenticated `GET /conversation/query-modes`.
+The response uses the standard Infera `Result` wrapper; its `result` contains
+`default_mode` and `modes[]` with `mode`, `label`, `description`, `enabled`,
+`capabilities.stream`, and optional-parameter metadata in `parameters`.
+Modes using the existing conversation SSE contract (including Codex) require no
+frontend enum changes. The mode ID is a lowercase slug of at most 16 characters.
+Delphi initially prefers Plain; Engine prefers Agent. Existing session modes stay fixed.
+Only supported optional parameters are sent. Loading errors offer retry and may
+use an in-memory, login-scoped cache; only a 404 catalog endpoint falls back to
+the legacy Plain/Agent list. Deploy the backend catalog/adapter before this client.
+
 Run these on a Mac, not on Windows:
 
 ```bash

@@ -876,7 +876,7 @@ async function streamConversation(event, payload = {}) {
   if (!/^[A-Za-z0-9_.:-]{8,120}$/.test(streamId)) {
     throw new Error("Invalid conversation stream id.");
   }
-  if (!/^\/conversation\/sessions\/[^/?#]+\/input\/mode\/(agent|plain)\/stream$/.test(requestPath)) {
+  if (!/^\/conversation\/sessions\/[^/?#]+\/input\/mode\/[a-z][a-z0-9_-]{0,15}\/stream$/.test(requestPath)) {
     throw new Error("Invalid conversation stream path.");
   }
   if (!payload.token) {
