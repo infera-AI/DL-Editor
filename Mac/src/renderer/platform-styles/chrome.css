@@ -1,0 +1,169 @@
+
+
+.app-shell {
+  --chrome-left-inset: 14px;
+  --chrome-tool-button-width: 32px;
+  --system-window-controls-width: 0px;
+  display: flex;
+  width: 100%;
+  max-width: 100%;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 14px 14px;
+  background: var(--bg);
+}
+
+.app-shell.platform-darwin {
+  --chrome-left-inset: 86px;
+}
+
+.app-shell.platform-darwin.is-fullscreen {
+  --chrome-left-inset: 14px;
+}
+
+.app-shell.platform-win32 {
+  --chrome-tool-button-width: 46px;
+  --system-window-controls-width: 138px;
+}
+
+.app-chrome {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  box-sizing: border-box;
+  width: calc(100% + 28px);
+  max-width: calc(100% + 28px);
+  min-width: 0;
+  height: 42px;
+  gap: 10px;
+  justify-content: space-between;
+  margin: 0 -14px;
+  padding: 5px calc(8px + var(--system-window-controls-width)) 5px var(--chrome-left-inset);
+  background: var(--bg);
+  -webkit-app-region: drag;
+}
+
+.chrome-left {
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.drag-region {
+  flex: 1;
+  min-width: 12px;
+  height: 100%;
+}
+
+.window-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0;
+  height: 32px;
+  -webkit-app-region: no-drag;
+}
+
+.chrome-button {
+  display: inline-grid;
+  flex: 0 0 var(--chrome-tool-button-width);
+  width: var(--chrome-tool-button-width);
+  height: 32px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.chrome-button:hover {
+  background: var(--surface-soft);
+  color: var(--text);
+}
+
+.app-shell.platform-win32 .chrome-button {
+  border-radius: 0;
+}
+
+.app-shell.platform-win32 .chrome-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.profile-button {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface-subtle);
+  color: var(--muted-strong);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.profile-button svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.profile-initial {
+  display: inline-grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  border-radius: inherit;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.profile-button:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-soft);
+  color: var(--text);
+}
+
+.top-nav {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 18px;
+  height: 30px;
+}
+
+.nav-item {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  transition: color 180ms ease;
+}

@@ -1,0 +1,118 @@
+
+
+.file-footer span {
+  min-width: 0;
+}
+
+.item-actions {
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.item-actions button {
+  min-height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  padding: 0 9px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(17, 20, 19, 0.32);
+  padding: 18px;
+}
+
+.time-dialog {
+  display: grid;
+  width: min(360px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
+.app-info-dialog {
+  display: grid;
+  width: min(430px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 15px;
+}
+
+.login-dialog {
+  display: grid;
+  width: min(360px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 15px;
+}
+
+.dialog-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.app-info-heading {
+  align-items: flex-start;
+}
+
+.app-info-heading strong,
+.app-info-heading span {
+  display: block;
+}
+
+.app-info-heading span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-heading strong,
+.login-heading span {
+  display: block;
+}
+
+.login-heading span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 3px;
+}
+
+.login-mode-button {
+  min-height: 30px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+}

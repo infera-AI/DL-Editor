@@ -1,0 +1,329 @@
+
+
+.engine-reasoning-list,
+.engine-retrieval-result-list {
+  display: grid;
+  gap: 6px;
+}
+
+.engine-reasoning-step,
+.engine-retrieval-result {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 8px 9px;
+}
+
+.engine-reasoning-step > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.engine-reasoning-step strong,
+.engine-retrieval-result strong,
+.engine-reasoning-step span,
+.engine-retrieval-result span,
+.engine-reasoning-step small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.engine-reasoning-step strong,
+.engine-retrieval-result strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.engine-reasoning-step span {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 780;
+  padding: 3px 6px;
+}
+
+.engine-reasoning-step small,
+.engine-retrieval-result span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.engine-citation-list {
+  display: grid;
+  gap: 6px;
+}
+
+.engine-citation {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 7px 8px;
+}
+
+.engine-citation strong,
+.engine-citation span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.engine-citation strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.engine-citation span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.engine-citation .engine-media-preview {
+  margin-top: 3px;
+}
+
+.engine-empty-state {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.engine-input-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 64px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.engine-version-select,
+.engine-input-wrap {
+  display: grid;
+  min-width: 0;
+  min-height: 40px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--muted);
+  padding: 0 10px;
+}
+
+.engine-version-select:focus-within,
+.engine-input-wrap:focus-within {
+  border-color: rgba(15, 118, 110, 0.5);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.1);
+}
+
+.engine-version-select select,
+.engine-input-wrap input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  font-size: 13px;
+}
+
+.engine-version-select select {
+  appearance: none;
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.engine-submit-button {
+  min-width: 98px;
+  height: 40px;
+  justify-content: center;
+}
+
+.engine-test-view {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.engine-test-body {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 10px;
+}
+
+.engine-test-refresh {
+  min-height: 34px;
+  justify-content: center;
+}
+
+.engine-test-alert {
+  display: grid;
+  min-height: 160px;
+  grid-template-columns: auto minmax(0, auto);
+  place-content: center;
+  gap: 8px;
+  border: 1px solid rgba(180, 35, 24, 0.22);
+  border-radius: 7px;
+  background: rgba(180, 35, 24, 0.06);
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 12px;
+  text-align: center;
+}
+
+.engine-index-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.engine-index-summary div {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  padding: 9px 10px;
+}
+
+.engine-index-summary span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.engine-index-summary strong {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 780;
+}
+
+.engine-index-list {
+  display: grid;
+  gap: 8px;
+}
+
+.engine-index-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.engine-index-counts span {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 720;
+  padding: 0 8px;
+}
+
+.engine-index-result {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  padding: 9px;
+}
+
+.engine-index-result p {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.engine-index-raw,
+.engine-index-result-raw {
+  display: grid;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.engine-index-result-raw {
+  background: var(--surface-subtle);
+}
+
+.engine-index-raw summary,
+.engine-index-result-raw summary {
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+  padding: 8px 9px;
+}
+
+.engine-index-raw pre,
+.engine-index-result-raw pre {
+  max-height: 320px;
+  margin: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  color: var(--muted-strong);
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cloud-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.cloud-drive {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  grid-template-columns: 224px minmax(0, 1fr);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}

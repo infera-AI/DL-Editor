@@ -1,0 +1,97 @@
+
+
+.automation-option input:checked + .automation-check::after {
+  opacity: 1;
+}
+
+.automation-option input:checked ~ svg,
+.automation-option input:checked ~ span:last-child {
+  color: var(--accent-strong);
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1.12fr 0.94fr 0.94fr;
+  gap: 6px;
+}
+
+.primary-button,
+.secondary-button,
+.ghost-button,
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.primary-button {
+  flex: 1;
+  background: var(--button);
+  color: var(--button-text);
+}
+
+.secondary-button {
+  background: var(--button);
+  color: var(--button-text);
+  padding: 0 12px;
+}
+
+.ghost-button {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted-strong);
+  padding: 0 12px;
+}
+
+.primary-button:hover:not(:disabled),
+.secondary-button:hover:not(:disabled),
+.ghost-button:hover:not(:disabled),
+.icon-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.actions .primary-button,
+.actions .ghost-button {
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 9px;
+}
+
+.actions .primary-button {
+  flex: initial;
+  border-color: rgba(15, 118, 110, 0.42);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .actions .primary-button {
+  color: #07100d;
+}
+
+.actions .ghost-button {
+  background: var(--surface-subtle);
+}
+
+.danger-button {
+  border-color: rgba(180, 35, 24, 0.22);
+  background: rgba(180, 35, 24, 0.06);
+  color: var(--danger);
+}
+
+:root[data-theme="dark"] .danger-button {
+  border-color: rgba(255, 138, 127, 0.28);
+  background: rgba(255, 138, 127, 0.08);
+}

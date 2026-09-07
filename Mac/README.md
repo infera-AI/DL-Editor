@@ -1,5 +1,7 @@
 # DL Studio Mac
 
+前端维护与目录说明见 [开发文档](../docs/README.md)、[架构](../docs/architecture.md) 和 [构建说明](../docs/development.md)。前端源码位于仓库的 `shared/renderer/`，请保留完整仓库后执行本目录原有 npm 命令。
+
 macOS desktop video downsampler built with Electron, React, FFmpeg, FFprobe, and Apple VideoToolbox acceleration.
 
 ## Commands

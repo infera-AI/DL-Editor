@@ -1,0 +1,9 @@
+
+
+const AUTH_STORAGE_KEY = "dl-studio-auth";
+
+const EMAIL_IDENTIFIER_PATTERN = /^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+$/;
+
+const PHONE_IDENTIFIER_PATTERN = /^\+?\d{6,20}$/;
+
+export { AUTH_STORAGE_KEY, EMAIL_IDENTIFIER_PATTERN, PHONE_IDENTIFIER_PATTERN };

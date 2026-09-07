@@ -1,0 +1,146 @@
+
+
+@media (max-width: 1100px) {
+  .research-workspace,
+  .research-workspace.chats {
+    grid-template-columns: 1fr;
+  }
+
+  .research-detail {
+    min-height: 420px;
+  }
+
+  .research-simulation-view {
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+}
+
+.app-info-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 9px 14px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 12px 0;
+  font-size: 12px;
+}
+
+.app-info-grid span {
+  color: var(--muted);
+}
+
+.app-info-grid strong {
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-weight: 700;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-status {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  padding: 9px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.update-status span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.update-status.available {
+  border-color: rgba(23, 114, 69, 0.25);
+  background: rgba(23, 114, 69, 0.08);
+  color: var(--success);
+}
+
+.update-status.error {
+  border-color: rgba(180, 35, 24, 0.22);
+  background: rgba(180, 35, 24, 0.06);
+  color: var(--danger);
+}
+
+.update-status.no_asset,
+.update-status.no_release {
+  border-color: rgba(154, 103, 0, 0.24);
+  background: rgba(154, 103, 0, 0.07);
+  color: var(--warning);
+}
+
+.app-info-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.app-info-actions .primary-button,
+.app-info-actions .ghost-button {
+  min-width: 96px;
+}
+
+.dialog-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.dialog-section {
+  display: grid;
+  gap: 7px;
+}
+
+.dialog-section-label {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.single-time-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.single-time-field .text-input {
+  font-variant-numeric: tabular-nums;
+}
+
+.dialog-error {
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+
+.dialog-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.file-name-parse-button {
+  flex: 0 1 auto;
+  min-width: 136px;
+}
+
+.dialog-actions .primary-button,
+.dialog-actions .ghost-button {
+  flex: 0 0 auto;
+  min-width: 76px;
+}
+
+.dialog-actions .file-name-parse-button {
+  min-width: 136px;
+}

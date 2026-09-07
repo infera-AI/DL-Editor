@@ -7,7 +7,9 @@ const required = [
   "src/main/main.js",
   "src/main/preload.js",
   "src/renderer/App.jsx",
-  "src/renderer/styles.css"
+  "src/renderer/styles.css",
+  "../shared/renderer/app/App.jsx",
+  "../shared/build/vite.config.cjs"
 ];
 
 const missing = required.filter((file) => !fs.existsSync(path.join(root, file)));
@@ -17,4 +19,5 @@ if (missing.length) {
   process.exit(1);
 }
 
+require("../../shared/testing/renderer-structure.cjs").validateBuiltAssets(root);
 console.log("Smoke check passed.");

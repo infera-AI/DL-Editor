@@ -1,0 +1,143 @@
+
+
+.research-simulation-view {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
+}
+
+.research-simulation-sidebar,
+.research-simulation-chat {
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.research-simulation-sidebar {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.research-simulation-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding: 10px;
+}
+
+.research-simulation-toolbar select {
+  min-width: 0;
+}
+
+.research-simulation-sessions {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  overflow: auto;
+  padding: 10px;
+}
+
+.research-simulation-sessions > button {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px;
+  text-align: left;
+}
+
+.research-simulation-sessions > button.active {
+  border-color: var(--accent);
+  background: rgba(16, 120, 111, 0.06);
+}
+
+.research-simulation-sessions strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.research-simulation-sessions span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.research-simulation-chat {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.research-simulation-chat > header {
+  border-bottom: 1px solid var(--line);
+  padding: 11px 13px;
+}
+
+.research-simulation-chat h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.research-simulation-chat header span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.research-simulation-messages {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.research-simulation-composer {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding: 10px;
+}
+
+.research-simulation-composer textarea {
+  width: 100%;
+  min-height: 74px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 9px 10px;
+  font: inherit;
+}
+
+.research-simulation-composer > div {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.research-simulation-composer > div > span {
+  flex: 1;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.research-simulation-composer .primary-button {
+  flex: 0 0 auto;
+  min-width: 88px;
+  padding: 0 18px;
+}

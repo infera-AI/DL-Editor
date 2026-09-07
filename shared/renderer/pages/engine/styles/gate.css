@@ -1,0 +1,42 @@
+
+
+.engine-page {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+}
+
+.engine-gate {
+  display: grid;
+  width: min(360px, 100%);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 15px;
+}
+
+.engine-gate-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.engine-gate-heading strong,
+.engine-gate-heading span {
+  display: block;
+}
+
+.engine-gate-heading strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.engine-gate-heading span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}

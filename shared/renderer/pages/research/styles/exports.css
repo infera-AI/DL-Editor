@@ -1,0 +1,115 @@
+
+
++.research-export-modal {
+  width: min(620px, 92vw);
+}
+
+.research-export-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.research-export-summary > div {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  padding: 12px;
+}
+
+.research-export-summary span,
+.research-export-media-option small,
+.research-modal-panel footer > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.research-export-summary strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 20px;
+}
+
+.research-export-status {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  color: var(--muted-strong);
+  padding: 11px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.research-export-status.error {
+  border-color: rgba(180, 35, 24, 0.25);
+  background: rgba(180, 35, 24, 0.06);
+  color: var(--danger);
+}
+
+.research-batch-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.research-batch-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.research-batch-fields select,
+.research-batch-fields input,
+.research-simulation-toolbar select,
+.research-simulation-composer select {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  padding: 0 10px;
+}
+
+.research-export-media-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 11px;
+  cursor: pointer;
+}
+
+.research-export-media-option input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.research-export-media-option > span {
+  display: grid;
+  gap: 3px;
+}
+
+.research-export-media-option strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.research-export-download {
+  display: inline-flex;
+  margin-top: 10px;
+  text-decoration: none;
+}
+
+.research-modal-panel footer > div {
+  display: flex;
+  gap: 8px;
+}

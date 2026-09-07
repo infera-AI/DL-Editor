@@ -1,16 +1,5 @@
 const { defineConfig } = require("vite");
 const react = require("@vitejs/plugin-react");
+const { createRendererConfig } = require("../shared/build/vite.config.cjs");
 
-module.exports = defineConfig({
-  plugins: [react()],
-  root: ".",
-  base: "./",
-  build: {
-    outDir: "dist",
-    emptyOutDir: true
-  },
-  server: {
-    port: 5173,
-    strictPort: true
-  }
-});
+module.exports = createRendererConfig(__dirname, defineConfig, react);
