@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 
 function useResearchState() {
   const researchAccessRequestRef = useRef(0);
+  const researchDataRequestRef = useRef(0);
 
   const [researchTab, setResearchTab] = useState("resources");
 
@@ -9,7 +10,8 @@ function useResearchState() {
     from: "",
     status: "",
     to: "",
-    userId: ""
+    userId: "",
+    assistantKind: ""
   });
 
   const [researchAccessState, setResearchAccessState] = useState({ status: "idle", token: "", message: "" });
@@ -23,6 +25,8 @@ function useResearchState() {
     audioCount: 0,
     chats: [],
     chatsTotal: 0,
+    chatAgentCounts: null,
+    chatAgentFiltering: false,
     statistics: null,
     selectedResourceIds: [],
     selectedChatIds: [],
@@ -31,7 +35,7 @@ function useResearchState() {
     exportDownload: null
   });
 
-  return { researchAccessRequestRef, researchTab, setResearchTab, researchFilters, setResearchFilters, researchAccessState, setResearchAccessState, researchState, setResearchState };
+  return { researchAccessRequestRef, researchDataRequestRef, researchTab, setResearchTab, researchFilters, setResearchFilters, researchAccessState, setResearchAccessState, researchState, setResearchState };
 }
 
 export { useResearchState };

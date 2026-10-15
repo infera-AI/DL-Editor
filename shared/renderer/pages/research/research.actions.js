@@ -7,6 +7,7 @@ import { getResearchChatId, getResearchErrorMessage, getResearchResourceId, hasR
 function createResearchActions({
   authState,
   researchAccessRequestRef,
+  researchDataRequestRef,
   setResearchAccessState,
   authStateRef,
   setResearchState,
@@ -71,6 +72,8 @@ function createResearchActions({
     const token = authOverride?.token;
     const append = Boolean(options.append);
     const offset = Number(options.offset || 0);
+    const requestId = ++researchDataRequestRef.current;
+    const isCurrent = () => researchDataRequestRef.current === requestId && Boolean(authStateRef.current?.token);
     if (!token) {
       setResearchState((current) => ({
         ...current,
@@ -85,6 +88,8 @@ function createResearchActions({
       const usersPromise = fetchResearchUsers(token);
       if (tabOverride === "chats") {
         const [users, chats] = await Promise.all([usersPromise, fetchResearchChats(token, filtersOverride, { offset })]);
+        if (!isCurrent()) return;
+        if (filtersOverride.assistantKind && chats?.agent_filtering !== true) throw new Error("当前服务器不支持 agent 筛选，请更新 Research 后端后重试。");
         const chatItems = normalizeResearchItems(chats);
         setResearchState((current) => ({
           ...current,
@@ -92,6 +97,8 @@ function createResearchActions({
           users: normalizeResearchItems(users),
           chats: append ? [...current.chats, ...chatItems] : chatItems,
           chatsTotal: Number(chats?.total) || chatItems.length,
+          chatAgentCounts: chats?.agent_counts || null,
+          chatAgentFiltering: chats?.agent_filtering === true,
           selectedChatIds: append
             ? current.selectedChatIds
             : current.selectedChatIds.filter((id) => chatItems.some((item) => getResearchChatId(item) === String(id))),
@@ -99,6 +106,7 @@ function createResearchActions({
         }));
       } else if (tabOverride === "statistics") {
         const [users, statistics] = await Promise.all([usersPromise, fetchResearchStatistics(token)]);
+        if (!isCurrent()) return;
         setResearchState((current) => ({
           ...current,
           status: "ready",
@@ -108,6 +116,7 @@ function createResearchActions({
         }));
       } else if (tabOverride === "simulation") {
         const users = await usersPromise;
+        if (!isCurrent()) return;
         setResearchState((current) => ({
           ...current,
           status: "ready",
@@ -116,6 +125,7 @@ function createResearchActions({
         }));
       } else {
         const [users, resources] = await Promise.all([usersPromise, fetchResearchResources(token, filtersOverride, { offset })]);
+        if (!isCurrent()) return;
         const resourceItems = normalizeResearchItems(resources);
         setResearchState((current) => ({
           ...current,
@@ -132,6 +142,7 @@ function createResearchActions({
         }));
       }
     } catch (error) {
+      if (!isCurrent()) return;
       const permissionDenied = isResearchPermissionDenied(error);
       if (permissionDenied) {
         setResearchAccessState({
@@ -163,6 +174,9 @@ function createResearchActions({
   }
 
   function updateResearchFilter(patch) {
+    if (Object.entries(patch).every(([key, value]) => researchFilters[key] === value)) return;
+    researchDataRequestRef.current += 1;
+    setResearchState((current) => ({ ...current, chats: [], chatsTotal: 0, selectedChatIds: [], status: "loading", exportDownload: null }));
     setResearchFilters((current) => ({ ...current, ...patch }));
   }
 
@@ -232,6 +246,7 @@ function createResearchActions({
               max_sessions: 2000,
               start_ms: dateParams.start_ms,
               end_ms: dateParams.end_ms,
+              assistant_kind: researchFilters.assistantKind || null,
               include_evidences: true
             })
           : await exportResearchResources(token, {

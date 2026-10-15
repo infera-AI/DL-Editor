@@ -8,6 +8,7 @@ function ResearchChatsView({
   activeItem,
   hasMore,
   items,
+  loading,
   onExportFiltered,
   onExportSelected,
   onLoadMore,
@@ -21,14 +22,14 @@ function ResearchChatsView({
   return (
     <section className="research-shell">
       <div className="research-actions">
-        <button className="ghost-button" onClick={onSelectLoaded} type="button">Select loaded chats</button>
-        <button className="primary-button" onClick={onExportSelected} type="button">Export selected chats</button>
-        <button className="ghost-button" onClick={onExportFiltered} type="button">Export filtered chats</button>
+        <button className="ghost-button" disabled={loading || !items.length} onClick={onSelectLoaded} type="button">Select loaded chats</button>
+        <button className="primary-button" disabled={loading || !selected.size} onClick={onExportSelected} type="button">Export selected chats ({selected.size})</button>
+        <button className="ghost-button" disabled={loading || !items.length} onClick={onExportFiltered} type="button">Export filtered chats</button>
       </div>
       <div className="research-workspace chats">
         <div className="research-chat-list">
           {items.length === 0 ? (
-            <div className="repository-empty">No matching chat sessions</div>
+            <div className="repository-empty">{loading ? "Loading chat sessions..." : "No matching chat sessions"}</div>
           ) : (
             <>
               {items.map((item) => {
@@ -53,7 +54,7 @@ function ResearchChatsView({
             </>
           )}
         </div>
-        <ResearchChatDetail item={activeItem} token={token} />
+        <ResearchChatDetail item={activeItem} key={getResearchChatId(activeItem) || "empty"} token={token} />
       </div>
     </section>
   );

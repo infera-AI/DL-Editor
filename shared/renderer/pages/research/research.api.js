@@ -54,6 +54,7 @@ async function fetchResearchChats(token, filters, options = {}) {
   delete params.parse_status;
   delete params.date_start_ms;
   delete params.date_end_ms;
+  params.assistant_kind = filters.assistantKind || "";
   return requestInfera(buildResearchPath("/chats", params), { token });
 }
 
@@ -101,8 +102,27 @@ async function fetchResearchDailyExport(token, jobId) {
   return requestInfera(buildResearchPath(`/assets/videos/daily-exports/${encodeURIComponent(jobId)}`), { token });
 }
 
-async function fetchResearchSimulationSessions(token, subjectUserId) {
-  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions`), { token });
+async function fetchResearchSimulationSessions(token, subjectUserId, options = {}) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions`, { environment_id: options.environmentId, assistant_kind: options.assistantKind }), { token });
+}
+
+async function fetchResearchSimulationEnvironments(token, subjectUserId) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/environments`), { token });
+}
+async function createResearchSimulationEnvironment(token, subjectUserId) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/environments`), { token, method: "POST", body: {} });
+}
+async function fetchResearchSimulationEnvironment(token, subjectUserId, environmentId) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/environments/${encodeURIComponent(environmentId)}`), { token });
+}
+async function createResearchSimulationSession(token, subjectUserId, environmentId, assistantKind) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions`), { token, method: "POST", body: { environment_id: environmentId, assistant_kind: assistantKind } });
+}
+async function actOnResearchSimulationCard(token, subjectUserId, sessionCode, card, action) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions/${encodeURIComponent(sessionCode)}/cards/${encodeURIComponent(card.card_id || card.cardId)}/actions`), { token, method: "POST", body: { action, expectedVersion: card.version, clientToken: createResearchSimulationStreamId() } });
+}
+async function cancelResearchSimulationInput(token, subjectUserId, sessionCode, requestId) {
+  return requestInfera(buildResearchPath(`/simulations/users/${encodeURIComponent(subjectUserId)}/sessions/${encodeURIComponent(sessionCode)}/input/${encodeURIComponent(requestId)}/cancel`), { token, method: "POST" });
 }
 
 async function fetchResearchSimulationSession(token, subjectUserId, sessionCode) {
@@ -184,4 +204,4 @@ async function fetchResearchParsedData(token, path) {
   return requestInfera(path, { token });
 }
 
-export { getResearchDateRangeParams, getResearchListParams, fetchResearchUsers, fetchResearchResources, fetchResearchChats, fetchResearchStatistics, exportResearchResources, exportResearchChats, fetchResearchExportCount, createResearchDailyExport, fetchResearchDailyExport, fetchResearchSimulationSessions, fetchResearchSimulationSession, createResearchSimulationStreamId, streamResearchSimulationInput, fetchResearchParsedData };
+export { getResearchDateRangeParams, getResearchListParams, fetchResearchUsers, fetchResearchResources, fetchResearchChats, fetchResearchStatistics, exportResearchResources, exportResearchChats, fetchResearchExportCount, createResearchDailyExport, fetchResearchDailyExport, fetchResearchSimulationSessions, fetchResearchSimulationSession, createResearchSimulationStreamId, streamResearchSimulationInput, fetchResearchParsedData, fetchResearchSimulationEnvironments, createResearchSimulationEnvironment, fetchResearchSimulationEnvironment, createResearchSimulationSession, actOnResearchSimulationCard, cancelResearchSimulationInput };

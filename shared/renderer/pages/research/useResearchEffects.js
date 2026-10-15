@@ -4,6 +4,7 @@ function useResearchEffects({
   activeNav,
   authState,
   researchAccessRequestRef,
+  researchDataRequestRef,
   setResearchAccessState,
   setResearchState,
   researchAccessState,
@@ -19,6 +20,7 @@ function useResearchEffects({
 
     if (!authState?.token) {
       researchAccessRequestRef.current += 1;
+      researchDataRequestRef.current += 1;
       setResearchAccessState({ status: "auth", token: "", message: "" });
       setResearchState((current) => ({
         ...current,
@@ -27,6 +29,8 @@ function useResearchEffects({
         resourcesTotal: 0,
         chats: [],
         chatsTotal: 0,
+        chatAgentCounts: null,
+        chatAgentFiltering: false,
         message: "请先登录后查看 Research"
       }));
       return;
@@ -53,6 +57,7 @@ function useResearchEffects({
     }
 
     loadResearchData(researchTab, authState, researchFilters);
+    return () => { researchDataRequestRef.current += 1; };
   }, [
     activeNav,
     authState?.token,
@@ -62,6 +67,7 @@ function useResearchEffects({
     researchFilters.status,
     researchFilters.to,
     researchFilters.userId,
+    researchFilters.assistantKind,
     researchTab
   ]);
 }

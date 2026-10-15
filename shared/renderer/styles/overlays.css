@@ -1,12 +1,11 @@
 
 
 @media (max-width: 1100px) {
-  .research-workspace,
-  .research-workspace.chats {
+  .research-workspace:not(.chats) {
     grid-template-columns: 1fr;
   }
 
-  .research-detail {
+  .research-detail:not(.chat-detail) {
     min-height: 420px;
   }
 

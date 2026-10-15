@@ -1,6 +1,7 @@
 import { formatBytes } from "../../utils/format.js";
 import { ResearchBatchExportModal } from "./components/ResearchBatchExportModal.jsx";
 import { ResearchChatsView } from "./components/ResearchChatsView.jsx";
+import { ResearchAgentFilters } from "./components/ResearchAgentFilters.jsx";
 import { ResearchExportAllModal } from "./components/ResearchExportAllModal.jsx";
 import { ResearchFilters } from "./components/ResearchFilters.jsx";
 import { ResearchResourcesView } from "./components/ResearchResourcesView.jsx";
@@ -214,6 +215,7 @@ function ResearchPage({
         </header>
 
         {(tab === "resources" || tab === "chats") && <ResearchFilters filters={filters} onChange={onFilterChange} showStatus={tab === "resources"} users={users} />}
+        {tab === "chats" && <ResearchAgentFilters counts={state.chatAgentCounts} enabled={state.chatAgentFiltering} onChange={onFilterChange} value={filters.assistantKind || ""} />}
 
         {state.status === "error" && (
           <div className="repository-alert">
@@ -239,6 +241,7 @@ function ResearchPage({
 
         {tab === "chats" ? (
           <ResearchChatsView
+            loading={isLoading}
             activeId={getResearchChatId(activeChat)}
             activeItem={activeChat}
             hasMore={loadedChatCount < Number(state.chatsTotal || 0)}
@@ -253,7 +256,7 @@ function ResearchPage({
             token={authState.token}
           />
         ) : tab === "simulation" ? (
-          <ResearchSimulationView token={authState.token} users={users} />
+          <ResearchSimulationView researcherId={authState.userId} token={authState.token} users={users} />
         ) : tab === "statistics" ? (
           <ResearchStatisticsView data={state.statistics} />
         ) : (
